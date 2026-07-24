@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pymongo
+streamlit
+requests
+python-multipart
+pandas
+roboflow
