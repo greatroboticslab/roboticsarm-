@@ -1,6 +1,7 @@
 import math
 import threading
 from time import sleep
+from datetime import date
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
@@ -9,8 +10,64 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from dobot_util import Dobot
 
+from vision.config import PHOTO_STATION, NUM_VIEWS, VIEW_SETTLE_SECONDS, LIVE_FEED_FPS
+from vision.camera.capture import (
+    capture_station_frame,
+    capture_wrist_frame,
+    capture_frame,
+    list_configured_cameras,
+    frame_to_rgb,
+    save_image,
+    new_sample_id,
+)
+import requests
+from vision.config import TOPIC_CAPTURE_COMMAND, TOPIC_ARM_MOVE_COMMAND, FOURDAI_API_URL
+from vision.messaging.publisher import publish_captured, publish_capture_status
+from vision.messaging.subscriber import subscribe
+
+try:
+    from PIL import Image, ImageTk
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
 # Global anchor for the matplotlib live tracking marker
 live_dot = None
+# Global anchor for the fixed photo-station marker (yellow dot)
+photo_station_dot = None
+
+# ---------------------------------------------------------------------------
+# Arm operation lock — prevents two robot-motion sequences from running at
+# once (e.g. clicking "Pickup & Photograph" while "Send to Robot" is still
+# working through its queue). Both paths send commands over the same
+# DobotSocketConnection, which is not designed for concurrent callers -
+# interleaved sends/reads from two threads can corrupt command/response
+# parsing. Scoped to the two sequence-level entry points (the pipeline and
+# the queued point sender) rather than every single manual move, since
+# those are the two places multi-step command sequences run unattended in
+# a background thread.
+# ---------------------------------------------------------------------------
+arm_operation_lock = threading.Lock()
+
+
+def try_start_arm_operation(op_name: str = "this operation") -> bool:
+    """Attempt to claim exclusive arm access. Returns True if claimed;
+    shows a warning and returns False if the arm is already busy."""
+    if not arm_operation_lock.acquire(blocking=False):
+        messagebox.showwarning(
+            "Arm Busy",
+            f"The arm is currently busy with another sequence.\n"
+            f"Please wait for it to finish before starting {op_name}.")
+        return False
+    return True
+
+
+def finish_arm_operation() -> None:
+    """Release the arm operation lock. Safe to call even if not held."""
+    try:
+        arm_operation_lock.release()
+    except RuntimeError:
+        pass  # already released — avoid crashing cleanup paths on a double-release
 
 
 # Ported directly from HongboRobot_ActualRobot_AI_Points.m
@@ -276,10 +333,30 @@ def handle_jog_press(axis_cmd):
         is_jogging = True
 
 def handle_jog_release(event):
-    global is_jogging
+    global is_jogging, m_x, m_y, m_z
     if ROBOT_CONNECTED:
         robot.movement.safe_move_jog("stop", [])
         is_jogging = False
+
+        # --- SYNC FIX ---
+        # m_x/m_y/m_z ("manual control state") previously only got updated
+        # inside move_to_point(). Jogging bypasses move_to_point entirely
+        # (it calls safe_move_jog directly), so after a keyboard jog these
+        # stayed pointing at wherever the arm was *before* jogging. The next
+        # button that reused them — e.g. "Manual Z" (handle_manual_z) or
+        # any future move computed from m_x/m_y — would then jump the arm
+        # back toward that stale pre-jog position instead of continuing
+        # from where the jog actually left it.
+        #
+        # Fix: pull the robot's real, live telemetry (already tracked at
+        # 50Hz by feedback_loop() into robot_data["cartesian"], the same
+        # source the red tracking dot uses) and use it to resync m_x/m_y/m_z
+        # the moment jogging stops.
+        cart = robot_data.get("cartesian")
+        if cart and len(cart) >= 3:
+            m_x, m_y, m_z = cart[0], cart[1], cart[2]
+            print(f"[JOG SYNC] Manual position resynced to actual pose: "
+                  f"X={m_x:.1f} Y={m_y:.1f} Z={m_z:.1f}")
 
 
 
@@ -536,6 +613,20 @@ ax.set_aspect('equal', 'box')
 # Setup the valid region plot in light grey
 ax.contourf(X, Y, final_region, levels=[0.5, 1], colors=['lightgrey'], alpha=0.5)
 
+# --- Photo station marker (yellow dot) ---
+# Plot coordinates (px, py) and robot coordinates (x, y) are rotated
+# relative to each other elsewhere in this file (see add_dobot_instructions:
+# x = py, y = -px). Invert that here so the marker lands in the same spot
+# on the plot that the arm will actually visit: px = -robot_y, py = robot_x.
+_station_px = -PHOTO_STATION["y"]
+_station_py = PHOTO_STATION["x"]
+photo_station_dot = ax.scatter(
+    _station_px, _station_py,
+    color='yellow', edgecolors='black', s=140, marker='*',
+    zorder=6, label="Photo Station"
+)
+ax.legend()
+
 # Embed matplotlib figure into Tkinter
 canvas = FigureCanvasTkAgg(fig, master=left_container)
 canvas.draw()
@@ -613,9 +704,13 @@ def add_dobot_instructions():
         messagebox.showwarning("No Points", "No valid points to send to robot!")
         return
 
+    if not try_start_arm_operation("sending the queued points"):
+        return
+
     def process_next_point():
         if not valid_points:
             print("All points complete.")
+            finish_arm_operation()
             return
 
         px, py, point_z, claw_state = valid_points[0]
@@ -644,9 +739,11 @@ def add_dobot_instructions():
                 print(f"Point complete: claw={claw_text}")
 
             except Exception as e:
-                print(f"Sequence failed: {e}")
-                root.after(0, lambda: messagebox.showerror(
-                    "Robot Error", f"Point sequence failed: {e}"))
+                msg = str(e)
+                print(f"Sequence failed: {msg}")
+                finish_arm_operation()
+                root.after(0, lambda msg=msg: messagebox.showerror(
+                    "Robot Error", f"Point sequence failed: {msg}"))
                 return
 
             # 4. Remove point from GUI on the main thread, then trigger next
@@ -656,6 +753,356 @@ def add_dobot_instructions():
         threading.Thread(target=execute_point, daemon=True).start()
 
     process_next_point()
+
+def pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z):
+    """
+    [WIRED merge / STUB hardware] Full capture pipeline:
+    pick up object -> move to fixed photo station -> rotate J4 through
+    NUM_VIEWS steps capturing station+wrist frames at each step ->
+    hand the set off to the vision pipeline via MQTT.
+
+    This function itself is fully wired into the arm's motion/claw
+    control (real, tested code paths - move_to_point/Ikinematics/
+    set_claw_dual_output). It calls into vision.camera.capture and
+    vision.messaging.publisher, which are currently stubs that raise
+    NotImplementedError - that's expected until cameras/broker are set
+    up. The error is caught and reported through the GUI rather than
+    crashing the app.
+    """
+    global robot
+
+    # 1. Move to the object and grip it (reuses existing, tested logic)
+    sols = Ikinematics(pickup_x, pickup_y, z=pickup_z)
+    j1, j2, z_target, r_target = sols[0]
+    if ROBOT_CONNECTED and robot:
+        move_error = robot.movement.joint_to_joint_move([j1, j2, z_target, r_target])
+        if move_error is not None:
+            print(f"[PICKUP ERROR]: {move_error}")
+            return
+        robot.movement.sync()
+    else:
+        print(f"DEMO MODE: pickup at ({pickup_x}, {pickup_y}, {pickup_z})")
+    set_claw_dual_output(1)  # grip
+
+    # 2. Move to the fixed photo station (same marker shown as the yellow dot)
+    station_sols = Ikinematics(PHOTO_STATION["x"], PHOTO_STATION["y"], z=PHOTO_STATION["z"])
+    base_j1, base_j2, base_z, base_j4 = station_sols[0]
+    if ROBOT_CONNECTED and robot:
+        move_error = robot.movement.joint_to_joint_move([base_j1, base_j2, base_z, base_j4])
+        if move_error is not None:
+            print(f"[STATION MOVE ERROR]: {move_error}")
+            return
+        robot.movement.sync()
+    else:
+        print(f"DEMO MODE: moving to photo station {PHOTO_STATION}")
+
+    # 3. Rotate J4 through NUM_VIEWS steps, capturing station + wrist frames
+    sample_id = new_sample_id()
+    step_deg = 360.0 / NUM_VIEWS
+    views = []
+
+    # Work over however many cameras are actually configured in
+    # vision/config.py's CAMERAS dict, not just a hardcoded station+wrist
+    # pair. If a camera is missing/unplugged, it's skipped rather than
+    # aborting the whole sequence - once a camera fails, it's remembered
+    # for the rest of THIS capture run so we don't waste time retrying a
+    # known-dead camera on every single rotation step.
+    cameras_to_use = list_configured_cameras()
+    failed_cameras = set()
+
+    for i in range(NUM_VIEWS):
+        j4_target = base_j4 + (i * step_deg)
+        if ROBOT_CONNECTED and robot:
+            robot.movement.joint_to_joint_move([base_j1, base_j2, base_z, j4_target])
+            robot.movement.sync()
+        else:
+            print(f"DEMO MODE: rotating to J4={j4_target:.1f} deg (view {i+1}/{NUM_VIEWS})")
+        sleep(VIEW_SETTLE_SECONDS)
+
+        pose_snapshot = {"j1": base_j1, "j2": base_j2, "z": base_z, "j4": j4_target}
+
+        for camera_name in cameras_to_use:
+            if camera_name in failed_cameras:
+                continue
+            try:
+                frame = capture_frame(camera_name)
+            except (RuntimeError, ImportError) as e:
+                print(f"[CAPTURE SKIPPED] Camera '{camera_name}' unavailable — "
+                      f"skipping it for the rest of this capture: {e}")
+                failed_cameras.add(camera_name)
+                continue
+            image_path = save_image(frame, sample_id, camera_name, i)
+            views.append({"source": camera_name, "view_index": i,
+                          "image_path": image_path, "pose": pose_snapshot})
+
+    if not views:
+        raise RuntimeError(
+            f"No cameras were available — capture produced zero images. "
+            f"Configured cameras: {list(cameras_to_use.keys())}. Check "
+            f"connections and run `python -m vision.camera.capture` (no .py)."
+        )
+
+    if failed_cameras:
+        print(f"[CAPTURE COMPLETE WITH GAPS] Sample {sample_id}: "
+              f"{len(views)} image(s) captured; cameras unavailable this "
+              f"run: {sorted(failed_cameras)}")
+
+    # 4. Hand off to the vision pipeline (raises NotImplementedError until
+    #    an MQTT broker is configured)
+    publish_captured(sample_id, views, PHOTO_STATION)
+    print(f"[CAPTURE COMPLETE] sample_id={sample_id}, {len(views)} views published")
+    return sample_id
+
+
+def run_pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z):
+    """Background-thread wrapper so hardware/broker errors (missing
+    camera, unplugged laser, no MQTT broker running, etc.) show a clean
+    dialog instead of freezing or crashing the Tkinter main loop.
+
+    BUGFIX: `except X as e:` bindings are deleted by Python the moment the
+    except block ends (this is standard Python behavior, not a mistake in
+    the original try/except). root.after(0, lambda: ...) schedules the
+    lambda to run *later*, on a future pass through the Tkinter event
+    loop - by which point `e` has already been deleted, causing
+    `NameError: cannot access free variable 'e'`. Fix: read str(e) into a
+    plain local variable *inside* the except block (before it's deleted),
+    and have the lambda close over that string instead of over `e`.
+    """
+    def execute():
+        if not try_start_arm_operation("the pickup & photograph pipeline"):
+            return
+        try:
+            pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z)
+        except NotImplementedError as e:
+            msg = str(e)
+            root.after(0, lambda msg=msg: messagebox.showinfo(
+                "Not Implemented Yet",
+                f"Pipeline reached an unfinished piece:\n\n{msg}"))
+        except (ImportError, RuntimeError, IOError, ConnectionError) as e:
+            # These are now the expected real-world failure modes now that
+            # camera/laser/MQTT are wired to real hardware/services rather
+            # than stubs: missing dependency, camera not found, broker not
+            # running, etc. Reported the same clean way rather than a raw
+            # traceback dialog.
+            msg = str(e)
+            root.after(0, lambda msg=msg: messagebox.showwarning(
+                "Pipeline Could Not Complete", msg))
+        except Exception as e:
+            msg = str(e)
+            root.after(0, lambda msg=msg: messagebox.showerror(
+                "Pipeline Error", f"Pickup/photograph sequence failed: {msg}"))
+        finally:
+            finish_arm_operation()
+
+    threading.Thread(target=execute, daemon=True).start()
+
+
+def run_automatic_capture_sequence(category: str, num_images: int,
+                                    degrees_per_step: float,
+                                    interval_seconds: float) -> None:
+    """
+    [WIRED] The full "no manual clicking" capture loop: from wherever the
+    arm currently is, rotate J4 by `degrees_per_step` degrees, wait
+    `interval_seconds` to settle, take a photo with a local camera, and
+    repeat `num_images` times. Once done, registers the result through
+    4DAI's own existing REST API (/collection/submission,
+    /collection/images/upload) - the exact endpoints its manual "Submit"
+    flow already used - so 4DAI needs zero code changes for this to work.
+
+    Runs inline on whatever thread calls it - callers (the MQTT command
+    handler below) are responsible for running it off the Tkinter main
+    thread and holding arm_operation_lock, same convention as
+    run_pickup_photograph_and_identify.
+    """
+    sample_id = new_sample_id()
+    image_paths = []
+
+    try:
+        publish_capture_status("started", category=category,
+                                sample_id=sample_id,
+                                num_images=num_images,
+                                degrees_per_step=degrees_per_step)
+
+        base_joints = list(robot_data["joints"]) if robot_data["joints"] else [0.0, 0.0, 200.0, 0.0]
+        base_j1, base_j2, base_z, base_j4 = (base_joints + [0.0, 0.0, 200.0, 0.0])[:4]
+
+        cameras_to_use = list_configured_cameras()
+        failed_cameras = set()
+
+        for i in range(num_images):
+            j4_target = base_j4 + (i * degrees_per_step)
+
+            if ROBOT_CONNECTED and robot:
+                move_error = robot.movement.joint_to_joint_move(
+                    [base_j1, base_j2, base_z, j4_target])
+                if move_error is not None:
+                    raise RuntimeError(f"Move failed at image {i + 1}: {move_error}")
+                robot.movement.sync()
+            else:
+                print(f"DEMO MODE: rotating to J4={j4_target:.1f} deg "
+                      f"(image {i + 1}/{num_images})")
+
+            sleep(interval_seconds)
+
+            captured_this_step = False
+            for camera_name in cameras_to_use:
+                if camera_name in failed_cameras:
+                    continue
+                try:
+                    frame = capture_frame(camera_name)
+                except (RuntimeError, ImportError) as e:
+                    print(f"[CAPTURE SKIPPED] '{camera_name}' unavailable: {e}")
+                    failed_cameras.add(camera_name)
+                    continue
+                image_path = save_image(frame, sample_id, camera_name, i)
+                image_paths.append(image_path)
+                captured_this_step = True
+                publish_capture_status("image", category=category,
+                                        sample_id=sample_id, image_index=i,
+                                        camera=camera_name)
+
+            if not captured_this_step:
+                print(f"[WARNING] No camera produced a frame for image {i + 1}")
+
+        if not image_paths:
+            raise RuntimeError("Automatic capture produced zero images - "
+                                "check camera connections.")
+
+        # Register through 4DAI's own REST API - same endpoints its
+        # "Submit" button uses - so this sample lands in the correct
+        # per-category collection and shows up in 4DAI's "View
+        # Collections" page identically to a manual submission. 4DAI's
+        # code is completely unmodified for this to work.
+        values = {"predicted_label": category, "num_images": len(image_paths)}
+        submit_response = requests.post(
+            f"{FOURDAI_API_URL}/collection/submission",
+            json={"category": category, "date": str(date.today()), "data": values},
+            timeout=10,
+        )
+        submit_response.raise_for_status()
+        fourdai_sample_id = submit_response.json()["sample_id"]
+
+        for image_path in image_paths:
+            with open(image_path, "rb") as image_file:
+                upload_response = requests.post(
+                    f"{FOURDAI_API_URL}/collection/images/upload",
+                    files={"file": image_file},
+                    data={"sample_id": fourdai_sample_id, "category": category},
+                    timeout=10,
+                )
+            upload_response.raise_for_status()
+
+        publish_capture_status("completed", category=category,
+                                sample_id=fourdai_sample_id,
+                                image_paths=image_paths, values=values)
+        print(f"[AUTO CAPTURE COMPLETE] sample_id={fourdai_sample_id}, "
+              f"{len(image_paths)} image(s) uploaded to 4DAI")
+
+    except Exception as e:
+        msg = str(e)
+        print(f"[AUTO CAPTURE ERROR] {msg}")
+        try:
+            publish_capture_status("error", category=category, message=msg)
+        except Exception as publish_err:
+            print(f"[AUTO CAPTURE] Could not report error over MQTT: {publish_err}")
+
+
+def _handle_capture_command(payload: dict) -> None:
+    """MQTT handler for TOPIC_CAPTURE_COMMAND messages from 4DAI.
+    Expected payload: {"category": str, "num_images": int,
+    "degrees_per_step": float, "interval_seconds": float}."""
+    category = payload.get("category", "uncategorized")
+    num_images = int(payload.get("num_images", 5))
+    degrees_per_step = float(payload.get("degrees_per_step", 5.0))
+    interval_seconds = float(payload.get("interval_seconds", 5.0))
+
+    if not try_start_arm_operation("an automatic capture sequence"):
+        return
+    try:
+        run_automatic_capture_sequence(category, num_images,
+                                        degrees_per_step, interval_seconds)
+    finally:
+        finish_arm_operation()
+
+
+def start_capture_command_listener() -> None:
+    """Background thread: subscribes to TOPIC_CAPTURE_COMMAND and runs
+    each command as it arrives. Safe to call even if no MQTT broker is
+    reachable yet - retries quietly rather than crashing the GUI, since
+    this thread is not required for local/manual GUI operation."""
+    def _run():
+        while True:
+            try:
+                subscribe(TOPIC_CAPTURE_COMMAND, _handle_capture_command)
+            except Exception as e:
+                print(f"[MQTT] Capture command listener error, retrying in 5s: {e}")
+                sleep(5)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# =============================================================================
+# GENERIC REMOTE CONTROL — lets anything (4DAI's own "Arm Control" page,
+# an external AI/automation script, a notebook, etc.) drive the arm over
+# MQTT without needing direct access to this machine. Two message
+# shapes, both published to TOPIC_ARM_MOVE_COMMAND:
+#
+#   {"jog": "J4+"}            - start jogging that axis (same as holding
+#                                the arrow/W/S keys in the GUI)
+#   {"jog": "stop"}           - stop jogging
+#   {"j1": .., "j2": .., "j3": .., "j4": ..}
+#                             - absolute joint move (any subset; missing
+#                               joints hold their current position)
+# =============================================================================
+
+def _handle_move_command(payload: dict) -> None:
+    if "jog" in payload:
+        axis_cmd = payload["jog"]
+        if not ROBOT_CONNECTED or not manual_active.get():
+            print(f"[REMOTE JOG IGNORED] robot not connected or manual mode off: {axis_cmd}")
+            return
+        if axis_cmd == "stop":
+            handle_jog_release(None)
+        else:
+            handle_jog_press(axis_cmd)
+        return
+
+    current = robot_data["joints"] if robot_data["joints"] else [0.0, 0.0, 200.0, 0.0]
+    current = (list(current) + [0.0, 0.0, 200.0, 0.0])[:4]
+    j1 = float(payload.get("j1", current[0]))
+    j2 = float(payload.get("j2", current[1]))
+    j3 = float(payload.get("j3", current[2]))
+    j4 = float(payload.get("j4", current[3]))
+
+    if not try_start_arm_operation("a remote move command"):
+        return
+    try:
+        if ROBOT_CONNECTED and robot:
+            move_error = robot.movement.joint_to_joint_move([j1, j2, j3, j4])
+            if move_error is not None:
+                print(f"[REMOTE MOVE ERROR]: {move_error}")
+            else:
+                robot.movement.sync()
+        else:
+            print(f"DEMO MODE: remote move to J1={j1:.1f} J2={j2:.1f} "
+                  f"J3={j3:.1f} J4={j4:.1f}")
+    finally:
+        finish_arm_operation()
+
+
+def start_move_command_listener() -> None:
+    """Background thread: subscribes to TOPIC_ARM_MOVE_COMMAND for
+    generic remote control (an AI model, external script, etc.)."""
+    def _run():
+        while True:
+            try:
+                subscribe(TOPIC_ARM_MOVE_COMMAND, _handle_move_command)
+            except Exception as e:
+                print(f"[MQTT] Move command listener error, retrying in 5s: {e}")
+                sleep(5)
+
+    threading.Thread(target=_run, daemon=True).start()
+
 
 def dobot_error_reset():
     if ROBOT_CONNECTED and robot:
@@ -824,6 +1271,32 @@ error_button.pack(pady=5)
 # Button to add test points from list
 test_points_button = tk.Button(frame, text="Add Test Points", command=add_test_points_from_list, )
 test_points_button.pack(pady=5)
+
+# --- Vision pipeline entry point (yellow star = photo station on the plot) ---
+def prompt_pickup_and_photograph():
+    """Reuses the same X/Y/Z manual-entry fields as 'Add Point', but routes
+    into the full pickup -> photo-station -> multi-view capture pipeline
+    instead of just queueing a FIFO point."""
+    try:
+        x_val = float(x_manual_entry.get())
+        y_val = float(y_manual_entry.get())
+        z_val = float(z_manual_entry.get())
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Enter numeric X, Y, Z in the manual fields above first.")
+        return
+
+    if not (5.0 <= z_val <= 245.0):
+        messagebox.showerror("Invalid Z-Value", "Z-value must be between 5 and 245 mm")
+        return
+    if not is_inside(x_val, y_val):
+        messagebox.showerror("Invalid Point", f"Point ({x_val:.2f}, {y_val:.2f}) is outside the valid region")
+        return
+
+    run_pickup_photograph_and_identify(x_val, y_val, z_val)
+
+vision_button = tk.Button(frame, text="Pickup & Photograph (uses X/Y/Z above)",
+                           command=prompt_pickup_and_photograph, bg="khaki")
+vision_button.pack(pady=5)
 
 # Custom dialog for Z-value and claw state
 
@@ -1020,6 +1493,146 @@ instructions = tk.Label(frame, text="Instructions:\n1. Click points on plot OR\n
                        justify=tk.LEFT, font=("Arial", 9), bg="lightyellow")
 instructions.pack(pady=10)
 
+# =============================================================================
+# MongoDB gallery panel — browse captured samples/images stored in Mongo,
+# plus a standalone "Capture Photo" button for a single quick snapshot
+# (no arm movement, no multi-view rotation, no identification — just grab
+# one frame from the station camera and log it).
+# =============================================================================
+gallery_frame = tk.Frame(main_container, width=280, bg="#f0f0f0", bd=1, relief=tk.SUNKEN)
+# NOTE: Tkinter's side=RIGHT packing stacks outward in the order widgets
+# are packed — whichever is packed FIRST ends up visually rightmost/
+# outermost. `frame` (the control panel) was already packed earlier in
+# this file, so without `before=frame` here, this new gallery panel would
+# land sandwiched between the plot and the control buttons instead of
+# sitting past them on the far right. `before=frame` forces the intended
+# left-to-right reading order: plot | controls | gallery.
+gallery_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5, before=frame)
+gallery_frame.pack_propagate(False)
+
+# =============================================================================
+# Live camera feed — continuous preview from any configured camera
+# (vision.config.CAMERAS), not just a single snapshot. Runs as a
+# self-rescheduling root.after() loop: each tick grabs one frame in a
+# background thread (camera reads shouldn't block the GUI thread), then
+# marshals the resulting PhotoImage back via root.after(0, ...) before
+# scheduling the next tick. A busy-flag prevents ticks piling up if a
+# camera read is slow. Works for however many cameras are configured -
+# the dropdown is populated straight from CAMERAS, so adding a third/
+# fourth camera in vision/config.py makes it selectable here with no
+# other code changes.
+# =============================================================================
+tk.Label(gallery_frame, text="Live Camera Feed",
+         font=("Arial", 11, "bold"), bg="#f0f0f0").pack(pady=(10, 5))
+
+_camera_names = list(list_configured_cameras().keys()) or ["station"]
+live_feed_camera_var = tk.StringVar(value=_camera_names[0])
+tk.OptionMenu(gallery_frame, live_feed_camera_var, *_camera_names).pack(pady=2)
+
+live_feed_button_row = tk.Frame(gallery_frame, bg="#f0f0f0")
+live_feed_button_row.pack(pady=4)
+
+live_feed_status_label = tk.Label(gallery_frame, text="Stopped",
+                                   font=("Arial", 8), bg="#f0f0f0", fg="gray")
+live_feed_status_label.pack()
+
+live_feed_label = tk.Label(gallery_frame, bg="#222222", width=32, height=10,
+                            text="Live feed will appear here", fg="white",
+                            justify=tk.CENTER)
+live_feed_label.pack(padx=8, pady=8)
+
+live_feed_active = False
+live_feed_busy = False
+
+
+def _schedule_next_live_feed_tick():
+    if live_feed_active:
+        root.after(int(1000 / LIVE_FEED_FPS), _live_feed_tick)
+
+
+def _live_feed_tick():
+    global live_feed_busy
+    if not live_feed_active:
+        return
+    if live_feed_busy:
+        # Previous tick's camera read hasn't finished yet — skip this
+        # tick rather than piling up threads.
+        _schedule_next_live_feed_tick()
+        return
+
+    live_feed_busy = True
+    camera_name = live_feed_camera_var.get()
+
+    def grab():
+        global live_feed_busy
+        try:
+            frame = capture_frame(camera_name)
+            rgb = frame_to_rgb(frame)
+        except Exception as e:
+            msg = str(e)
+
+            def on_error():
+                global live_feed_busy
+                live_feed_busy = False
+                live_feed_status_label.config(text=f"Error: {msg}", fg="red")
+                stop_live_feed()
+
+            root.after(0, on_error)
+            return
+
+        def apply():
+            global live_feed_busy
+            try:
+                if _PIL_AVAILABLE:
+                    img = Image.fromarray(rgb)
+                    img.thumbnail((260, 200))
+                    photo = ImageTk.PhotoImage(img)
+                    live_feed_label.image = photo  # keep a reference
+                    live_feed_label.config(image=photo, text="")
+                else:
+                    live_feed_label.config(
+                        text="Pillow not installed.\nRun: pip install Pillow")
+            finally:
+                live_feed_busy = False
+                _schedule_next_live_feed_tick()
+
+        root.after(0, apply)
+
+    threading.Thread(target=grab, daemon=True).start()
+
+
+def start_live_feed():
+    global live_feed_active
+    if live_feed_active:
+        return
+    if not _PIL_AVAILABLE:
+        messagebox.showwarning("Pillow Required", "Run: pip install Pillow")
+        return
+    live_feed_active = True
+    live_feed_status_label.config(text=f"Live — {live_feed_camera_var.get()}", fg="green")
+    _schedule_next_live_feed_tick()
+
+
+def stop_live_feed():
+    global live_feed_active
+    live_feed_active = False
+    live_feed_status_label.config(text="Stopped", fg="gray")
+
+
+tk.Button(live_feed_button_row, text="Start Feed", bg="lightgreen",
+          command=start_live_feed).pack(side=tk.LEFT, padx=4)
+tk.Button(live_feed_button_row, text="Stop Feed",
+          command=stop_live_feed).pack(side=tk.LEFT, padx=4)
+
+tk.Label(gallery_frame, text="Captured Objects",
+         font=("Arial", 11, "bold"), bg="#f0f0f0").pack(pady=(10, 5))
+tk.Label(gallery_frame, text="Browse captured samples in 4DAI's\n"
+         "'View Collections' page — this app no\n"
+         "longer keeps its own local copy.",
+         font=("Arial", 8), bg="#f0f0f0", fg="gray",
+         justify=tk.CENTER).pack(pady=(0, 10))
+
+
 # --- KEYBOARD BINDINGS ---
 # --- NEW AREA C: JOGGING BINDINGS ---
 
@@ -1044,9 +1657,57 @@ root.bind("<KeyRelease-w>",   handle_jog_release)
 root.bind("<KeyPress-s>",     lambda e: handle_jog_press("J3-"))
 root.bind("<KeyRelease-s>",   handle_jog_release)
 
+# J4 Control (Wrist rotation)
+root.bind("<KeyPress-q>",     lambda e: handle_jog_press("J4+"))
+root.bind("<KeyRelease-q>",   handle_jog_release)
+
+root.bind("<KeyPress-e>",     lambda e: handle_jog_press("J4-"))
+root.bind("<KeyRelease-e>",   handle_jog_release)
+
 
 
 update_gui_from_feedback()
+
+# Start listening for automatic-capture commands published by 4DAI (see
+# vision/config.py TOPIC_CAPTURE_COMMAND). This is what lets 4DAI's GUI
+# trigger a full "rotate + photograph" sequence with no manual
+# button-clicking on the arm side, per the transcript's requirement.
+start_capture_command_listener()
+
+# Generic remote control - lets 4DAI's own Arm Control page, an external
+# AI model, or any other MQTT publisher move the arm without touching
+# this machine (see TOPIC_ARM_MOVE_COMMAND in vision/config.py).
+start_move_command_listener()
+
+
+def on_app_close():
+    """Release camera handles, the laser's serial connection, and the
+    MQTT client cleanly on exit rather than leaving them open/locked."""
+    global live_feed_active
+    live_feed_active = False  # stop the self-rescheduling live feed loop
+
+    try:
+        from vision.camera.capture import release_all
+        release_all()
+    except Exception as e:
+        print(f"[CLEANUP] Camera release skipped: {e}")
+
+    try:
+        from vision.camera.laser import close as close_laser
+        close_laser()
+    except Exception as e:
+        print(f"[CLEANUP] Laser close skipped: {e}")
+
+    try:
+        from vision.messaging.publisher import disconnect as disconnect_mqtt
+        disconnect_mqtt()
+    except Exception as e:
+        print(f"[CLEANUP] MQTT disconnect skipped: {e}")
+
+    root.destroy()
+
+
+root.protocol("WM_DELETE_WINDOW", on_app_close)
 root.mainloop()
 
 

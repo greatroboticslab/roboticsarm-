@@ -4,3 +4,7 @@ matplotlib
 customtkinter
 pyserial
 ikpy
+opencv-python
+paho-mqtt
+pymongo
+Pillow
