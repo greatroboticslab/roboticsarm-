@@ -32,28 +32,37 @@ NUM_VIEWS = 6
 # to avoid motion blur from residual swing of the held object.
 VIEW_SETTLE_SECONDS = 0.2
 
-# ---------------------------------------------------------------------------
-# Camera — USB (OpenCV / UVC). Supports any number of cameras, each given
-# a name. Device indices are OS-assigned by plug order; confirm with
-# `python -m vision.camera.capture` (no .py) once cameras are plugged in.
-#
-# Add/remove entries here for however many cameras you actually have -
-# nothing else in the code needs to change. "station" and "wrist" are
-# just the two names the existing pipeline already uses; add more (e.g.
-# "overhead", "side") and they immediately become selectable in the live
-# feed panel and available to capture_frame().
-# ---------------------------------------------------------------------------
-CAMERAS = {
-    "station": 0,
-    "wrist": 1,
-}
-CAMERA_FRAME_WIDTH = 1280
-CAMERA_FRAME_HEIGHT = 720
+# ===========================================================================
+# ENVIRONMENT TOGGLE
+# ===========================================================================
+TEST_MODE = True  # Default to Local. Set to False to target 3.134.125.175
 
-# How often the live preview panel grabs a new frame. Lower = smoother
-# but more CPU/USB bandwidth; 10 fps is a reasonable default for a
-# Tkinter preview (not meant to be broadcast-quality video).
-LIVE_FEED_FPS = 10
+if TEST_MODE:
+    FOURDAI_API_URL = "http://localhost:8000"
+    MQTT_BROKER_HOST = "localhost"
+    MQTT_BROKER_PORT = 1883
+    MONGO_URI = "mongodb://localhost:27017"
+else:
+    FOURDAI_API_URL = "http://3.134.125.175:443" 
+    MQTT_BROKER_HOST = "3.134.125.175"
+    MQTT_BROKER_PORT = 1883
+    MONGO_URI = "mongodb://3.134.125.175:27017"
+
+# Database collections
+MONGO_DB_NAME = "Collections"
+MONGO_OBJECTS_COLLECTION = "objects"
+MONGO_IMAGES_COLLECTION = "images"
+
+# ===========================================================================
+# SWEEP SETTINGS
+# ===========================================================================
+# NOTE: local camera hardware settings (CAMERAS, CAMERA_FRAME_WIDTH/HEIGHT,
+# LIVE_FEED_FPS) have been removed. All photo capture is now handed off to
+# 4DAI over REST (see /collection/trigger-webcam-capture calls in
+# main-arm.py) - this machine no longer owns any camera hardware.
+
+# How many degrees of movement across J1, J2, or J3 triggers a photo
+SWEEP_TRIGGER_DEGREES = 25.0
 
 # ---------------------------------------------------------------------------
 # Laser — USB serial (pyserial, already in requirements.txt). Most USB
@@ -72,15 +81,7 @@ LASER_BAUD_RATE = 9600
 LASER_ON_COMMAND = b"1"
 LASER_OFF_COMMAND = b"0"
 
-# ---------------------------------------------------------------------------
-# MQTT broker placeholders.
-# ---------------------------------------------------------------------------
-MQTT_BROKER_HOST = "localhost"
-MQTT_BROKER_PORT = 1883
 
-TOPIC_ARM_OBJECT_CAPTURED = "arm/object/captured"
-TOPIC_VISION_RESULT = "vision/result"
-TOPIC_ARM_COMMAND = "arm/command"
 
 # ---------------------------------------------------------------------------
 # 4DAI <-> arm automation contract.
@@ -99,17 +100,7 @@ TOPIC_ARM_COMMAND = "arm/command"
 # on both sides (arm: vision/config.py, 4DAI: Server/bridge_config.py) if
 # you ever rename them.
 # ---------------------------------------------------------------------------
-TOPIC_CAPTURE_COMMAND = "4dai/capture/command"       # 4DAI -> arm: start a sequence
 TOPIC_CAPTURE_STATUS = "arm/capture/status"          # arm -> 4DAI: progress/result
-
-# ---------------------------------------------------------------------------
-# 4DAI's FastAPI server (4DAI-main/Server/main.py) — completely
-# unmodified. The arm registers each automatic capture through 4DAI's
-# own existing REST endpoints (/collection/submission,
-# /collection/images/upload), the same ones its manual "Submit" flow
-# already used, so no code on the 4DAI side needs to change at all.
-# ---------------------------------------------------------------------------
-FOURDAI_API_URL = "http://localhost:8000"
 
 # ---------------------------------------------------------------------------
 # Generic remote arm control. Anything - 4DAI's own UI, an external
@@ -119,14 +110,13 @@ FOURDAI_API_URL = "http://localhost:8000"
 #   {"j1": .., "j2": .., "j3": .., "j4": ..}             - absolute move
 # See main.py: _handle_move_command().
 # ---------------------------------------------------------------------------
-TOPIC_ARM_MOVE_COMMAND = "arm/command/move"
 
-# ---------------------------------------------------------------------------
-# MongoDB placeholders — same database 4DAI's server uses, so 4DAI's
-# view_data.py can browse the "objects" category with zero changes on
-# its side.
-# ---------------------------------------------------------------------------
-MONGO_URI = "mongodb://localhost:27017"
-MONGO_DB_NAME = "Collections"
-MONGO_OBJECTS_COLLECTION = "objects"
-MONGO_IMAGES_COLLECTION = "images"
+# ===========================================================================
+# MQTT TOPICS
+# ===========================================================================
+TOPIC_CAPTURE_COMMAND = "arm/command/capture"
+TOPIC_ARM_MOVE_COMMAND = "arm/command/move"
+TOPIC_ARM_OBJECT_CAPTURED = "arm/event/captured"
+TOPIC_ARM_CAPTURE_STATUS = "arm/event/status"
+TOPIC_VISION_RESULT = "vision/event/result"
+TOPIC_TELEMETRY = "arm/telemetry"

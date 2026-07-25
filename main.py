@@ -1,35 +1,23 @@
 import math
 import threading
 from time import sleep
+import time
 from datetime import date
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from dobot_util import Dobot
 
-from vision.config import PHOTO_STATION, NUM_VIEWS, VIEW_SETTLE_SECONDS, LIVE_FEED_FPS
-from vision.camera.capture import (
-    capture_station_frame,
-    capture_wrist_frame,
-    capture_frame,
-    list_configured_cameras,
-    frame_to_rgb,
-    save_image,
-    new_sample_id,
-)
+import uuid
+from vision.config import PHOTO_STATION, NUM_VIEWS, VIEW_SETTLE_SECONDS
 import requests
 from vision.config import TOPIC_CAPTURE_COMMAND, TOPIC_ARM_MOVE_COMMAND, FOURDAI_API_URL
-from vision.messaging.publisher import publish_captured, publish_capture_status
+from vision.messaging.publisher import publish_capture_status
 from vision.messaging.subscriber import subscribe
-
-try:
-    from PIL import Image, ImageTk
-    _PIL_AVAILABLE = True
-except ImportError:
-    _PIL_AVAILABLE = False
 
 # Global anchor for the matplotlib live tracking marker
 live_dot = None
@@ -754,20 +742,18 @@ def add_dobot_instructions():
 
     process_next_point()
 
-def pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z):
+def pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z, category="uncategorized"):
     """
-    [WIRED merge / STUB hardware] Full capture pipeline:
-    pick up object -> move to fixed photo station -> rotate J4 through
-    NUM_VIEWS steps capturing station+wrist frames at each step ->
-    hand the set off to the vision pipeline via MQTT.
+    Full capture pipeline: pick up object -> move to fixed photo station ->
+    rotate J4 through NUM_VIEWS steps -> ask 4DAI to take a photo at each
+    step.
 
-    This function itself is fully wired into the arm's motion/claw
-    control (real, tested code paths - move_to_point/Ikinematics/
-    set_claw_dual_output). It calls into vision.camera.capture and
-    vision.messaging.publisher, which are currently stubs that raise
-    NotImplementedError - that's expected until cameras/broker are set
-    up. The error is caught and reported through the GUI rather than
-    crashing the app.
+    Camera hardware/capture is no longer handled on this machine at all -
+    every "take a photo now" moment is a REST call to 4DAI's
+    `/collection/trigger-webcam-capture` endpoint (the same endpoint
+    `run_continuous_sweep` below uses), and 4DAI owns the actual webcam,
+    image storage, and Mongo record from there. This function only drives
+    the arm and tells 4DAI when to snap each view.
     """
     global robot
 
@@ -796,19 +782,11 @@ def pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z):
     else:
         print(f"DEMO MODE: moving to photo station {PHOTO_STATION}")
 
-    # 3. Rotate J4 through NUM_VIEWS steps, capturing station + wrist frames
-    sample_id = new_sample_id()
+    # 3. Rotate J4 through NUM_VIEWS steps, asking 4DAI to snap a photo at
+    #    each step instead of grabbing a frame from a local camera.
+    sample_id = str(uuid.uuid4())
     step_deg = 360.0 / NUM_VIEWS
-    views = []
-
-    # Work over however many cameras are actually configured in
-    # vision/config.py's CAMERAS dict, not just a hardcoded station+wrist
-    # pair. If a camera is missing/unplugged, it's skipped rather than
-    # aborting the whole sequence - once a camera fails, it's remembered
-    # for the rest of THIS capture run so we don't waste time retrying a
-    # known-dead camera on every single rotation step.
-    cameras_to_use = list_configured_cameras()
-    failed_cameras = set()
+    triggered = 0
 
     for i in range(NUM_VIEWS):
         j4_target = base_j4 + (i * step_deg)
@@ -819,45 +797,46 @@ def pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z):
             print(f"DEMO MODE: rotating to J4={j4_target:.1f} deg (view {i+1}/{NUM_VIEWS})")
         sleep(VIEW_SETTLE_SECONDS)
 
-        pose_snapshot = {"j1": base_j1, "j2": base_j2, "z": base_z, "j4": j4_target}
+        try:
+            trigger_payload = {
+                "category": category,
+                "sample_id": sample_id,
+                "image_index": i,
+                "source": "robotic_arm_photo_station",
+            }
+            res = requests.post(
+                f"{FOURDAI_API_URL}/collection/trigger-webcam-capture",
+                json=trigger_payload,
+                timeout=5,
+            )
+            if res.status_code == 200:
+                triggered += 1
+                print(f"[REMOTE TRIGGER] Sent capture trigger #{i} for category '{category}'")
+            else:
+                print(f"[REMOTE TRIGGER] Server returned status code {res.status_code}")
+        except Exception as err:
+            print(f"[TRIGGER ERROR] Could not reach website trigger endpoint: {err}")
 
-        for camera_name in cameras_to_use:
-            if camera_name in failed_cameras:
-                continue
-            try:
-                frame = capture_frame(camera_name)
-            except (RuntimeError, ImportError) as e:
-                print(f"[CAPTURE SKIPPED] Camera '{camera_name}' unavailable — "
-                      f"skipping it for the rest of this capture: {e}")
-                failed_cameras.add(camera_name)
-                continue
-            image_path = save_image(frame, sample_id, camera_name, i)
-            views.append({"source": camera_name, "view_index": i,
-                          "image_path": image_path, "pose": pose_snapshot})
+        publish_capture_status("image_triggered", category=category,
+                                sample_id=sample_id, image_index=i)
 
-    if not views:
-        raise RuntimeError(
-            f"No cameras were available — capture produced zero images. "
-            f"Configured cameras: {list(cameras_to_use.keys())}. Check "
-            f"connections and run `python -m vision.camera.capture` (no .py)."
+    if triggered == 0:
+        raise ConnectionError(
+            f"Could not reach 4DAI at {FOURDAI_API_URL} for any of the "
+            f"{NUM_VIEWS} view(s) — no capture triggers were sent. Check "
+            f"that 4DAI's server is running and FOURDAI_API_URL in "
+            f"vision/config.py is correct."
         )
 
-    if failed_cameras:
-        print(f"[CAPTURE COMPLETE WITH GAPS] Sample {sample_id}: "
-              f"{len(views)} image(s) captured; cameras unavailable this "
-              f"run: {sorted(failed_cameras)}")
-
-    # 4. Hand off to the vision pipeline (raises NotImplementedError until
-    #    an MQTT broker is configured)
-    publish_captured(sample_id, views, PHOTO_STATION)
-    print(f"[CAPTURE COMPLETE] sample_id={sample_id}, {len(views)} views published")
+    publish_capture_status("completed", category=category, sample_id=sample_id)
+    print(f"[CAPTURE COMPLETE] sample_id={sample_id}, {triggered}/{NUM_VIEWS} view(s) triggered")
     return sample_id
 
 
-def run_pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z):
-    """Background-thread wrapper so hardware/broker errors (missing
-    camera, unplugged laser, no MQTT broker running, etc.) show a clean
-    dialog instead of freezing or crashing the Tkinter main loop.
+def run_pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z, category="uncategorized"):
+    """Background-thread wrapper so errors (unreachable 4DAI server, no
+    MQTT broker running, etc.) show a clean dialog instead of freezing or
+    crashing the Tkinter main loop.
 
     BUGFIX: `except X as e:` bindings are deleted by Python the moment the
     except block ends (this is standard Python behavior, not a mistake in
@@ -872,17 +851,10 @@ def run_pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z):
         if not try_start_arm_operation("the pickup & photograph pipeline"):
             return
         try:
-            pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z)
-        except NotImplementedError as e:
-            msg = str(e)
-            root.after(0, lambda msg=msg: messagebox.showinfo(
-                "Not Implemented Yet",
-                f"Pipeline reached an unfinished piece:\n\n{msg}"))
+            pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z, category)
         except (ImportError, RuntimeError, IOError, ConnectionError) as e:
-            # These are now the expected real-world failure modes now that
-            # camera/laser/MQTT are wired to real hardware/services rather
-            # than stubs: missing dependency, camera not found, broker not
-            # running, etc. Reported the same clean way rather than a raw
+            # Expected real-world failure modes: 4DAI unreachable, no MQTT
+            # broker running, etc. Reported cleanly rather than a raw
             # traceback dialog.
             msg = str(e)
             root.after(0, lambda msg=msg: messagebox.showwarning(
@@ -897,130 +869,91 @@ def run_pickup_photograph_and_identify(pickup_x, pickup_y, pickup_z):
     threading.Thread(target=execute, daemon=True).start()
 
 
-def run_automatic_capture_sequence(category: str, num_images: int,
-                                    degrees_per_step: float,
-                                    interval_seconds: float) -> None:
+def run_continuous_sweep(category="default", target_j1=0.0, target_j2=0.0, target_j3=200.0, target_j4=25.0):
     """
-    [WIRED] The full "no manual clicking" capture loop: from wherever the
-    arm currently is, rotate J4 by `degrees_per_step` degrees, wait
-    `interval_seconds` to settle, take a photo with a local camera, and
-    repeat `num_images` times. Once done, registers the result through
-    4DAI's own existing REST API (/collection/submission,
-    /collection/images/upload) - the exact endpoints its manual "Submit"
-    flow already used - so 4DAI needs zero code changes for this to work.
-
-    Runs inline on whatever thread calls it - callers (the MQTT command
-    handler below) are responsible for running it off the Tkinter main
-    thread and holding arm_operation_lock, same convention as
-    run_pickup_photograph_and_identify.
+    Executes an arm sweep and sends photo capture triggers to 
+    the web server instead of using local OpenCV hardware cameras.
     """
-    sample_id = new_sample_id()
-    image_paths = []
+    global robot
+    print(f"[SWEEP START] Category: '{category}' | Target: ({target_j1}, {target_j2}, {target_j3}, {target_j4})")
 
-    try:
-        publish_capture_status("started", category=category,
-                                sample_id=sample_id,
-                                num_images=num_images,
-                                degrees_per_step=degrees_per_step)
+    sample_id = f"sweep_{int(time.time())}"
 
-        base_joints = list(robot_data["joints"]) if robot_data["joints"] else [0.0, 0.0, 200.0, 0.0]
-        base_j1, base_j2, base_z, base_j4 = (base_joints + [0.0, 0.0, 200.0, 0.0])[:4]
+    if ROBOT_CONNECTED and robot:
+        robot.movement.sync()
 
-        cameras_to_use = list_configured_cameras()
-        failed_cameras = set()
+    SWEEP_TRIGGER_DEGREES = 15.0
+    image_index = 0
+    last_capture_joints = [0.0, 0.0, 0.0, 0.0]
+    arm_is_moving = True
 
-        for i in range(num_images):
-            j4_target = base_j4 + (i * degrees_per_step)
+    while arm_is_moving:
+        if ROBOT_CONNECTED and robot:
+            current_joints = [
+                robot.get_j1_angle(),
+                robot.get_j2_angle(),
+                robot.get_j3_angle(),
+                robot.get_j4_angle()
+            ]
+        else:
+            current_joints = [target_j1, target_j2, target_j3, target_j4]
+            arm_is_moving = False  # Single pass in simulation mode
 
-            if ROBOT_CONNECTED and robot:
-                move_error = robot.movement.joint_to_joint_move(
-                    [base_j1, base_j2, base_z, j4_target])
-                if move_error is not None:
-                    raise RuntimeError(f"Move failed at image {i + 1}: {move_error}")
-                robot.movement.sync()
-            else:
-                print(f"DEMO MODE: rotating to J4={j4_target:.1f} deg "
-                      f"(image {i + 1}/{num_images})")
+        delta_j1 = abs(current_joints[0] - last_capture_joints[0])
+        delta_j2 = abs(current_joints[1] - last_capture_joints[1])
+        delta_j3 = abs(current_joints[2] - last_capture_joints[2])
 
-            sleep(interval_seconds)
+        if delta_j1 >= SWEEP_TRIGGER_DEGREES or delta_j2 >= SWEEP_TRIGGER_DEGREES or delta_j3 >= SWEEP_TRIGGER_DEGREES or not arm_is_moving:
 
-            captured_this_step = False
-            for camera_name in cameras_to_use:
-                if camera_name in failed_cameras:
-                    continue
-                try:
-                    frame = capture_frame(camera_name)
-                except (RuntimeError, ImportError) as e:
-                    print(f"[CAPTURE SKIPPED] '{camera_name}' unavailable: {e}")
-                    failed_cameras.add(camera_name)
-                    continue
-                image_path = save_image(frame, sample_id, camera_name, i)
-                image_paths.append(image_path)
-                captured_this_step = True
-                publish_capture_status("image", category=category,
-                                        sample_id=sample_id, image_index=i,
-                                        camera=camera_name)
-
-            if not captured_this_step:
-                print(f"[WARNING] No camera produced a frame for image {i + 1}")
-
-        if not image_paths:
-            raise RuntimeError("Automatic capture produced zero images - "
-                                "check camera connections.")
-
-        # Register through 4DAI's own REST API - same endpoints its
-        # "Submit" button uses - so this sample lands in the correct
-        # per-category collection and shows up in 4DAI's "View
-        # Collections" page identically to a manual submission. 4DAI's
-        # code is completely unmodified for this to work.
-        values = {"predicted_label": category, "num_images": len(image_paths)}
-        submit_response = requests.post(
-            f"{FOURDAI_API_URL}/collection/submission",
-            json={"category": category, "date": str(date.today()), "data": values},
-            timeout=10,
-        )
-        submit_response.raise_for_status()
-        fourdai_sample_id = submit_response.json()["sample_id"]
-
-        for image_path in image_paths:
-            with open(image_path, "rb") as image_file:
-                upload_response = requests.post(
-                    f"{FOURDAI_API_URL}/collection/images/upload",
-                    files={"file": image_file},
-                    data={"sample_id": fourdai_sample_id, "category": category},
-                    timeout=10,
+            # Send remote trigger request to website backend
+            try:
+                trigger_payload = {
+                    "category": category,
+                    "sample_id": sample_id,
+                    "image_index": image_index,
+                    "source": "robotic_arm_sweep"
+                }
+                
+                res = requests.post(
+                    f"{FOURDAI_API_URL}/collection/trigger-webcam-capture",
+                    json=trigger_payload,
+                    timeout=5
                 )
-            upload_response.raise_for_status()
+                if res.status_code == 200:
+                    print(f"[REMOTE TRIGGER] Sent capture trigger #{image_index} for category '{category}'")
+                else:
+                    print(f"[REMOTE TRIGGER] Server returned status code {res.status_code}")
 
-        publish_capture_status("completed", category=category,
-                                sample_id=fourdai_sample_id,
-                                image_paths=image_paths, values=values)
-        print(f"[AUTO CAPTURE COMPLETE] sample_id={fourdai_sample_id}, "
-              f"{len(image_paths)} image(s) uploaded to 4DAI")
+            except Exception as err:
+                print(f"[TRIGGER ERROR] Could not reach website trigger endpoint: {err}")
 
-    except Exception as e:
-        msg = str(e)
-        print(f"[AUTO CAPTURE ERROR] {msg}")
-        try:
-            publish_capture_status("error", category=category, message=msg)
-        except Exception as publish_err:
-            print(f"[AUTO CAPTURE] Could not report error over MQTT: {publish_err}")
+            publish_capture_status("image_triggered", category=category, sample_id=sample_id, image_index=image_index)
+            image_index += 1
+            last_capture_joints = list(current_joints)
+
+        time.sleep(0.1)
+
+    if ROBOT_CONNECTED and robot:
+        robot.movement.sync()
+
+    publish_capture_status("completed", category=category, sample_id=sample_id)
+    print(f"[SWEEP COMPLETE] Sent {image_index} trigger request(s) for category '{category}'.")
 
 
 def _handle_capture_command(payload: dict) -> None:
-    """MQTT handler for TOPIC_CAPTURE_COMMAND messages from 4DAI.
-    Expected payload: {"category": str, "num_images": int,
-    "degrees_per_step": float, "interval_seconds": float}."""
+    """MQTT handler for TOPIC_CAPTURE_COMMAND messages from 4DAI."""
     category = payload.get("category", "uncategorized")
-    num_images = int(payload.get("num_images", 5))
-    degrees_per_step = float(payload.get("degrees_per_step", 5.0))
-    interval_seconds = float(payload.get("interval_seconds", 5.0))
+    
+    # Target coordinates (defaulting to safe values if not provided)
+    target_j1 = float(payload.get("target_j1", 0.0))
+    target_j2 = float(payload.get("target_j2", 0.0))
+    target_j3 = float(payload.get("target_j3", 200.0))
+    target_j4 = float(payload.get("target_j4", 25.0)) # J4 fixed offset
 
-    if not try_start_arm_operation("an automatic capture sequence"):
+    if not try_start_arm_operation("an automatic continuous sweep"):
         return
     try:
-        run_automatic_capture_sequence(category, num_images,
-                                        degrees_per_step, interval_seconds)
+        run_continuous_sweep(category, target_j1, target_j2, target_j3, target_j4)
     finally:
         finish_arm_operation()
 
@@ -1292,11 +1225,55 @@ def prompt_pickup_and_photograph():
         messagebox.showerror("Invalid Point", f"Point ({x_val:.2f}, {y_val:.2f}) is outside the valid region")
         return
 
-    run_pickup_photograph_and_identify(x_val, y_val, z_val)
+    chosen_category = category_entry.get().strip() or "uncategorized"
+    run_pickup_photograph_and_identify(x_val, y_val, z_val, chosen_category)
 
 vision_button = tk.Button(frame, text="Pickup & Photograph (uses X/Y/Z above)",
                            command=prompt_pickup_and_photograph, bg="khaki")
 vision_button.pack(pady=5)
+
+
+# =====================================================================
+# --- NEW: CONTINUOUS SWEEP UI PANEL ---
+# =====================================================================
+sweep_ui_frame = tk.LabelFrame(frame, text=" Continuous Sweep Automation ", padx=5, pady=5)
+sweep_ui_frame.pack(fill=tk.X, pady=10, padx=5)
+
+tk.Label(sweep_ui_frame, text="Category / Folder Name:").pack(anchor=tk.W)
+category_entry = tk.Entry(sweep_ui_frame, width=20)
+category_entry.insert(0, "testing")  # Default placeholder text
+category_entry.pack(fill=tk.X, pady=2)
+
+def trigger_ui_sweep():
+    """Reads the category text box and starts the sweep if valid."""
+    chosen_category = category_entry.get().strip()
+
+    # Simple check: Make sure the text box isn't empty!
+    if not chosen_category:
+        messagebox.showwarning(
+            "Missing Category", 
+            "Please enter a category name in the text box before starting the sweep!"
+        )
+        return
+
+    # User entered a category name—launch the sweep!
+    target_j1, target_j2, target_j3, target_j4 = 0.0, 0.0, 200.0, 25.0
+
+    import threading
+    threading.Thread(
+        target=run_continuous_sweep,
+        args=(chosen_category, target_j1, target_j2, target_j3, target_j4),
+        daemon=True
+    ).start()
+
+tk.Button(
+    sweep_ui_frame, 
+    text="Start Sweep & Upload", 
+    command=trigger_ui_sweep, 
+    bg="lightblue", 
+    font=("Arial", 9, "bold")
+).pack(fill=tk.X, pady=5)
+# =====================================================================
 
 # Custom dialog for Z-value and claw state
 
@@ -1494,12 +1471,11 @@ instructions = tk.Label(frame, text="Instructions:\n1. Click points on plot OR\n
 instructions.pack(pady=10)
 
 # =============================================================================
-# MongoDB gallery panel — browse captured samples/images stored in Mongo,
-# plus a standalone "Capture Photo" button for a single quick snapshot
-# (no arm movement, no multi-view rotation, no identification — just grab
-# one frame from the station camera and log it).
+# Gallery panel — browse captured samples/images. All camera hardware and
+# image storage now lives entirely on the 4DAI side; this app no longer
+# owns a camera, a live preview feed, or a local image cache of any kind.
 # =============================================================================
-gallery_frame = tk.Frame(main_container, width=280, bg="#f0f0f0", bd=1, relief=tk.SUNKEN)
+gallery_frame = tk.Frame(main_container, width=660, bg="#f0f0f0", bd=1, relief=tk.SUNKEN)
 # NOTE: Tkinter's side=RIGHT packing stacks outward in the order widgets
 # are packed — whichever is packed FIRST ends up visually rightmost/
 # outermost. `frame` (the control panel) was already packed earlier in
@@ -1509,120 +1485,6 @@ gallery_frame = tk.Frame(main_container, width=280, bg="#f0f0f0", bd=1, relief=t
 # left-to-right reading order: plot | controls | gallery.
 gallery_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5, before=frame)
 gallery_frame.pack_propagate(False)
-
-# =============================================================================
-# Live camera feed — continuous preview from any configured camera
-# (vision.config.CAMERAS), not just a single snapshot. Runs as a
-# self-rescheduling root.after() loop: each tick grabs one frame in a
-# background thread (camera reads shouldn't block the GUI thread), then
-# marshals the resulting PhotoImage back via root.after(0, ...) before
-# scheduling the next tick. A busy-flag prevents ticks piling up if a
-# camera read is slow. Works for however many cameras are configured -
-# the dropdown is populated straight from CAMERAS, so adding a third/
-# fourth camera in vision/config.py makes it selectable here with no
-# other code changes.
-# =============================================================================
-tk.Label(gallery_frame, text="Live Camera Feed",
-         font=("Arial", 11, "bold"), bg="#f0f0f0").pack(pady=(10, 5))
-
-_camera_names = list(list_configured_cameras().keys()) or ["station"]
-live_feed_camera_var = tk.StringVar(value=_camera_names[0])
-tk.OptionMenu(gallery_frame, live_feed_camera_var, *_camera_names).pack(pady=2)
-
-live_feed_button_row = tk.Frame(gallery_frame, bg="#f0f0f0")
-live_feed_button_row.pack(pady=4)
-
-live_feed_status_label = tk.Label(gallery_frame, text="Stopped",
-                                   font=("Arial", 8), bg="#f0f0f0", fg="gray")
-live_feed_status_label.pack()
-
-live_feed_label = tk.Label(gallery_frame, bg="#222222", width=32, height=10,
-                            text="Live feed will appear here", fg="white",
-                            justify=tk.CENTER)
-live_feed_label.pack(padx=8, pady=8)
-
-live_feed_active = False
-live_feed_busy = False
-
-
-def _schedule_next_live_feed_tick():
-    if live_feed_active:
-        root.after(int(1000 / LIVE_FEED_FPS), _live_feed_tick)
-
-
-def _live_feed_tick():
-    global live_feed_busy
-    if not live_feed_active:
-        return
-    if live_feed_busy:
-        # Previous tick's camera read hasn't finished yet — skip this
-        # tick rather than piling up threads.
-        _schedule_next_live_feed_tick()
-        return
-
-    live_feed_busy = True
-    camera_name = live_feed_camera_var.get()
-
-    def grab():
-        global live_feed_busy
-        try:
-            frame = capture_frame(camera_name)
-            rgb = frame_to_rgb(frame)
-        except Exception as e:
-            msg = str(e)
-
-            def on_error():
-                global live_feed_busy
-                live_feed_busy = False
-                live_feed_status_label.config(text=f"Error: {msg}", fg="red")
-                stop_live_feed()
-
-            root.after(0, on_error)
-            return
-
-        def apply():
-            global live_feed_busy
-            try:
-                if _PIL_AVAILABLE:
-                    img = Image.fromarray(rgb)
-                    img.thumbnail((260, 200))
-                    photo = ImageTk.PhotoImage(img)
-                    live_feed_label.image = photo  # keep a reference
-                    live_feed_label.config(image=photo, text="")
-                else:
-                    live_feed_label.config(
-                        text="Pillow not installed.\nRun: pip install Pillow")
-            finally:
-                live_feed_busy = False
-                _schedule_next_live_feed_tick()
-
-        root.after(0, apply)
-
-    threading.Thread(target=grab, daemon=True).start()
-
-
-def start_live_feed():
-    global live_feed_active
-    if live_feed_active:
-        return
-    if not _PIL_AVAILABLE:
-        messagebox.showwarning("Pillow Required", "Run: pip install Pillow")
-        return
-    live_feed_active = True
-    live_feed_status_label.config(text=f"Live — {live_feed_camera_var.get()}", fg="green")
-    _schedule_next_live_feed_tick()
-
-
-def stop_live_feed():
-    global live_feed_active
-    live_feed_active = False
-    live_feed_status_label.config(text="Stopped", fg="gray")
-
-
-tk.Button(live_feed_button_row, text="Start Feed", bg="lightgreen",
-          command=start_live_feed).pack(side=tk.LEFT, padx=4)
-tk.Button(live_feed_button_row, text="Stop Feed",
-          command=stop_live_feed).pack(side=tk.LEFT, padx=4)
 
 tk.Label(gallery_frame, text="Captured Objects",
          font=("Arial", 11, "bold"), bg="#f0f0f0").pack(pady=(10, 5))
@@ -1681,17 +1543,9 @@ start_move_command_listener()
 
 
 def on_app_close():
-    """Release camera handles, the laser's serial connection, and the
-    MQTT client cleanly on exit rather than leaving them open/locked."""
-    global live_feed_active
-    live_feed_active = False  # stop the self-rescheduling live feed loop
-
-    try:
-        from vision.camera.capture import release_all
-        release_all()
-    except Exception as e:
-        print(f"[CLEANUP] Camera release skipped: {e}")
-
+    """Release the laser's serial connection and the MQTT client cleanly
+    on exit rather than leaving them open/locked. No camera handles to
+    release here — camera hardware is owned entirely by 4DAI now."""
     try:
         from vision.camera.laser import close as close_laser
         close_laser()
