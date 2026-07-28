@@ -120,3 +120,76 @@ Troubleshooting tips:
 - If you cannot reach the robot, try pinging the robot IP from a terminal to confirm connectivity.
 
 If you'd like, I can extract exact connection fields and button names from `Interface.py` and update the README to show the exact GUI steps (I won't modify `Interface.py` itself unless you ask).
+
+## Integration with 4DAI Server
+
+This arm no longer owns any camera hardware directly. Photo capture has
+been handed off entirely to the **4DAI server** — when the arm wants a
+photo taken (during a pickup/photograph sequence or a sweep), it sends a
+capture trigger over HTTP, and 4DAI's Streamlit UI takes the photo using
+the browser's webcam and saves it. The arm never touches `cv2`, a
+webcam, or a live camera preview anymore.
+
+The 4DAI server code lives in this repo under [`server-4dai/`](server-4dai/).
+
+> **Note on this merged codebase:** the local-camera pipeline (`CAMERAS` in
+> `vision/config.py`, the Live Camera Feed panel, `pickup_photograph_and_identify`,
+> `run_automatic_capture_sequence`) is still present and still the default —
+> it was kept as the base. The 4DAI-server-triggered versions of the
+> capture pipeline live alongside it under a `_server_dependent` suffix
+> (e.g. `pickup_photograph_and_identify_server_dependent`,
+> `run_pickup_photograph_and_identify_server_dependent`,
+> `_handle_capture_command_server_dependent`), plus the standalone
+> `run_continuous_sweep` feature and its "Continuous Sweep Automation" UI
+> panel, which have no local-camera equivalent.
+
+### How the two sides talk to each other
+- The arm POSTs to `{FOURDAI_API_URL}/collection/trigger-webcam-capture`
+  whenever it wants a photo taken.
+- 4DAI's UI polls `/collection/check-trigger` and, when a trigger comes
+  in, switches to the Collection page (requesting webcam permission if
+  it hasn't been granted yet) and takes the photo.
+- `FOURDAI_API_URL` is set in `vision/config.py` on the arm side —
+  `http://localhost:8000` for local testing (`TEST_MODE = True`), or the
+  real server address if the arm and server are on separate machines.
+
+### Starting the local 4DAI server
+Run these from `server-4dai/`, in order:
+
+1. **Start MongoDB**
+   ```bash
+   mongosh   # confirms it connects; Ctrl+D to exit
+   ```
+
+2. **Start the FastAPI backend**
+   ```bash
+   cd Server
+   uvicorn main:app --host 0.0.0.0 --port 8000
+   ```
+   Leave this running — this is what both the arm and the Streamlit UI
+   talk to.
+
+3. **Start the Streamlit UI** (in a separate terminal)
+   ```bash
+   cd UI
+   streamlit run home.py
+   ```
+   Opens at `http://localhost:8501`. Check `UI/key.py` points `URL` at
+   the running server (`http://localhost:8000` for local testing).
+
+4. **Grant camera permission once, up front.** Open any category's
+   Collection page in the browser and allow webcam access before
+   relying on automatic capture from the arm — the camera widget has to
+   be visible on-screen for the browser to prompt for permission at all.
+
+With both the arm (`python main.py`) and the 4DAI server/UI running
+locally, a pickup-and-photograph sequence on the arm should trigger a
+photo automatically in the browser and save it under
+`server-4dai/images/<category>/auto_capture/`.
+
+See [`server-4dai/README.md`](server-4dai/README.md) for the full server
+setup and troubleshooting details.
+
+## Video Walkthrough
+
+[![Watch the demo](https://img.youtube.com/vi/GgRfbci3YlA/0.jpg)](https://youtu.be/GgRfbci3YlA)

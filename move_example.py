@@ -2,23 +2,34 @@ from dobot_util import Dobot, DobotError
 from time import sleep
 
 if __name__ == "__main__":
-    # Provide the IP of the Dobot Robot, determine if you want to log or not - read other default arguments and determine what you want to change.
-    robot = Dobot("192.168.1.6", logging = True)
-    
-    # Attempt to turn on the robot with the needed command, could fail - but we assume it works.
+    ip="192.168.1.6"
+    robot = Dobot(ip, logging=True)
+    ROBOT_CONNECTED = False
+
+
+    from dobot_util import Dobot
+    print(f"Attempting to connect to robot at {ip}...")
+        
+    # 1. Establish Network Connection
+        
+    # 2. Bootup Handshake (Critical for Physical Robot)
+    # Clear existing alarms and power on the motors
+    print("here2 ")
+    robot.dashboard.send_command("ClearError()")
+    sleep(0.5)
+    print("Here3")
     robot.dashboard.enable()
-
-    # This is a joint to joint move, so you provide the joint values you want to move to.
-    # The amount of joints needed to pass depends on the robot model type.
-    # For the case of an M1 Pro, it would need to be four floats.
-
-    # Most if not all of the API commands could potentially fail with an error which means YOU need to handle errors.
-    # It is upto the user to determine how to go about errors, ignore them, try to redo the command, or even just panic and exit.
-    # Until positioning is integrated into the move commands, you typically need to sleep between commands or check positioning yourself.
-
+    print("enabled")
+    sleep(5)
+        
+    ROBOT_CONNECTED = True
+    print("Robot connected and enabled successfully!")
+    print("trying move")
     robot.movement.joint_to_joint_move([20.0, 10.0, 150.0, -25,0.5])
+    print("move order sent")
     robot.dashboard.set_digital_output(1, 0)
     sleep(3)
+    print("wait okay hopefuly done")
 
     potential_error = robot.dashboard.set_digital_output(1, 0)
     sleep(3)
@@ -36,12 +47,14 @@ if __name__ == "__main__":
 
 
     """
-    
+    print("done")
     
 
     # If you've got this far, you didn't encounter an error or handled it.
 
     # This API subscribes to the idea that the USER should handle exceptions and not force their hand by raising exceptions, but it comes with the price of simple code being verbose and needing an error handling function.
     # In the future, there will be in-built handler functions on DobotError types to panic or raise exceptions easily, if wanted explicitly.
+
+
 
 
