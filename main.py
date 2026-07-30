@@ -45,7 +45,7 @@ except ImportError:
 # Server URL — where images/samples get uploaded and where the
 # server-triggered capture endpoints live. Starts at whatever
 # vision/config.py has configured (a local test address by default, see
-# TEST_MODE there), but can be changed live from the "Server & Database"
+# TEST_MODE there), but can be changed live from the "Server"
 # tab without editing config.py or restarting the app.
 # ---------------------------------------------------------------------------
 SERVER_URL = FOURDAI_API_URL
@@ -509,10 +509,12 @@ manual_active = tk.BooleanVar(value=False)
 #                               the pickup+photograph vision pipeline, and a
 #                               one-click "Capture Photo" that saves locally,
 #                               logs to MongoDB, and uploads to the server.
-#   Tab 3 "Server & Database" — the server URL (test-local by default),
-#                               connection testing, the server-triggered
-#                               continuous-sweep automation, and a browser
-#                               for what's stored in the local MongoDB.
+#   Tab 3 "Server"            — the server URL (test-local by default),
+#                               connection testing, and the server-
+#                               triggered continuous-sweep automation.
+#   Tab 4 "Database"          — a browser for what's stored in the local
+#                               MongoDB (kept separate from "Server" so
+#                               either can grow independently later).
 # =============================================================================
 notebook = ttk.Notebook(root)
 notebook.pack(fill=tk.BOTH, expand=1)
@@ -533,6 +535,7 @@ _tab_style.map("TNotebook.Tab",
 tab_arm = tk.Frame(notebook)
 tab_camera = tk.Frame(notebook)
 tab_server = tk.Frame(notebook)
+tab_database = tk.Frame(notebook)
 
 # NOTE: widgets added to a Notebook via notebook.add(...) are already
 # geometry-managed BY the notebook — do not also call .pack()/.grid() on
@@ -542,7 +545,8 @@ tab_server = tk.Frame(notebook)
 # clicking between tabs looked like it wasn't doing anything.
 notebook.add(tab_arm, text="Arm Control")
 notebook.add(tab_camera, text="Camera")
-notebook.add(tab_server, text="Server & Database")
+notebook.add(tab_server, text="Server")
+notebook.add(tab_database, text="Database")
 
 # Always boot straight into the Arm Control tab (demo mode banner and
 # all), regardless of insertion order above.
@@ -1233,7 +1237,7 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
             f"Could not reach the configured server at {SERVER_URL} for any of the "
             f"{NUM_VIEWS} view(s) — no capture triggers were sent. Check "
             f"that the server is running and that the URL set on the "
-            f"'Server & Database' tab is correct."
+            f"'Server' tab is correct."
         )
 
     publish_capture_status("completed", category=category, sample_id=sample_id)
@@ -1562,7 +1566,7 @@ vision_button = tk.Button(tab_camera, text="Take Photograph (current position)",
                            command=run_photograph_at_current_position, bg="khaki")
 vision_button.pack(pady=5)
 
-tk.Label(tab_server, text="Server Communication & Local Database",
+tk.Label(tab_server, text="Server Communication",
          font=("Arial", 12, "bold")).pack(pady=(10, 5))
 
 # =====================================================================
@@ -1656,9 +1660,14 @@ tk.Button(
 # LOCAL MONGODB — browse what's actually been captured/stored locally.
 # Uses the same "Collections" database 4DAI's own server points at (see
 # vision/config.py MONGO_URI/MONGO_DB_NAME), so this is a read-only
-# window into the same data, not a separate copy.
+# window into the same data, not a separate copy. Kept on its own
+# "Database" tab (split from "Server") so there's room to grow either
+# one independently later.
 # =====================================================================
-mongo_frame = tk.LabelFrame(tab_server, text=" Local MongoDB ", padx=10, pady=10)
+tk.Label(tab_database, text="Local Database",
+         font=("Arial", 12, "bold")).pack(pady=(10, 5))
+
+mongo_frame = tk.LabelFrame(tab_database, text=" Local MongoDB ", padx=10, pady=10)
 mongo_frame.pack(fill=tk.BOTH, expand=1, padx=10, pady=10)
 
 mongo_status_label = tk.Label(mongo_frame, text="Not tested yet", fg="gray")
@@ -1680,9 +1689,15 @@ mongo_btn_row.pack(fill=tk.X, pady=(2, 6))
 tk.Button(mongo_btn_row, text="Test Mongo Connection", command=test_mongo_connection,
           bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
 
-tk.Label(mongo_frame, text="Recent local captures (newest first):").pack(anchor=tk.W)
+tk.Label(mongo_frame, text="Recent local captures (newest first) — double-click a row to view its photo(s):").pack(anchor=tk.W)
 recent_samples_listbox = tk.Listbox(mongo_frame, height=12)
 recent_samples_listbox.pack(fill=tk.BOTH, expand=1, pady=4)
+
+# Listbox rows are plain text, but we need the actual sample _id behind
+# each row to look up its images — kept in lockstep with the listbox's
+# rows (same index = same row) and rebuilt every refresh.
+_recent_sample_ids = []
+
 
 def refresh_recent_samples():
     """Pull the most recent sample documents from local MongoDB and show
@@ -1698,6 +1713,7 @@ def refresh_recent_samples():
 
         def apply():
             recent_samples_listbox.delete(0, tk.END)
+            _recent_sample_ids.clear()
             if samples is None:
                 recent_samples_listbox.insert(tk.END, f"Error: {err}")
                 return
@@ -1709,10 +1725,89 @@ def refresh_recent_samples():
                 sdate = s.get("date", "?")
                 label = (s.get("data") or {}).get("predicted_label", "")
                 recent_samples_listbox.insert(tk.END, f"{sdate}  |  {label}  |  {sid}")
+                _recent_sample_ids.append(sid)
 
         root.after(0, apply)
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def open_sample_photo_viewer(event=None):
+    """Pop up a window showing every image logged against the
+    double-clicked sample (one row per camera/view, scrollable if there
+    are several)."""
+    selection = recent_samples_listbox.curselection()
+    if not selection:
+        return
+    idx = selection[0]
+    if idx >= len(_recent_sample_ids):
+        return  # clicked on a placeholder row like "(no samples yet)" or "Error: ..."
+    sample_id = _recent_sample_ids[idx]
+
+    if not _PIL_AVAILABLE:
+        messagebox.showwarning("Pillow Required", "Run: pip install Pillow")
+        return
+
+    viewer = tk.Toplevel(root)
+    viewer.title(f"Sample {sample_id}")
+    viewer.geometry("760x600")
+    loading_label = tk.Label(viewer, text="Loading images...", padx=20, pady=20)
+    loading_label.pack()
+
+    def worker():
+        try:
+            image_docs = mongo_client.get_images_for_sample(sample_id)
+        except Exception as e:
+            err = str(e)
+            root.after(0, lambda: loading_label.config(
+                text=f"Could not load images for this sample:\n{err}"))
+            return
+
+        def build_ui():
+            loading_label.destroy()
+            if not image_docs:
+                tk.Label(viewer, text="No images found for this sample.",
+                         padx=20, pady=20).pack()
+                return
+
+            canvas_frame = tk.Frame(viewer)
+            canvas_frame.pack(fill=tk.BOTH, expand=1)
+            scroll_canvas = tk.Canvas(canvas_frame)
+            scrollbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL,
+                                      command=scroll_canvas.yview)
+            inner_frame = tk.Frame(scroll_canvas)
+            inner_frame.bind("<Configure>", lambda e: scroll_canvas.configure(
+                scrollregion=scroll_canvas.bbox("all")))
+            scroll_canvas.create_window((0, 0), window=inner_frame, anchor="nw")
+            scroll_canvas.configure(yscrollcommand=scrollbar.set)
+            scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=1)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+            viewer._photo_refs = []  # keep references so Tk doesn't garbage-collect them
+            for doc in image_docs:
+                path = doc.get("image_path", "")
+                source = doc.get("source", "?")
+                view_index = doc.get("view_index", "?")
+                row = tk.Frame(inner_frame, pady=8)
+                row.pack(fill=tk.X)
+                tk.Label(row, text=f"{source} — view {view_index}",
+                         font=("Arial", 9, "bold")).pack()
+                try:
+                    img = Image.open(path)
+                    img.thumbnail((700, 525))
+                    photo = ImageTk.PhotoImage(img)
+                    viewer._photo_refs.append(photo)
+                    tk.Label(row, image=photo).pack()
+                except Exception as e:
+                    tk.Label(row, text=f"Could not load '{path}': {e}",
+                             fg="red", wraplength=680).pack()
+
+        root.after(0, build_ui)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+recent_samples_listbox.bind("<Double-Button-1>", open_sample_photo_viewer)
 
 tk.Button(mongo_btn_row, text="Refresh", command=refresh_recent_samples,
           bg="lightblue").pack(side=tk.LEFT, padx=4)
@@ -1916,7 +2011,7 @@ instructions.pack(pady=10)
 # CAMERA TAB — live preview (full-size, not a small sidebar bubble), camera
 # selection, and the "Capture Photo" action: grab one frame, save it
 # locally, log it to the local MongoDB, and upload it to whatever server
-# URL is configured on the "Server & Database" tab.
+# URL is configured on the "Server" tab.
 # =============================================================================
 gallery_frame = tk.Frame(tab_camera, bg="#f0f0f0")
 gallery_frame.pack(fill=tk.BOTH, expand=1, padx=10, pady=10)
@@ -2078,7 +2173,7 @@ def capture_photo_and_store():
     — if the server responds — upload each image too, through the same
     /collection/submission + /collection/images/upload endpoints the
     automatic capture sequence uses, against whatever SERVER_URL is
-    currently configured on the "Server & Database" tab.
+    currently configured on the "Server" tab.
     """
     camera_names = list(live_feed_panels.keys()) or list(list_configured_cameras().keys())
     capture_status_label.config(
@@ -2151,7 +2246,7 @@ def capture_photo_and_store():
             try:
                 refresh_recent_samples()
             except NameError:
-                pass  # Server & Database tab not built yet — harmless
+                pass  # Database tab not built yet — harmless
         root.after(0, report)
 
     threading.Thread(target=worker, daemon=True).start()
@@ -2162,8 +2257,9 @@ tk.Button(gallery_frame, text="Capture Photo — All Cameras (Save + Upload)", b
           command=capture_photo_and_store).pack(pady=6)
 
 tk.Label(gallery_frame, text="Captures are saved locally, logged to the local\n"
-         "MongoDB, and uploaded to the server URL configured\n"
-         "on the 'Server & Database' tab.",
+         "MongoDB (browse them on the 'Database' tab), and\n"
+         "uploaded to the server URL configured on the\n"
+         "'Server' tab.",
          font=("Arial", 8), bg="#f0f0f0", fg="gray",
          justify=tk.CENTER).pack(pady=(0, 10))
 
