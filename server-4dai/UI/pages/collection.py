@@ -84,14 +84,51 @@ if True:  # was: if camera:
                     st.session_state.arm_trigger_data = data
                     st.toast(f"🤖 Arm Signal Received! Frame #{data['image_index']} for '{incoming_category}'")
 
-                    # IF AUTO MODE IS ON: Programmatically click the browser camera shutter
+                    # IF AUTO MODE IS ON: Programmatically click the browser camera shutter.
+                    #
+                    # BUGFIX: previously this grabbed the FIRST
+                    # button[data-testid="stCameraButton"] on the whole page —
+                    # correct only by coincidence of "Automatic Capture" being
+                    # rendered before "Manual Photo Capture" below, and silently
+                    # wrong (clicks the manual widget's shutter instead) the
+                    # moment the page is reordered. Now it walks up from each
+                    # candidate button to its camera-input container and picks
+                    # the one whose label text actually matches the Automatic
+                    # Capture widget, so it's correct regardless of page order.
+                    # Also retries a few times (150ms apart) in case the button
+                    # isn't mounted yet the instant this script runs.
                     if auto_mode:
                         st.components.v1.html("""
                             <script>
-                                const cameraBtn = window.parent.document.querySelector('button[data-testid="stCameraButton"]');
-                                if (cameraBtn) {
-                                    cameraBtn.click();
-                                }
+                                (function() {
+                                    function clickAutoShutter(attemptsLeft) {
+                                        const doc = window.parent.document;
+                                        const buttons = doc.querySelectorAll('button[data-testid="stCameraButton"]');
+                                        let target = null;
+                                        for (const btn of buttons) {
+                                            const container = btn.closest('[data-testid="stCameraInput"]') || btn.closest('div');
+                                            if (container && container.innerText &&
+                                                container.innerText.indexOf('Automatic Capture') !== -1) {
+                                                target = btn;
+                                                break;
+                                            }
+                                        }
+                                        // Fallback: if the label-based match didn't find anything
+                                        // (e.g. Streamlit changed its markup), fall back to the
+                                        // first button rather than doing nothing.
+                                        if (!target && buttons.length > 0) {
+                                            target = buttons[0];
+                                        }
+                                        if (target) {
+                                            target.click();
+                                        } else if (attemptsLeft > 0) {
+                                            setTimeout(function() { clickAutoShutter(attemptsLeft - 1); }, 150);
+                                        } else {
+                                            console.warn('[auto-capture] camera shutter button not found after retries');
+                                        }
+                                    }
+                                    clickAutoShutter(5);
+                                })();
                             </script>
                         """, height=0)
                     else:
@@ -112,20 +149,50 @@ if True:  # was: if camera:
         if st.session_state.last_auto_saved_capture != capture_signature:
             timestamp_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             files = {"file": (f"{timestamp_name}.jpg", auto_picture, "image/jpeg")}
+            # BUGFIX: previously didn't forward the arm's sample_id at all, so
+            # every image in a sweep/rotation was saved as an orphan file with
+            # no linking sample record — the server had to invent a bare
+            # "images/<category>/auto_capture/" folder with no Mongo entry
+            # tying it to anything, which is why files existed on disk but the
+            # app (View Collections) could never find/show them. Forwarding
+            # the trigger's sample_id lets the server group every image from
+            # the same sweep under one findable sample.
+            trigger_sample_id = (st.session_state.arm_trigger_data or {}).get("sample_id")
             data = {"category": category, "filename": timestamp_name}
+            if trigger_sample_id:
+                data["sample_id"] = trigger_sample_id
             save_res = requests.post(f"{URL}/collection/auto-capture-image", files=files, data=data)
             if save_res.status_code == 200:
                 st.session_state.last_auto_saved_capture = capture_signature
                 st.toast(f"📸 Auto-saved photo as {save_res.json().get('filename', timestamp_name)}")
             else:
-                st.error("Failed to save the automatically captured photo.")
+                st.error(f"Failed to save the automatically captured photo "
+                         f"(status {save_res.status_code}): {save_res.text}")
 
     st.write("---")
 
     st.subheader("Manual Photo Capture")
     manual_picture = st.camera_input("Take a Picture", key="cam_input_manual")
-    if manual_picture:
-        st.session_state.images.append(manual_picture)
+
+    # BUGFIX: st.camera_input keeps returning the SAME photo across every
+    # rerun until a new one is taken — and this page reruns for reasons
+    # that have nothing to do with the camera (typing into a prompt field,
+    # the automatic-capture listener firing a st.rerun() above, etc). The
+    # old code unconditionally appended on every truthy `manual_picture`,
+    # so a single manual photo could get appended dozens of times and all
+    # of those duplicates got uploaded on Submit. Track the photo's own
+    # file_id (same signature check the automatic-capture branch already
+    # uses above) so a still-unchanged photo doesn't get re-appended, and
+    # a freshly retaken one always saves as this sample's photo.
+    if "last_manual_capture_id" not in st.session_state:
+        st.session_state.last_manual_capture_id = None
+
+    if manual_picture is not None:
+        manual_signature = (manual_picture.file_id if hasattr(manual_picture, "file_id")
+                             else id(manual_picture))
+        if st.session_state.last_manual_capture_id != manual_signature:
+            st.session_state.images.append(manual_picture)
+            st.session_state.last_manual_capture_id = manual_signature
 
     st.write("---")
 # =========================================================================

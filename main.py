@@ -23,6 +23,9 @@ from vision.camera.capture import (
     frame_to_rgb,
     save_image,
     new_sample_id,
+    assign_camera,
+    remove_camera_assignment,
+    list_camera_indices,
 )
 import requests
 from vision.config import (
@@ -35,6 +38,7 @@ from vision.messaging.publisher import publish_captured, publish_capture_status
 from vision.messaging.subscriber import subscribe
 from vision.storage import mongo_client
 
+from laser_control import RelayController
 try:
     from PIL import Image, ImageTk
     _PIL_AVAILABLE = True
@@ -287,7 +291,43 @@ def Ikinematics(x, y, z=200.0, r=0.0):
 
 # --- MANUAL CONTROL STATE ---
 m_x, m_y, m_z = 250.0, 0.0, 200.0 
+m_j4 = 0.0
 m_claw = 0
+
+
+def sync_manual_position_from_feedback(reason: str = "") -> None:
+    """
+    Resyncs the "manual control state" globals (m_x, m_y, m_z, m_j4) to the
+    robot's real, live telemetry (robot_data["cartesian"]/["joints"], the
+    same 50Hz feed the red tracking dot uses).
+
+    WHY THIS EXISTS: m_x/m_y/m_z/m_j4 only get updated automatically inside
+    move_to_point() (used by the click-a-point-on-the-plot flow and the
+    queued-points sender). Several other code paths move the arm directly
+    via robot.movement.joint_to_joint_move() instead - the automatic
+    capture sequence, the pickup+photograph pipeline, remote MQTT move
+    commands, and the manual J1/J2/Z/J4 "Move Joints" button - and none of
+    those touched these globals at all. Left unsynced, the NEXT manual
+    action that reuses them (e.g. "Manual Z", clicking a new point, or
+    sending the point queue - all of which used to hardcode J4 back to 0
+    regardless of the arm's actual wrist angle) would start from a stale
+    pre-move position instead of where the arm actually is now - i.e. the
+    position tracking silently drifts out of sync with the real robot and
+    subsequent "manual" moves jump/snap to positions and wrist angles that
+    were never actually commanded ("making up moves"). This mirrors the
+    same fix already applied to jog release (handle_jog_release) so every
+    direct-move code path stays consistent.
+    """
+    global m_x, m_y, m_z, m_j4
+    cart = robot_data.get("cartesian")
+    if cart and len(cart) >= 3:
+        m_x, m_y, m_z = cart[0], cart[1], cart[2]
+    joints = robot_data.get("joints")
+    if joints and len(joints) >= 4:
+        m_j4 = joints[3]
+    if reason and (cart or joints):
+        print(f"[POSITION SYNC] Manual position resynced after {reason}: "
+              f"X={m_x:.1f} Y={m_y:.1f} Z={m_z:.1f} J4={m_j4:.1f}")
 
 
 
@@ -298,7 +338,7 @@ def safe_move_to_point(x, y, z=200, r=0):
     threading.Thread(target=move_to_point, args=(x, y, z, r), daemon=True).start()
 
 def move_to_point(x, y, z=200, r=0):
-    global m_x, m_y, m_z          # declare global so the assignment below persists
+    global m_x, m_y, m_z, m_j4    # declare global so the assignment below persists
     if is_jogging:
         # messagebox must run on the main thread — schedule it there safely
         root.after(0, lambda: messagebox.showwarning(
@@ -328,7 +368,7 @@ def move_to_point(x, y, z=200, r=0):
             print(f"DEMO MODE: J1={j1:.1f}° J2={j2:.1f}° Z={z_target:.1f}")
 
         # Only reached if the move succeeded (or demo mode) — safe to sync
-        m_x, m_y, m_z = x, y, z
+        m_x, m_y, m_z, m_j4 = x, y, z, r_target
 
     except Exception as e:
         print(f"Robot command failed: {e}")
@@ -352,7 +392,7 @@ def handle_jog_press(axis_cmd):
         is_jogging = True
 
 def handle_jog_release(event):
-    global is_jogging, m_x, m_y, m_z
+    global is_jogging, m_x, m_y, m_z, m_j4
     if ROBOT_CONNECTED:
         robot.movement.safe_move_jog("stop", [])
         is_jogging = False
@@ -376,6 +416,9 @@ def handle_jog_release(event):
             m_x, m_y, m_z = cart[0], cart[1], cart[2]
             print(f"[JOG SYNC] Manual position resynced to actual pose: "
                   f"X={m_x:.1f} Y={m_y:.1f} Z={m_z:.1f}")
+        joints = robot_data.get("joints")
+        if joints and len(joints) >= 4:
+            m_j4 = joints[3]
 
 
 
@@ -386,7 +429,13 @@ def handle_manual_z(dz):
     global m_x, m_y, m_z
     m_z = max(5.0, min(245.0, m_z + dz))
     print(f"Manual Z: moving to Z={m_z:.1f}")
-    safe_move_to_point(m_x, m_y, m_z)
+    # BUGFIX: previously called safe_move_to_point(m_x, m_y, m_z) with no
+    # 4th argument, which defaults to r=0 — meaning every single Z nudge
+    # silently snapped J4 back to 0, regardless of where the wrist
+    # actually was (set via the Move Joints row, a queued point, jogging,
+    # etc). Passing m_j4 now holds whatever J4 is currently tracked
+    # instead of clobbering it.
+    safe_move_to_point(m_x, m_y, m_z, m_j4)
 
 # =====================================================================
 # CLAW DUAL-OUTPUT CONFIGURATION & HANDLER
@@ -481,7 +530,7 @@ def is_inside(px, py):
     return cond1 or cond2 or cond3
 
 # Lists to store valid and invalid points (now with z-values and claw state)
-valid_points = []  # Will store tuples of (px, py, z, claw_state)
+valid_points = []  # Will store tuples of (px, py, z, claw_state, j4)
 valid_scatters = []
 
 # Global references for Joint Entry boxes
@@ -582,6 +631,20 @@ claw_overdrive_btn = tk.Button(overdrive_frame, text="Claw: INACTIVE", width=15,
                                command=handle_manual_claw)
 claw_overdrive_btn.grid(row=1, column=2, padx=5)
 
+# J4 (wrist rotation) Jog Buttons — click-and-hold equivalent of the Q/E
+# keyboard jog bindings, for mouse-only use. Reuses the same continuous
+# jog press/release handlers as every other axis, so behavior (and the
+# "Enable Keyboard Control" safety gate) is identical to the keys.
+j4_minus_btn = tk.Button(overdrive_frame, text="J4 Left (Q)", width=10)
+j4_minus_btn.grid(row=2, column=0, padx=5, pady=(4, 0))
+j4_minus_btn.bind("<ButtonPress-1>", lambda e: handle_jog_press("J4+"))
+j4_minus_btn.bind("<ButtonRelease-1>", handle_jog_release)
+
+j4_plus_btn = tk.Button(overdrive_frame, text="J4 Right (E)", width=10)
+j4_plus_btn.grid(row=2, column=1, padx=5, pady=(4, 0))
+j4_plus_btn.bind("<ButtonPress-1>", lambda e: handle_jog_press("J4-"))
+j4_plus_btn.bind("<ButtonRelease-1>", handle_jog_release)
+
 # Main Title
 tk.Label(manual_frame, text="Manual Control Interface", font=("Arial", 12, "bold")).pack(pady=5)
 
@@ -610,6 +673,14 @@ tk.Label(z_frame, text="Z (mm):").pack()
 z_manual_entry = tk.Entry(z_frame, width=8)
 z_manual_entry.insert(0, "200")
 z_manual_entry.pack()
+
+# J4 input — leave blank to hold whatever J4 is currently tracked
+# (m_j4) rather than snapping the wrist back to 0 on every position move.
+j4_frame = tk.Frame(input_fields_frame)
+j4_frame.pack(side=tk.LEFT, padx=10)
+tk.Label(j4_frame, text="J4 (deg):").pack()
+j4_manual_entry = tk.Entry(j4_frame, width=8)
+j4_manual_entry.pack()
 
 # Claw control (XYZ Row)
 claw_frame = tk.Frame(input_fields_frame)
@@ -648,6 +719,11 @@ j2_entry = tk.Entry(f2, width=8); j2_entry.pack()
 f3 = tk.Frame(joint_fields_frame); f3.pack(side=tk.LEFT, padx=10)
 tk.Label(f3, text="Z (mm):").pack()
 zj_entry = tk.Entry(f3, width=8); zj_entry.insert(0, "200"); zj_entry.pack()
+
+# J4 (wrist rotation) Entry — leave blank to hold the arm's current J4
+f4 = tk.Frame(joint_fields_frame); f4.pack(side=tk.LEFT, padx=10)
+tk.Label(f4, text="J4 (deg):").pack()
+j4_entry = tk.Entry(f4, width=8); j4_entry.pack()
 
 # Claw control (Joint Row)
 claw_frame_j = tk.Frame(joint_fields_frame)
@@ -727,7 +803,16 @@ def add_manual_point():
         y_val = float(y_manual_entry.get())
         z_val = float(z_manual_entry.get())
         claw_state = claw_var.get()  # Get claw state from radio buttons
-        
+
+        # J4 is optional — leave blank to hold whatever J4 is currently
+        # tracked (m_j4) when this point is actually sent, rather than
+        # forcing a specific wrist angle.
+        j4_text = j4_manual_entry.get().strip()
+        j4_val = float(j4_text) if j4_text else None
+        if j4_val is not None and not (-358.0 <= j4_val <= 358.0):
+            messagebox.showerror("Invalid J4-Value", "J4 must be between -358 and 358 degrees")
+            return
+
         # Validate z-value range
         if not (5.0 <= z_val <= 245.0):
             messagebox.showerror("Invalid Z-Value", "Z-value must be between 5 and 245 mm")
@@ -735,13 +820,14 @@ def add_manual_point():
         
         # Check if point is in valid region
         if is_inside(x_val, y_val):
-            # Add valid point with its z-value and claw state
-            valid_points.append((x_val, y_val, z_val, claw_state))
+            # Add valid point with its z-value, claw state, and J4 (None = hold current J4 when sent)
+            valid_points.append((x_val, y_val, z_val, claw_state, j4_val))
             scatter = ax.scatter(x_val, y_val, color='blue', s=50, marker='s')  # Blue square for manual points
             valid_scatters.append(scatter)
             
             claw_text = "ON" if claw_state == 1 else "OFF"
-            points_listbox.insert(tk.END, f"{len(valid_points)}: ({x_val:.2f}, {y_val:.2f}, z={z_val:.1f}, claw={claw_text}) [Manual]")
+            j4_text_display = f"{j4_val:.1f}" if j4_val is not None else "current"
+            points_listbox.insert(tk.END, f"{len(valid_points)}: ({x_val:.2f}, {y_val:.2f}, z={z_val:.1f}, claw={claw_text}, J4={j4_text_display}) [Manual]")
             canvas.draw()
             
             # Clear input fields after successful addition
@@ -749,14 +835,15 @@ def add_manual_point():
             y_manual_entry.delete(0, tk.END)
             z_manual_entry.delete(0, tk.END)
             z_manual_entry.insert(0, "200")  # Reset z to default
+            j4_manual_entry.delete(0, tk.END)
             # Keep claw setting as is (don't reset)
             
-            print(f"Manual point added: ({x_val:.2f}, {y_val:.2f}, z={z_val:.1f}, claw={claw_text})")
+            print(f"Manual point added: ({x_val:.2f}, {y_val:.2f}, z={z_val:.1f}, claw={claw_text}, J4={j4_text_display})")
         else:
             messagebox.showerror("Invalid Point", f"Point ({x_val:.2f}, {y_val:.2f}) is outside the valid region")
             
     except ValueError:
-        messagebox.showerror("Invalid Input", "Please enter valid numeric values for X, Y, and Z coordinates")
+        messagebox.showerror("Invalid Input", "Please enter valid numeric values for X, Y, Z, and J4")
 
 # Function to remove first valid point (FIFO)
 def remove_first_point():
@@ -784,18 +871,29 @@ def add_dobot_instructions():
             finish_arm_operation()
             return
 
-        px, py, point_z, claw_state = valid_points[0]
+        px, py, point_z, claw_state, point_j4 = valid_points[0]
         # Coordinate frame rotation to match physical desk orientation
         x = round(py, 2)
         y = -1 * round(px, 2)
         claw_text = "ON" if claw_state == 1 else "OFF"
-        print(f"Sending point: x={px:.2f}, y={py:.2f}, z={point_z:.2f}, claw={claw_text}")
+        # BUGFIX: every queued point used to be sent with move_to_point's
+        # J4 argument hardcoded to 0 — meaning sending the queue would
+        # silently snap the wrist to 0° on the very first point and hold
+        # it there for every point after, regardless of what J4 was set
+        # to (via the Move Joints row, jogging, or a previous point).
+        # A point can now carry its own J4 (set in the Add Point row or
+        # the click-a-point dialog); if it didn't specify one, hold
+        # whatever J4 is currently tracked instead of forcing it to 0.
+        j4_target = point_j4 if point_j4 is not None else m_j4
+        j4_display = f"{point_j4:.1f}" if point_j4 is not None else f"current ({m_j4:.1f})"
+        print(f"Sending point: x={px:.2f}, y={py:.2f}, z={point_z:.2f}, "
+              f"claw={claw_text}, J4={j4_display}")
 
         def execute_point():
             """Runs in background thread — move, sync, claw, then schedule next."""
             try:
                 # 1. Move to target
-                move_to_point(x, y, point_z, 0)
+                move_to_point(x, y, point_z, j4_target)
 
                 # 2. Block until the physical robot actually stops moving.
                 #    This replaces the fixed 3-second delay and handles both
@@ -976,6 +1074,7 @@ def run_automatic_capture_sequence(category: str, num_images: int,
                 if move_error is not None:
                     raise RuntimeError(f"Move failed at image {i + 1}: {move_error}")
                 robot.movement.sync()
+                sync_manual_position_from_feedback("automatic capture rotation step")
             else:
                 print(f"DEMO MODE: rotating to J4={j4_target:.1f} deg "
                       f"(image {i + 1}/{num_images})")
@@ -1121,6 +1220,7 @@ def _handle_move_command(payload: dict) -> None:
                 print(f"[REMOTE MOVE ERROR]: {move_error}")
             else:
                 robot.movement.sync()
+                sync_manual_position_from_feedback("remote MQTT move command")
         else:
             print(f"DEMO MODE: remote move to J1={j1:.1f} J2={j2:.1f} "
                   f"J3={j3:.1f} J4={j4:.1f}")
@@ -1178,6 +1278,7 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
             print(f"[PICKUP ERROR]: {move_error}")
             return
         robot.movement.sync()
+        sync_manual_position_from_feedback("pipeline pickup move")
     else:
         print(f"DEMO MODE: pickup at ({pickup_x}, {pickup_y}, {pickup_z})")
     set_claw_dual_output(1)  # grip
@@ -1191,6 +1292,7 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
             print(f"[STATION MOVE ERROR]: {move_error}")
             return
         robot.movement.sync()
+        sync_manual_position_from_feedback("pipeline photo-station move")
     else:
         print(f"DEMO MODE: moving to photo station {PHOTO_STATION}")
 
@@ -1205,6 +1307,7 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
         if ROBOT_CONNECTED and robot:
             robot.movement.joint_to_joint_move([base_j1, base_j2, base_z, j4_target])
             robot.movement.sync()
+            sync_manual_position_from_feedback(f"pipeline view {i+1}/{NUM_VIEWS} rotation")
         else:
             print(f"DEMO MODE: rotating to J4={j4_target:.1f} deg (view {i+1}/{NUM_VIEWS})")
         sleep(VIEW_SETTLE_SECONDS)
@@ -1469,12 +1572,20 @@ def add_test_points_from_list():
 
             for i, point in enumerate(points_list):
                 try:
-                    if len(point) != 4:
-                        print(f"Point {i+1}: Invalid number of values (expected 4, got {len(point)})")
+                    # Accept either 4 values (x, y, z, claw — J4 held at
+                    # whatever's currently tracked when sent) or 5 (x, y,
+                    # z, claw, j4) so existing pasted test-point lists
+                    # don't break after adding J4 support here.
+                    if len(point) not in (4, 5):
+                        print(f"Point {i+1}: Invalid number of values (expected 4 or 5, got {len(point)})")
                         invalid_count += 1
                         continue
 
-                    px, py, pz, claw = point
+                    if len(point) == 5:
+                        px, py, pz, claw, j4_val = point
+                    else:
+                        px, py, pz, claw = point
+                        j4_val = None
 
                     # Validate types and ranges
                     if not all(isinstance(coord, (int, float)) for coord in [px, py, pz]):
@@ -1487,6 +1598,16 @@ def add_test_points_from_list():
                         invalid_count += 1
                         continue
 
+                    if j4_val is not None:
+                        if not isinstance(j4_val, (int, float)):
+                            print(f"Point {i+1}: J4 must be a number")
+                            invalid_count += 1
+                            continue
+                        if not (-358.0 <= j4_val <= 358.0):
+                            print(f"Point {i+1}: J4 must be between -358 and 358 degrees")
+                            invalid_count += 1
+                            continue
+
                     if not (5.0 <= pz <= 245.0):
                         print(f"Point {i+1}: Z-value must be between 5 and 245 mm")
                         invalid_count += 1
@@ -1498,12 +1619,13 @@ def add_test_points_from_list():
                         continue
 
                     # Add valid point
-                    valid_points.append((px, py, pz, claw))
+                    valid_points.append((px, py, pz, claw, j4_val))
                     scatter = ax.scatter(px, py, color='purple', s=50, marker='D')  # Purple diamond for test points
                     valid_scatters.append(scatter)
 
                     claw_text = "ON" if claw == 1 else "OFF"
-                    points_listbox.insert(tk.END, f"{len(valid_points)}: ({px:.2f}, {py:.2f}, z={pz:.1f}, claw={claw_text}) [Test]")
+                    j4_text_display = f"{j4_val:.1f}" if j4_val is not None else "current"
+                    points_listbox.insert(tk.END, f"{len(valid_points)}: ({px:.2f}, {py:.2f}, z={pz:.1f}, claw={claw_text}, J4={j4_text_display}) [Test]")
                     valid_count += 1
 
                 except Exception as e:
@@ -1818,18 +1940,18 @@ def get_point_settings(px, py):
     # Create the popup window
     dialog = tk.Toplevel(root)
     dialog.title("Point Settings")
-    dialog.geometry("300x250")
+    dialog.geometry("300x320")
     dialog.transient(root)
     dialog.grab_set()  # Forces user to interact with this window before the main one
     
     # Center the dialog on screen
     dialog.update_idletasks()
     x = (dialog.winfo_screenwidth() // 2) - (300 // 2)
-    y = (dialog.winfo_screenheight() // 2) - (250 // 2)
-    dialog.geometry(f"300x250+{x}+{y}")
+    y = (dialog.winfo_screenheight() // 2) - (320 // 2)
+    dialog.geometry(f"300x320+{x}+{y}")
     
     # Initialize the result dictionary
-    result = {'z': None, 'claw': 0}
+    result = {'z': None, 'claw': 0, 'j4': None}
     
     # CRITICAL: This variable tells the code when the "Add Point" button is clicked
     submitted = tk.BooleanVar(value=False)
@@ -1843,6 +1965,12 @@ def get_point_settings(px, py):
     z_entry = tk.Entry(dialog, width=15)
     z_entry.insert(0, "200") # Default height
     z_entry.pack()
+
+    # J4 input — optional, leave blank to hold whatever J4 is currently
+    # tracked (m_j4) when this point is actually sent.
+    tk.Label(dialog, text="\nJ4 (-358 to 358 deg, blank = hold current):").pack()
+    j4_dialog_entry = tk.Entry(dialog, width=15)
+    j4_dialog_entry.pack()
     
     # Claw control
     tk.Label(dialog, text="\nClaw State:").pack()
@@ -1856,10 +1984,16 @@ def get_point_settings(px, py):
     def add_point_clicked():
         try:
             z_val = float(z_entry.get())
+            j4_text = j4_dialog_entry.get().strip()
+            j4_val = float(j4_text) if j4_text else None
+            if j4_val is not None and not (-358.0 <= j4_val <= 358.0):
+                messagebox.showerror("Invalid J4", "J4 must be between -358 and 358 degrees")
+                return
             if 5.0 <= z_val <= 245.0:
                 # SAVE the values into our result dictionary
                 result['z'] = z_val
                 result['claw'] = claw_var_inner.get()
+                result['j4'] = j4_val
                 
                 # Signal that we are done and close window
                 submitted.set(True)
@@ -1867,7 +2001,7 @@ def get_point_settings(px, py):
             else:
                 messagebox.showerror("Invalid Z", "Z must be between 5 and 245")
         except ValueError:
-            messagebox.showerror("Invalid Input", "Please enter a numeric Z-value")
+            messagebox.showerror("Invalid Input", "Please enter a numeric Z-value and J4 (or leave J4 blank)")
     
     def cancel_clicked():
         # result['z'] remains None, so the point won't be saved
@@ -1900,17 +2034,18 @@ def onclick(event):
         return
     px, py = event.xdata, event.ydata
     if is_inside(px, py):
-        # Get point settings (z-value and claw state)
+        # Get point settings (z-value, claw state, and J4)
         settings = get_point_settings(px, py)
         
         if settings['z'] is not None:  # User didn't cancel
-            # Add valid point with its z-value and claw state
-            valid_points.append((px, py, settings['z'], settings['claw']))
+            # Add valid point with its z-value, claw state, and J4 (None = hold current J4 when sent)
+            valid_points.append((px, py, settings['z'], settings['claw'], settings['j4']))
             scatter = ax.scatter(px, py, color='green', s=50)
             valid_scatters.append(scatter)
 
             claw_text = "ON" if settings['claw'] == 1 else "OFF"
-            points_listbox.insert(tk.END, f"{len(valid_points)}: ({px:.2f}, {py:.2f}, z={settings['z']:.1f}, claw={claw_text})")
+            j4_text_display = f"{settings['j4']:.1f}" if settings['j4'] is not None else "current"
+            points_listbox.insert(tk.END, f"{len(valid_points)}: ({px:.2f}, {py:.2f}, z={settings['z']:.1f}, claw={claw_text}, J4={j4_text_display})")
         # If user cancelled, don't add the point
     else:
         # Add invalid point and remove after 1 second
@@ -1930,31 +2065,45 @@ def manual_joint_move():
     J1_MIN, J1_MAX = -85.0, 85.0
     J2_MIN, J2_MAX = -135.0, 135.0
     Z_MIN, Z_MAX = 5.0, 245.0
-    J4_FIXED = -35.0
+    J4_MIN, J4_MAX = -358.0, 358.0   # matches dobot_util's Movement.SAFE_LIMITS["J4"]
 
     try:
         j1 = float(j1_entry.get())
         j2 = float(j2_entry.get())
         z  = float(zj_entry.get())
+        # J4 previously hardcoded to -35.0 with no way to change it from
+        # this row — now reads the new J4 entry field, defaulting to the
+        # arm's current live J4 telemetry if the box is left blank so
+        # leaving it empty doesn't yank the wrist to a fixed angle.
+        j4_text = j4_entry.get().strip()
+        if j4_text:
+            j4 = float(j4_text)
+        else:
+            current_joints = robot_data.get("joints")
+            j4 = float(current_joints[3]) if current_joints and len(current_joints) >= 4 else -35.0
         claw_state = claw_var_j.get()   # read the joint-row claw radio button
 
         if not (J1_MIN <= j1 <= J1_MAX and J2_MIN <= j2 <= J2_MAX and Z_MIN <= z <= Z_MAX):
             messagebox.showerror("Out of Range", "Joint values outside limits!")
             return
+        if not (J4_MIN <= j4 <= J4_MAX):
+            messagebox.showerror("Out of Range", f"J4 must be between {J4_MIN} and {J4_MAX} degrees!")
+            return
 
         def execute():
             if ROBOT_CONNECTED and robot:
-                print(f"Moving to J1:{j1}° J2:{j2}° Z:{z}mm")
-                move_error = robot.movement.joint_to_joint_move([j1, j2, z, J4_FIXED])
+                print(f"Moving to J1:{j1}° J2:{j2}° Z:{z}mm J4:{j4}°")
+                move_error = robot.movement.joint_to_joint_move([j1, j2, z, j4])
                 if move_error is not None:
                     print(f"[JOINT MOVE ERROR]: {move_error}")
                     return
-                print(f"[JOINT MOVE SUCCESS]: J1:{j1} J2:{j2} Z:{z}")
+                print(f"[JOINT MOVE SUCCESS]: J1:{j1} J2:{j2} Z:{z} J4:{j4}")
                 # Apply claw state after move completes
                 robot.movement.sync()
+                sync_manual_position_from_feedback("manual Move Joints button")
                 set_claw_dual_output(claw_state)
             else:
-                print(f"DEMO MODE: J1:{j1} J2:{j2} Z:{z} Claw:{'ON' if claw_state else 'OFF'}")
+                print(f"DEMO MODE: J1:{j1} J2:{j2} Z:{z} J4:{j4} Claw:{'ON' if claw_state else 'OFF'}")
 
         # Run in background thread so ensure_robot_enabled and sync
         # don't block the Tkinter main thread
@@ -2156,6 +2305,465 @@ tk.Button(live_feed_button_row, text="Start All Feeds", bg="lightgreen",
 tk.Button(live_feed_button_row, text="Stop All Feeds",
           command=stop_live_feed).pack(side=tk.LEFT, padx=4)
 
+# =============================================================================
+# CAMERA ASSIGNMENT — reassign which physical USB device index a named
+# camera (e.g. "station", "wrist") points at, or add a brand-new named
+# camera, without editing vision/config.py or restarting the app.
+# Reassigning an EXISTING name takes effect immediately (both the live
+# feed panel above and every capture path re-read the assignment on their
+# next frame grab). Adding a brand-new name is picked up immediately by
+# anything that calls list_configured_cameras() fresh each time it runs
+# (the "Capture Photo — All Cameras" button, automatic capture sequences),
+# but the live-feed panel grid above is built once at startup, so a new
+# camera's preview panel needs an app restart to appear.
+# =============================================================================
+camera_assign_frame = tk.LabelFrame(gallery_frame, text=" Camera Assignment ", padx=8, pady=8)
+camera_assign_frame.pack(fill=tk.X, padx=4, pady=(4, 10))
+
+camera_assign_status = tk.Label(camera_assign_frame, text="", fg="gray",
+                                 font=("Arial", 8), wraplength=520, justify=tk.LEFT)
+camera_assign_status.pack(anchor=tk.W, pady=(0, 4))
+
+camera_assign_rows_frame = tk.Frame(camera_assign_frame)
+camera_assign_rows_frame.pack(fill=tk.X)
+
+_camera_assign_index_vars = {}  # camera name -> tk.StringVar holding the index entry text
+
+
+def _rebuild_camera_assign_rows():
+    """(Re)draws one row per currently-configured camera name, each with
+    an editable device-index box and an Assign button."""
+    for child in camera_assign_rows_frame.winfo_children():
+        child.destroy()
+    _camera_assign_index_vars.clear()
+
+    current = list_configured_cameras()
+    for cam_name, cam_index in sorted(current.items()):
+        row = tk.Frame(camera_assign_rows_frame)
+        row.pack(fill=tk.X, pady=2)
+        tk.Label(row, text=cam_name, width=12, anchor=tk.W).pack(side=tk.LEFT)
+        tk.Label(row, text="device index:").pack(side=tk.LEFT, padx=(4, 2))
+        idx_var = tk.StringVar(value=str(cam_index))
+        _camera_assign_index_vars[cam_name] = idx_var
+        tk.Entry(row, textvariable=idx_var, width=5).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(row, text="Assign", bg="lightblue",
+                  command=lambda n=cam_name: _do_assign_camera(n)).pack(side=tk.LEFT)
+        tk.Button(row, text="Remove Override", fg="darkred",
+                  command=lambda n=cam_name: _do_remove_camera_override(n)).pack(side=tk.LEFT, padx=(6, 0))
+
+
+def _do_remove_camera_override(cam_name):
+    """Clears a runtime assignment for cam_name, falling back to whatever
+    vision/config.py's CAMERAS says (or dropping it if not in there)."""
+    remove_camera_assignment(cam_name)
+    _rebuild_camera_assign_rows()
+    camera_assign_status.config(
+        text=f"Cleared runtime override for '{cam_name}' — back to the "
+             f"vision/config.py default (if any).",
+        fg="green")
+
+
+def _do_assign_camera(cam_name):
+    idx_text = _camera_assign_index_vars[cam_name].get().strip()
+    try:
+        idx = int(idx_text)
+    except ValueError:
+        camera_assign_status.config(
+            text=f"'{idx_text}' is not a valid device index (must be a whole number).",
+            fg="red")
+        return
+    try:
+        assign_camera(cam_name, idx)
+        camera_assign_status.config(
+            text=f"'{cam_name}' assigned to device index {idx}. Takes effect on the "
+                 f"next capture/live-feed frame immediately.",
+            fg="green")
+    except Exception as e:
+        camera_assign_status.config(text=f"Could not assign '{cam_name}': {e}", fg="red")
+
+
+def _do_add_camera():
+    name = new_cam_name_var.get().strip()
+    idx_text = new_cam_index_var.get().strip()
+    if not name:
+        camera_assign_status.config(text="Enter a name for the new camera.", fg="red")
+        return
+    try:
+        idx = int(idx_text)
+    except ValueError:
+        camera_assign_status.config(
+            text=f"'{idx_text}' is not a valid device index (must be a whole number).",
+            fg="red")
+        return
+    try:
+        assign_camera(name, idx)
+        new_cam_name_var.set("")
+        new_cam_index_var.set("")
+        _rebuild_camera_assign_rows()
+        camera_assign_status.config(
+            text=f"Added camera '{name}' at device index {idx}. It's usable now by "
+                 f"'Capture Photo — All Cameras' and automatic capture right away; "
+                 f"restart the app to also give it its own Live Feed preview panel above.",
+            fg="green")
+    except Exception as e:
+        camera_assign_status.config(text=f"Could not add '{name}': {e}", fg="red")
+
+
+def _do_detect_cameras():
+    camera_assign_status.config(text="Detecting cameras (probing indices 0-4)...", fg="gray")
+
+    def worker():
+        try:
+            found = list_camera_indices()
+        except Exception as e:
+            found = None
+            err = str(e)
+        def report():
+            if found is None:
+                camera_assign_status.config(text=f"Detection failed: {err}", fg="red")
+            elif found:
+                camera_assign_status.config(
+                    text=f"Working device indices found: {found}. Enter one of these "
+                         f"above and click Assign for the camera you want it on.",
+                    fg="green")
+            else:
+                camera_assign_status.config(
+                    text="No working camera devices found on indices 0-4. Check "
+                         "connections and that no other program has them open.",
+                    fg="orange")
+        root.after(0, report)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+_rebuild_camera_assign_rows()
+
+camera_assign_new_row = tk.Frame(camera_assign_frame)
+camera_assign_new_row.pack(fill=tk.X, pady=(8, 0))
+tk.Label(camera_assign_new_row, text="Add new camera —  name:").pack(side=tk.LEFT)
+new_cam_name_var = tk.StringVar()
+tk.Entry(camera_assign_new_row, textvariable=new_cam_name_var, width=12).pack(side=tk.LEFT, padx=(2, 8))
+tk.Label(camera_assign_new_row, text="index:").pack(side=tk.LEFT)
+new_cam_index_var = tk.StringVar()
+tk.Entry(camera_assign_new_row, textvariable=new_cam_index_var, width=5).pack(side=tk.LEFT, padx=(2, 8))
+tk.Button(camera_assign_new_row, text="Add Camera", bg="lightgreen",
+          command=_do_add_camera).pack(side=tk.LEFT, padx=(0, 8))
+tk.Button(camera_assign_new_row, text="Detect Cameras", bg="khaki",
+          command=_do_detect_cameras).pack(side=tk.LEFT)
+
+# =============================================================================
+# LASER CONTROL (ESP32) — controls the structured-light / scan laser via the
+# ESP32 GPIO+laser controller firmware (see ESP32_Laser_Control/src/main.cpp
+# and laser_control/relay_controller.py for the full serial protocol). This
+# is a separate physical board/serial connection from the arm itself, so it
+# gets its own connect/disconnect lifecycle here.
+#
+# Mirrors the firmware's own safety model rather than adding a competing one:
+#   - Configure (pin/freq/max-duty) before anything else is allowed.
+#   - Explicit ARM step required before any nonzero duty is accepted —
+#     configuring or connecting never arms it by itself.
+#   - A background heartbeat thread pings the board every second while
+#     connected so the firmware's 2-second host-silence watchdog doesn't
+#     auto-disarm mid-use just because the user hasn't touched a control
+#     lately. (The watchdog itself only ever fires while armed AND duty>0,
+#     per firmware — this heartbeat just keeps the host from going quiet.)
+#   - Disconnecting (or closing the app) always disarms first.
+# =============================================================================
+laser_ctl = None                 # RelayController instance, once connected
+laser_heartbeat_stop = threading.Event()
+laser_configured = False
+laser_armed_state = False
+
+laser_frame = tk.LabelFrame(gallery_frame, text=" Laser Control (ESP32) ", padx=8, pady=8)
+laser_frame.pack(fill=tk.X, padx=4, pady=(4, 10))
+
+laser_status_label = tk.Label(laser_frame, text="Not connected.", fg="gray",
+                               font=("Arial", 8), wraplength=520, justify=tk.LEFT)
+laser_status_label.pack(anchor=tk.W, pady=(0, 6))
+
+# --- Connection row ---
+laser_conn_row = tk.Frame(laser_frame)
+laser_conn_row.pack(fill=tk.X, pady=2)
+tk.Label(laser_conn_row, text="Port:").pack(side=tk.LEFT)
+laser_port_var = tk.StringVar(value="Auto-Detect")
+laser_port_combo = ttk.Combobox(laser_conn_row, textvariable=laser_port_var, width=16,
+                                 values=["Auto-Detect"], state="readonly")
+laser_port_combo.pack(side=tk.LEFT, padx=(2, 6))
+laser_refresh_btn = tk.Button(laser_conn_row, text="Refresh Ports")
+laser_refresh_btn.pack(side=tk.LEFT, padx=(0, 6))
+laser_connect_btn = tk.Button(laser_conn_row, text="Connect", bg="lightgreen")
+laser_connect_btn.pack(side=tk.LEFT, padx=(0, 6))
+laser_disconnect_btn = tk.Button(laser_conn_row, text="Disconnect", state=tk.DISABLED)
+laser_disconnect_btn.pack(side=tk.LEFT)
+
+# --- Configuration row ---
+laser_config_row = tk.Frame(laser_frame)
+laser_config_row.pack(fill=tk.X, pady=(8, 2))
+tk.Label(laser_config_row, text="Pin:").pack(side=tk.LEFT)
+laser_pin_var = tk.StringVar(value="25")
+tk.Entry(laser_config_row, textvariable=laser_pin_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
+tk.Label(laser_config_row, text="Freq (Hz):").pack(side=tk.LEFT)
+laser_freq_var = tk.StringVar(value="1000")
+tk.Entry(laser_config_row, textvariable=laser_freq_var, width=7).pack(side=tk.LEFT, padx=(2, 10))
+tk.Label(laser_config_row, text="Max Duty (%):").pack(side=tk.LEFT)
+laser_maxduty_var = tk.StringVar(value="100")
+tk.Entry(laser_config_row, textvariable=laser_maxduty_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
+laser_configure_btn = tk.Button(laser_config_row, text="Configure Laser",
+                                 state=tk.DISABLED)
+laser_configure_btn.pack(side=tk.LEFT)
+
+# --- Arm / duty row ---
+laser_fire_row = tk.Frame(laser_frame)
+laser_fire_row.pack(fill=tk.X, pady=(8, 2))
+laser_arm_btn = tk.Button(laser_fire_row, text="ARM", bg="darkorange", fg="white",
+                          width=10, state=tk.DISABLED)
+laser_arm_btn.pack(side=tk.LEFT, padx=(0, 10))
+tk.Label(laser_fire_row, text="Duty %:").pack(side=tk.LEFT)
+laser_duty_var = tk.IntVar(value=0)
+laser_duty_scale = tk.Scale(laser_fire_row, from_=0, to=100, orient=tk.HORIZONTAL,
+                             variable=laser_duty_var, length=180, state=tk.DISABLED)
+laser_duty_scale.pack(side=tk.LEFT, padx=(4, 10))
+laser_set_duty_btn = tk.Button(laser_fire_row, text="Set Duty", state=tk.DISABLED)
+laser_set_duty_btn.pack(side=tk.LEFT, padx=(0, 10))
+laser_off_btn = tk.Button(laser_fire_row, text="LASER OFF", bg="red", fg="white",
+                          width=12, state=tk.DISABLED)
+laser_off_btn.pack(side=tk.LEFT)
+
+
+def _laser_set_status(text, fg="gray"):
+    laser_status_label.config(text=text, fg=fg)
+
+
+def _laser_refresh_ports():
+    try:
+        ports = RelayController.list_ports()
+    except Exception as e:
+        _laser_set_status(f"Could not list serial ports: {e}", fg="red")
+        return
+    laser_port_combo["values"] = ["Auto-Detect"] + ports
+    if laser_port_var.get() not in laser_port_combo["values"]:
+        laser_port_var.set("Auto-Detect")
+
+
+def _laser_connect():
+    laser_connect_btn.config(state=tk.DISABLED)
+    _laser_set_status("Connecting...", fg="gray")
+
+    def worker():
+        global laser_ctl
+        chosen_port = laser_port_var.get()
+        try:
+            if chosen_port == "Auto-Detect":
+                found = RelayController.find_esp32()
+                if found is None:
+                    root.after(0, lambda: (_laser_set_status(
+                        "No ESP32 laser controller found on any serial port. "
+                        "Check the USB connection, or pick a port manually.", fg="red"),
+                        laser_connect_btn.config(state=tk.NORMAL)))
+                    return
+                port = found
+            else:
+                port = chosen_port
+
+            rc = RelayController(port)
+            ok = rc.connect()
+
+            def finish():
+                global laser_ctl
+                if ok:
+                    laser_ctl = rc
+                    _laser_set_status(f"Connected on {port}.", fg="green")
+                    laser_connect_btn.config(state=tk.DISABLED)
+                    laser_disconnect_btn.config(state=tk.NORMAL)
+                    laser_configure_btn.config(state=tk.NORMAL)
+                    laser_heartbeat_stop.clear()
+                    threading.Thread(target=_laser_heartbeat_loop, daemon=True).start()
+                else:
+                    _laser_set_status(f"Failed to connect on {port} "
+                                       f"(no PING response).", fg="red")
+                    laser_connect_btn.config(state=tk.NORMAL)
+            root.after(0, finish)
+        except Exception as e:
+            root.after(0, lambda: (_laser_set_status(f"Connection error: {e}", fg="red"),
+                                    laser_connect_btn.config(state=tk.NORMAL)))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _laser_disconnect():
+    global laser_ctl, laser_configured, laser_armed_state
+    laser_heartbeat_stop.set()
+
+    def worker():
+        global laser_ctl, laser_configured, laser_armed_state
+        try:
+            if laser_ctl is not None:
+                laser_ctl.laser_disarm()   # always leave hardware safe on disconnect
+                laser_ctl.disconnect()
+        except Exception:
+            pass
+
+        def finish():
+            global laser_ctl, laser_configured, laser_armed_state
+            laser_ctl = None
+            laser_configured = False
+            laser_armed_state = False
+            _laser_set_status("Disconnected (laser disarmed).", fg="gray")
+            laser_connect_btn.config(state=tk.NORMAL)
+            laser_disconnect_btn.config(state=tk.DISABLED)
+            laser_configure_btn.config(state=tk.DISABLED)
+            laser_arm_btn.config(state=tk.DISABLED, text="ARM", bg="darkorange")
+            laser_duty_scale.config(state=tk.DISABLED)
+            laser_set_duty_btn.config(state=tk.DISABLED)
+            laser_off_btn.config(state=tk.DISABLED)
+        root.after(0, finish)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _laser_heartbeat_loop():
+    """Pings the board once a second while connected so the firmware's
+    host-silence watchdog (2s) never trips just because the user hasn't
+    clicked anything recently. Also keeps the status label reasonably
+    fresh. Stops as soon as laser_heartbeat_stop is set (disconnect)."""
+    while not laser_heartbeat_stop.wait(1.0):
+        ctl = laser_ctl
+        if ctl is None or not ctl.is_connected():
+            return
+        try:
+            ctl.ping()
+        except Exception:
+            return
+
+
+def _laser_configure():
+    if laser_ctl is None:
+        return
+    try:
+        pin = int(laser_pin_var.get())
+        freq = int(laser_freq_var.get())
+        maxduty = int(laser_maxduty_var.get())
+    except ValueError:
+        _laser_set_status("Pin, frequency, and max duty must all be whole numbers.", fg="red")
+        return
+    if not (0 <= maxduty <= 100):
+        _laser_set_status("Max duty must be between 0 and 100.", fg="red")
+        return
+
+    laser_configure_btn.config(state=tk.DISABLED)
+
+    def worker():
+        global laser_configured
+        ok = laser_ctl.laser_config(pin=pin, freq_hz=freq, max_duty_pct=maxduty)
+
+        def finish():
+            global laser_configured
+            laser_configure_btn.config(state=tk.NORMAL)
+            if ok:
+                laser_configured = True
+                laser_arm_btn.config(state=tk.NORMAL)
+                _laser_set_status(
+                    f"Laser configured: pin {pin}, {freq} Hz, max duty {maxduty}%. "
+                    f"Disarmed / 0% until you click ARM.", fg="green")
+            else:
+                laser_configured = False
+                _laser_set_status(
+                    "Laser configuration rejected by the board — check the pin "
+                    "isn't already used by a relay channel, and that frequency/"
+                    "duty are in range.", fg="red")
+        root.after(0, finish)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _laser_toggle_arm():
+    if laser_ctl is None or not laser_configured:
+        return
+    laser_arm_btn.config(state=tk.DISABLED)
+
+    def worker():
+        global laser_armed_state
+        if not laser_armed_state:
+            ok = laser_ctl.laser_arm()
+            new_state = True if ok else laser_armed_state
+        else:
+            ok = laser_ctl.laser_disarm()
+            new_state = False if ok else laser_armed_state
+
+        def finish():
+            global laser_armed_state
+            laser_armed_state = new_state
+            laser_arm_btn.config(state=tk.NORMAL)
+            if laser_armed_state:
+                laser_arm_btn.config(text="DISARM", bg="red")
+                laser_duty_scale.config(state=tk.NORMAL)
+                laser_set_duty_btn.config(state=tk.NORMAL)
+                laser_off_btn.config(state=tk.NORMAL)
+                _laser_set_status("Laser ARMED. Duty is still 0% until you Set Duty.",
+                                   fg="darkorange")
+            else:
+                laser_arm_btn.config(text="ARM", bg="darkorange")
+                laser_duty_var.set(0)
+                laser_duty_scale.config(state=tk.DISABLED)
+                laser_set_duty_btn.config(state=tk.DISABLED)
+                laser_off_btn.config(state=tk.DISABLED)
+                if ok:
+                    _laser_set_status("Laser DISARMED (forced to 0%).", fg="gray")
+                else:
+                    _laser_set_status("Arm/disarm command failed — check the connection.",
+                                       fg="red")
+        root.after(0, finish)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _laser_set_duty():
+    if laser_ctl is None or not laser_armed_state:
+        return
+    pct = laser_duty_var.get()
+    laser_set_duty_btn.config(state=tk.DISABLED)
+
+    def worker():
+        ok = laser_ctl.laser_set(pct)
+
+        def finish():
+            laser_set_duty_btn.config(state=tk.NORMAL)
+            if ok:
+                _laser_set_status(f"Laser duty set to {pct}%.", fg="green")
+            else:
+                _laser_set_status(
+                    f"Board rejected {pct}% (over the configured max duty, or not "
+                    f"armed). Duty unchanged.", fg="red")
+        root.after(0, finish)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _laser_force_off():
+    if laser_ctl is None:
+        return
+
+    def worker():
+        laser_ctl.laser_off()
+
+        def finish():
+            laser_duty_var.set(0)
+            _laser_set_status("Laser forced to 0% (still armed).", fg="gray")
+        root.after(0, finish)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+laser_refresh_btn.config(command=_laser_refresh_ports)
+laser_connect_btn.config(command=_laser_connect)
+laser_disconnect_btn.config(command=_laser_disconnect)
+laser_configure_btn.config(command=_laser_configure)
+laser_arm_btn.config(command=_laser_toggle_arm)
+laser_set_duty_btn.config(command=_laser_set_duty)
+laser_off_btn.config(command=_laser_force_off)
+
+_laser_refresh_ports()
+
 tk.Label(gallery_frame, text="Capture Photo",
          font=("Arial", 11, "bold"), bg="#f0f0f0").pack(pady=(10, 5))
 
@@ -2334,6 +2942,18 @@ def on_app_close():
         close_laser()
     except Exception as e:
         print(f"[CLEANUP] Laser close skipped: {e}")
+
+    # The ESP32 laser controller wired up in the Camera tab (laser_ctl) is a
+    # separate connection from the vision.camera.laser stub above — always
+    # disarm before disconnecting so a live laser is never left armed/firing
+    # if the app is closed mid-use.
+    try:
+        if laser_ctl is not None:
+            laser_heartbeat_stop.set()
+            laser_ctl.laser_disarm()
+            laser_ctl.disconnect()
+    except Exception as e:
+        print(f"[CLEANUP] ESP32 laser controller cleanup skipped: {e}")
 
     try:
         from vision.messaging.publisher import disconnect as disconnect_mqtt

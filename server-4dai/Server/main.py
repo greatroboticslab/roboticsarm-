@@ -7,6 +7,7 @@ import os
 import re
 import uuid
 import json
+from collections import deque
 from datetime import datetime
 
 app = FastAPI()
@@ -207,12 +208,15 @@ def get_roboflow_configuration(selection:str):
 # vision project and has been removed).
 # =====================================================================
 
-active_sweep_state = {
-    "pending": False,
-    "category": "",
-    "sample_id": "",
-    "image_index": 0
-}
+# BUGFIX: this used to be a single-slot dict ("pending": True/False) — if
+# the arm fired triggers faster than the UI's once-a-second poll (exactly
+# what happens during a sweep, which can cross the trigger-degree
+# threshold several times a second), each new trigger silently overwrote
+# the previous one before it was ever consumed, so most of the sweep's
+# photos were simply never taken. A real FIFO queue means every trigger
+# the arm sends gets served eventually, in order, even if several arrive
+# between polls.
+_trigger_queue: deque = deque()
 
 class TriggerCaptureRequest(BaseModel):
     category: str
@@ -222,14 +226,17 @@ class TriggerCaptureRequest(BaseModel):
 
 @app.post("/collection/trigger-webcam-capture")
 async def trigger_webcam_capture(payload: TriggerCaptureRequest):
-    """Stores trigger request details in memory for the Streamlit UI to poll."""
-    active_sweep_state["pending"] = True
-    active_sweep_state["category"] = payload.category
-    active_sweep_state["sample_id"] = payload.sample_id
-    active_sweep_state["image_index"] = payload.image_index
+    """Queues a trigger request for the Streamlit UI to consume. FIFO —
+    see _trigger_queue note above for why this isn't a single slot."""
+    _trigger_queue.append({
+        "category": payload.category,
+        "sample_id": payload.sample_id,
+        "image_index": payload.image_index,
+    })
 
-    print(f"[TRIGGER ACK] Queued frame #{payload.image_index} for '{payload.category}'")
-    
+    print(f"[TRIGGER ACK] Queued frame #{payload.image_index} for "
+          f"'{payload.category}' (queue depth now {len(_trigger_queue)})")
+
     return {
         "status": "success",
         "message": f"Capture trigger queued for {payload.category}",
@@ -239,31 +246,66 @@ async def trigger_webcam_capture(payload: TriggerCaptureRequest):
 
 @app.get("/collection/check-trigger")
 async def check_trigger():
-    """Polled by Streamlit UI. Returns true when a trigger event is pending."""
-    if active_sweep_state["pending"]:
-        active_sweep_state["pending"] = False  # Reset flag after consuming
-        return {"trigger": True, "data": active_sweep_state}
-    
+    """Polled by Streamlit UI. Pops (not just peeks) the oldest pending
+    trigger off the queue, if any, so triggers are consumed in order and
+    none are silently dropped by a later one arriving first."""
+    if _trigger_queue:
+        data = _trigger_queue.popleft()
+        return {"trigger": True, "data": data}
+
     return {"trigger": False}
 
 
 @app.post("/collection/auto-capture-image")
 def save_auto_captured_image(category: str = Form(...), file: UploadFile = File(...),
-                              filename: str = Form(None)):
+                              filename: str = Form(None), sample_id: str = Form(None)):
     """
     Saves a photo taken automatically in response to an arm trigger.
 
-    This is intentionally standalone - just "take a photo, save it to
-    disk" - with no sample_id, no Mongo record, and no link to a
-    submission form. There used to be a fuller "captured object"
-    pipeline here (feeding automatic captures into object identification/
-    classification), but that lived entirely on the robotic-arm/vision
-    side and has been removed, so this endpoint no longer tries to
-    participate in it.
+    BUGFIX: this used to just write the file to
+    "images/<category>/auto_capture/" with NO Mongo record at all — no
+    sample document, no "images" collection entry. The folder and files
+    on disk were real, but nothing in the app could ever look them up:
+    View Collections lists samples from the category's Mongo collection,
+    then fetches each sample's images from the "images" collection by
+    sample_id — with neither of those written, an auto-captured photo was
+    permanently invisible even though it existed on disk. That's exactly
+    the "sweep makes a folder but can't find the files inside it" bug.
+
+    Fix: behave like a real capture. Reuse (or create, if this is the
+    first image for it) a sample document in the category's collection —
+    keyed by the arm-supplied sample_id when given, so every image from
+    one sweep/rotation lands under the same findable sample — save the
+    file under images/<category>/<sample_id>/ (matching the layout
+    /collection/images/upload already uses), and log an "images" record
+    pointing at it. After this, auto-captured photos show up in View
+    Collections exactly like a manual submission's photos do.
     """
     category = safe_filename(category)
-    folder = f"images/{category}/auto_capture"
-    os.makedirs(folder, exist_ok=True)
+    collection_name = safe_collection_name(category.lower())
+    table = db[collection_name]
+
+    if sample_id:
+        sample_id = safe_filename(sample_id)
+        if table.find_one({"_id": sample_id}) is None:
+            table.insert_one({
+                "_id": sample_id,
+                "date": str(datetime.now().date()),
+                "data": {"predicted_label": "auto_capture", "source": "arm_trigger"},
+            })
+    else:
+        # No sample_id from the caller (e.g. a manual test POST) — every
+        # image gets its own sample so it's still findable, just not
+        # grouped with anything.
+        sample_id = str(uuid.uuid4())
+        table.insert_one({
+            "_id": sample_id,
+            "date": str(datetime.now().date()),
+            "data": {"predicted_label": "auto_capture", "source": "arm_trigger"},
+        })
+
+    image_folder = f"images/{category}/{sample_id}"
+    os.makedirs(image_folder, exist_ok=True)
 
     if filename:
         safe_name = safe_filename(filename)
@@ -279,13 +321,27 @@ def save_auto_captured_image(category: str = Form(...), file: UploadFile = File(
     base_name, ext = os.path.splitext(safe_name)
     candidate = safe_name
     suffix = 1
-    while os.path.exists(f"{folder}/{candidate}"):
+    while os.path.exists(f"{image_folder}/{candidate}"):
         candidate = f"{base_name}_{suffix}{ext}"
         suffix += 1
     safe_name = candidate
 
-    file_path = f"{folder}/{safe_name}"
+    image_id = str(uuid.uuid4())
+    file_path = f"{image_folder}/{safe_name}"
     with open(file_path, "wb") as outfile:
         outfile.write(file.file.read())
 
-    return {"message": "saved", "file": file_path, "filename": safe_name}
+    image_table = db["images"]
+    image_table.insert_one({
+        "_id": image_id,
+        "sample_id": sample_id,
+        "image_path": file_path,
+    })
+
+    return {
+        "message": "saved",
+        "file": file_path,
+        "filename": safe_name,
+        "sample_id": sample_id,
+        "image_id": image_id,
+    }

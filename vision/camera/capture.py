@@ -40,6 +40,79 @@ from vision.config import (
 
 IMAGES_ROOT = "images/objects"
 
+# ---------------------------------------------------------------------------
+# RUNTIME CAMERA ASSIGNMENT
+# ---------------------------------------------------------------------------
+# vision/config.py's CAMERAS dict is the *default* name -> device-index
+# mapping, but it's a plain file on disk — changing it means editing code
+# and restarting the app. This lets a camera be (re)assigned from the GUI
+# (main.py's Camera tab) while the app is running, and persists the choice
+# to camera_assignments.json so it survives a restart without touching
+# vision/config.py at all. CAMERAS itself is never mutated — the override
+# dict below always takes priority over it in list_configured_cameras()/
+# capture_frame(), so a runtime assignment always wins.
+# ---------------------------------------------------------------------------
+import json
+
+_ASSIGNMENTS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "camera_assignments.json")
+
+_camera_overrides: dict = {}
+
+
+def _load_camera_overrides() -> None:
+    global _camera_overrides
+    try:
+        if os.path.exists(_ASSIGNMENTS_FILE):
+            with open(_ASSIGNMENTS_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _camera_overrides = {str(k): int(v) for k, v in data.items()}
+    except Exception as e:
+        print(f"[CAMERA CONFIG] Could not load {_ASSIGNMENTS_FILE}: {e}")
+        _camera_overrides = {}
+
+
+def _save_camera_overrides() -> None:
+    try:
+        with open(_ASSIGNMENTS_FILE, "w") as f:
+            json.dump(_camera_overrides, f, indent=2)
+    except Exception as e:
+        print(f"[CAMERA CONFIG] Could not save {_ASSIGNMENTS_FILE}: {e}")
+
+
+_load_camera_overrides()
+
+
+def assign_camera(name: str, index: int) -> None:
+    """Assign (or reassign) a camera name to a device index at runtime and
+    persist it to camera_assignments.json. Releases any cached handle
+    already open under that name's *previous* index so the next capture/
+    live-feed read opens the newly assigned device instead of a stale one.
+    """
+    name = str(name).strip()
+    if not name:
+        raise ValueError("Camera name cannot be empty.")
+    index = int(index)
+
+    old_index = list_configured_cameras().get(name)
+    _camera_overrides[name] = index
+    _save_camera_overrides()
+
+    if old_index is not None and old_index != index and old_index in _capture_handles:
+        try:
+            _capture_handles[old_index].release()
+        except Exception:
+            pass
+        _capture_handles.pop(old_index, None)
+
+
+def remove_camera_assignment(name: str) -> None:
+    """Remove a runtime override, falling back to vision/config.py's CAMERAS
+    (or dropping the camera entirely if it's not in CAMERAS either)."""
+    _camera_overrides.pop(str(name).strip(), None)
+    _save_camera_overrides()
+
 # Lazily-opened, cached VideoCapture handles - opened once, reused across
 # calls rather than reopening the device every capture (slow + some UVC
 # cameras don't like being reopened rapidly).
@@ -160,15 +233,18 @@ def _capture_from_index(index: int, _retry: bool = True):
 def capture_frame(camera_name: str):
     """
     [WIRED] Grab a single frame from any camera configured in
-    vision.config.CAMERAS by name. This is the general entry point -
+    vision.config.CAMERAS (or reassigned at runtime via assign_camera(),
+    which takes priority) by name. This is the general entry point -
     works for any number of cameras, not just station/wrist.
     """
-    if camera_name not in CAMERAS:
+    configured = list_configured_cameras()
+    if camera_name not in configured:
         raise ValueError(
             f"Unknown camera '{camera_name}'. Configured cameras: "
-            f"{list(CAMERAS.keys())}. Add it to CAMERAS in vision/config.py."
+            f"{list(configured.keys())}. Add it to CAMERAS in "
+            f"vision/config.py, or assign it from the Camera tab."
         )
-    return _capture_from_index(CAMERAS[camera_name])
+    return _capture_from_index(configured[camera_name])
 
 
 def capture_station_frame():
@@ -186,9 +262,14 @@ def capture_wrist_frame():
 
 
 def list_configured_cameras() -> dict:
-    """Returns the name -> index mapping from vision.config.CAMERAS, for
-    populating UI camera-selector dropdowns etc."""
-    return dict(CAMERAS)
+    """Returns the name -> index mapping for populating UI camera-selector
+    dropdowns, capture_frame(), etc. Starts from vision.config.CAMERAS and
+    layers any runtime assignments (assign_camera()) on top, so a camera
+    reassigned from the GUI always overrides the on-disk default without
+    editing vision/config.py."""
+    merged = dict(CAMERAS)
+    merged.update(_camera_overrides)
+    return merged
 
 
 def frame_to_rgb(frame):
