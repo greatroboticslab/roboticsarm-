@@ -169,3 +169,25 @@ TOPIC_ARM_MOVE_COMMAND = "arm/command/move"
 # TOGGLE section above; kept here as a pointer for anyone looking for them
 # near the rest of the MQTT/4DAI contract.)
 # ---------------------------------------------------------------------------
+
+# ===========================================================================
+# [TEMP] LOCAL LLM (NATURAL-LANGUAGE MONGO QUERY) — see
+# vision/services/deepseek_query.py for why this is marked temporary.
+# ===========================================================================
+# Points at a local Ollama install (https://ollama.com), not a hosted API —
+# no key needed. Requires `ollama pull <model>` for whichever model is
+# selected before it will work.
+OLLAMA_HOST = "http://localhost:11434"
+
+# Default model. "deepseek-r1:7b" is the safer default for correctness on
+# multi-condition questions; "deepseek-r1:1.5b" is a lighter/faster option
+# that still tends to be fine for this narrow a task (short question + a
+# handful of field names -> one JSON filter). Swap here, or override
+# per-call from the GUI.
+OLLAMA_MODEL = "deepseek-r1:7b"
+OLLAMA_MODEL_LIGHTWEIGHT = "deepseek-r1:1.5b"
+
+# How many recent sample documents to scan when building the "known
+# fields" list handed to the model as context. User-adjustable from the
+# GUI; this is just the default.
+NL_QUERY_FIELD_SAMPLE_SIZE = 50
