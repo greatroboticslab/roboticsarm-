@@ -57,6 +57,57 @@ still needs it.)
    and set a static IP on the robot's subnet. See the project's main
    README for the full network setup steps.
 
+## [TEMP] Local AI Mongo query (optional)
+
+The "Database" tab's "Ask (local AI, temporary)" panel lets you type a
+plain-English question (e.g. "red objects from yesterday") and get back
+matching samples from the local `objects` collection, instead of
+scrolling the recent-captures list by hand. See
+`vision/services/deepseek_query.py`'s module docstring for why this is
+marked temporary and what should eventually replace it.
+
+This is entirely optional — the rest of the app, including the rest of
+the Database tab (recent captures list, photo viewer), works with zero
+setup here. If Ollama isn't installed/running, the "Ask" panel just
+shows a red "unavailable" status and disables itself; nothing else is
+affected.
+
+**Setup:**
+
+1. Install Ollama: <https://ollama.com>
+2. Pull a model:
+   ```bash
+   ollama pull deepseek-r1:7b
+   ```
+   For a lighter/faster option (still generally fine for this — turning
+   a short question + a handful of field names into one JSON filter —
+   though less reliable on more complex, multi-condition questions):
+   ```bash
+   ollama pull deepseek-r1:1.5b
+   ```
+3. Make sure Ollama is running (`ollama serve` — most installs start
+   this automatically in the background) and reachable at
+   `http://localhost:11434`.
+4. In `vision/config.py`, confirm/adjust:
+   - `OLLAMA_HOST` — where Ollama is listening (default
+     `http://localhost:11434`; change this if Ollama is running on
+     another machine).
+   - `OLLAMA_MODEL` — which pulled model to use by default
+     (`deepseek-r1:7b`; set to `OLLAMA_MODEL_LIGHTWEIGHT`'s value or
+     any other pulled model name if you'd rather use a smaller one).
+   - `NL_QUERY_FIELD_SAMPLE_SIZE` — how many recent sample documents to
+     scan for known field names before asking a question (default 50;
+     also adjustable per-query from the GUI panel itself).
+5. Launch `main.py` as usual — the Database tab checks availability on
+   startup and enables the "Ask" button automatically if steps 1–4 are
+   in place.
+
+**Note:** the fields it can query against come from whatever's already
+in each sample's `data` dict — there's no classifier auto-filling
+fields yet, so query quality depends on what was manually entered at
+collection time. See the module docstring in `deepseek_query.py` for
+more on this.
+
 ## How to run
 
 ```bash

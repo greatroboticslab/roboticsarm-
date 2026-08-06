@@ -3,6 +3,7 @@ import threading
 from time import sleep
 import time
 import os
+import json
 import uuid
 from datetime import date
 import tkinter as tk
@@ -37,6 +38,14 @@ from vision.config import (
 from vision.messaging.publisher import publish_captured, publish_capture_status
 from vision.messaging.subscriber import subscribe
 from vision.storage import mongo_client
+
+# [TEMP] Local-LLM (DeepSeek via Ollama) natural-language Mongo query —
+# see vision/services/deepseek_query.py's module docstring for why this
+# is temporary. Imported here (not inline in the Database tab code) so
+# it's a single, obvious place to delete/replace later. Only used inside
+# the "Database" tab below, and only when Ollama is actually reachable.
+from vision.services import deepseek_query
+from vision.config import OLLAMA_MODEL, NL_QUERY_FIELD_SAMPLE_SIZE
 
 from laser_control import RelayController
 try:
@@ -1933,6 +1942,124 @@ recent_samples_listbox.bind("<Double-Button-1>", open_sample_photo_viewer)
 
 tk.Button(mongo_btn_row, text="Refresh", command=refresh_recent_samples,
           bg="lightblue").pack(side=tk.LEFT, padx=4)
+
+# =====================================================================
+# [TEMP] NATURAL-LANGUAGE QUERY (DeepSeek via local Ollama)
+# See vision/services/deepseek_query.py's module docstring for why this
+# is temporary and what should replace it. Disabled automatically (not
+# just erroring on click) if Ollama isn't reachable or the configured
+# model isn't pulled, so the rest of the Database tab keeps working
+# with zero dependency on this being set up.
+# =====================================================================
+nl_query_frame = tk.LabelFrame(tab_database, text=" Ask (local AI, temporary) ", padx=10, pady=10)
+nl_query_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+nl_query_status_label = tk.Label(nl_query_frame, text="Checking local AI availability...", fg="gray")
+nl_query_status_label.pack(anchor=tk.W)
+
+nl_query_input_row = tk.Frame(nl_query_frame)
+nl_query_input_row.pack(fill=tk.X, pady=(4, 2))
+
+tk.Label(nl_query_input_row, text="Question:").pack(side=tk.LEFT)
+nl_query_entry = tk.Entry(nl_query_input_row)
+nl_query_entry.pack(side=tk.LEFT, fill=tk.X, expand=1, padx=4)
+
+nl_query_ask_btn = tk.Button(nl_query_input_row, text="Ask", state=tk.DISABLED)
+nl_query_ask_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+nl_query_fields_row = tk.Frame(nl_query_frame)
+nl_query_fields_row.pack(fill=tk.X, pady=(2, 2))
+
+tk.Label(nl_query_fields_row, text="Fields to sample from recent docs:").pack(side=tk.LEFT)
+nl_query_field_sample_var = tk.StringVar(value=str(NL_QUERY_FIELD_SAMPLE_SIZE))
+tk.Entry(nl_query_fields_row, textvariable=nl_query_field_sample_var, width=6).pack(side=tk.LEFT, padx=4)
+tk.Label(nl_query_fields_row, text="(how many recent samples to scan for known field names)",
+         fg="gray", font=("Arial", 8)).pack(side=tk.LEFT)
+
+nl_query_filter_label = tk.Label(nl_query_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+nl_query_filter_label.pack(anchor=tk.W, pady=(4, 0))
+
+
+def _check_nl_query_availability():
+    """Runs once at startup (and can be re-run manually) to enable/
+    disable the Ask button based on whether Ollama + the configured
+    model are actually available. Never crashes the GUI — worst case
+    the feature just stays disabled with an explanatory error."""
+    def worker():
+        try:
+            deepseek_query.check_ollama_available(OLLAMA_MODEL)
+            msg, color, enabled = f"Local AI ready ({OLLAMA_MODEL})", "green", tk.NORMAL
+        except deepseek_query.DeepSeekQueryError as e:
+            msg, color, enabled = f"Local AI unavailable — disabled: {e}", "red", tk.DISABLED
+        except Exception as e:
+            msg, color, enabled = f"Local AI unavailable — disabled: {e}", "red", tk.DISABLED
+
+        def apply():
+            nl_query_status_label.config(text=msg, fg=color)
+            nl_query_ask_btn.config(state=enabled)
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def run_nl_query_from_gui():
+    """Runs the NL question through vision.services.deepseek_query and
+    reuses the existing recent-samples listbox + double-click photo
+    viewer to show results — no separate results UI needed."""
+    question = nl_query_entry.get().strip()
+    if not question:
+        return
+
+    try:
+        field_sample_size = int(nl_query_field_sample_var.get())
+    except ValueError:
+        field_sample_size = NL_QUERY_FIELD_SAMPLE_SIZE
+
+    nl_query_ask_btn.config(state=tk.DISABLED)
+    nl_query_filter_label.config(text="Thinking...", fg="gray")
+
+    def worker():
+        try:
+            samples, mongo_filter = deepseek_query.run_nl_query(
+                question, field_sample_size=field_sample_size, model=OLLAMA_MODEL
+            )
+            err = None
+        except deepseek_query.DeepSeekQueryError as e:
+            samples, mongo_filter, err = None, None, str(e)
+        except Exception as e:
+            samples, mongo_filter, err = None, None, str(e)
+
+        def apply():
+            nl_query_ask_btn.config(state=tk.NORMAL)
+
+            if err is not None:
+                nl_query_filter_label.config(text=f"Couldn't run that query: {err}", fg="red")
+                return
+
+            nl_query_filter_label.config(text=f"Filter used: {json.dumps(mongo_filter)}", fg="gray")
+
+            recent_samples_listbox.delete(0, tk.END)
+            _recent_sample_ids.clear()
+            if not samples:
+                recent_samples_listbox.insert(tk.END, "(no matching samples)")
+                return
+            for s in samples:
+                sid = s.get("_id", "?")
+                sdate = s.get("date", "?")
+                label = (s.get("data") or {}).get("predicted_label", "")
+                recent_samples_listbox.insert(tk.END, f"{sdate}  |  {label}  |  {sid}")
+                _recent_sample_ids.append(sid)
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+nl_query_ask_btn.config(command=run_nl_query_from_gui)
+nl_query_entry.bind("<Return>", lambda event: run_nl_query_from_gui())
+
+_check_nl_query_availability()
 
 # Custom dialog for Z-value and claw state
 
