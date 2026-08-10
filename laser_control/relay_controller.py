@@ -161,8 +161,17 @@ class RelayController:
 
     def _send_expecting_ok(self, cmd: str) -> bool:
         """Send a command and return True if the response contains 'OK'."""
+        ok, _ = self._send_expecting_ok_verbose(cmd)
+        return ok
+
+    def _send_expecting_ok_verbose(self, cmd: str) -> tuple:
+        """Same as _send_expecting_ok, but also returns the board's raw
+        response lines so callers can surface the *actual* rejection
+        reason (e.g. 'ERR PIN_IN_USE') instead of a generic guess.
+        Returns (ok: bool, raw_lines: list[str])."""
         lines = self._send(cmd)
-        return any(ln.startswith("OK") for ln in lines)
+        ok = any(ln.startswith("OK") for ln in lines)
+        return ok, lines
 
     # ── Commands ──────────────────────────────────────────────────────────
 
@@ -188,11 +197,24 @@ class RelayController:
         active_high : True → relay energises on HIGH; False → on LOW.
         safe_on     : True → safe state is ON; False → OFF.
 
-        Returns True on success.
+        Returns True on success. Use configure_channel_verbose() if you
+        need the board's actual reason when this returns False.
         """
+        ok, _ = self.configure_channel_verbose(ch, pin, active_high, safe_on)
+        return ok
+
+    def configure_channel_verbose(
+        self,
+        ch: int,
+        pin: int,
+        active_high: bool = True,
+        safe_on: bool = False,
+    ) -> tuple:
+        """Same as configure_channel(), but returns (ok, raw_response_lines)
+        so the caller can see the board's actual rejection reason."""
         pol  = "HIGH" if active_high else "LOW"
         safe = "ON"   if safe_on     else "OFF"
-        return self._send_expecting_ok(
+        return self._send_expecting_ok_verbose(
             f"CONFIG {ch} PIN {pin} POL {pol} SAFE {safe}"
         )
 
@@ -261,8 +283,17 @@ class RelayController:
         """Configure the laser PWM pin, frequency, and hard duty ceiling.
 
         Leaves the laser disarmed at 0%. Returns True on success.
+        Use laser_config_verbose() if you need the board's actual reason
+        when this returns False.
         """
-        return self._send_expecting_ok(
+        ok, _ = self.laser_config_verbose(pin=pin, freq_hz=freq_hz, max_duty_pct=max_duty_pct)
+        return ok
+
+    def laser_config_verbose(self, pin: int, freq_hz: int = 1000, max_duty_pct: int = 100) -> tuple:
+        """Same as laser_config(), but returns (ok, raw_response_lines) so
+        the caller can see the board's actual rejection reason (e.g.
+        'ERR PIN_IN_USE', 'ERR BAD_PIN') instead of guessing why."""
+        return self._send_expecting_ok_verbose(
             f"LASER CONFIG PIN {pin} FREQ {freq_hz} MAXDUTY {max_duty_pct}"
         )
 

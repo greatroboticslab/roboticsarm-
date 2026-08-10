@@ -191,3 +191,44 @@ OLLAMA_MODEL_LIGHTWEIGHT = "deepseek-r1:1.5b"
 # fields" list handed to the model as context. User-adjustable from the
 # GUI; this is just the default.
 NL_QUERY_FIELD_SAMPLE_SIZE = 50
+
+# ===========================================================================
+# MIDDLEMAN MODE (Physical Control tab) — lets one machine (Physical Side,
+# real robot/camera/laser attached) be driven remotely by another (Other
+# Side, the controller) over the same MQTT broker already used elsewhere.
+# See vision/services/middleman_*.py and vision/services/photo_transfer.py.
+# ===========================================================================
+
+# Shared, unnamespaced — every Physical Side announces itself here so Other
+# Side instances can discover/select one instead of typing an IP blind.
+MIDDLEMAN_DISCOVERY_TOPIC = "arm/middleman/discovery"
+
+# Per-Physical-Side topics are namespaced by that machine's IP (chosen as
+# the identifier — see net_utils.get_local_ip()) so multiple Physical
+# Side/Other Side pairs on the same broker never cross-talk, with no
+# separate ID scheme needed on top.
+MIDDLEMAN_SESSION_TOPIC_TEMPLATE = "arm/middleman/{ip}/session"
+MIDDLEMAN_CONTROL_STATUS_TOPIC_TEMPLATE = "arm/middleman/{ip}/control_status"
+MIDDLEMAN_MOVE_TOPIC_TEMPLATE = "arm/middleman/{ip}/move"
+MIDDLEMAN_LASER_TOPIC_TEMPLATE = "arm/middleman/{ip}/laser"
+MIDDLEMAN_TELEMETRY_TOPIC_TEMPLATE = "arm/middleman/{ip}/telemetry"
+MIDDLEMAN_CAPTURE_REQUEST_TOPIC_TEMPLATE = "arm/middleman/{ip}/capture_request"
+MIDDLEMAN_PHOTO_TOPIC_TEMPLATE = "arm/middleman/{ip}/photo"
+MIDDLEMAN_ERROR_TOPIC_TEMPLATE = "arm/middleman/{ip}/error"
+
+# Heartbeat cadence for both the discovery broadcast and the active-
+# controller session. 3 missed beats before something is considered gone.
+MIDDLEMAN_HEARTBEAT_INTERVAL_SECONDS = 2
+MIDDLEMAN_HEARTBEAT_TIMEOUT_SECONDS = 6
+
+# How long a photo-bundle publish is allowed to take to assemble before
+# giving up (base64-encoding + publishing several views can take a moment
+# on a slow link).
+MIDDLEMAN_PHOTO_TRANSFER_TIMEOUT_SECONDS = 30
+
+# Max dimension (longest side, px) for images relayed over the middleman
+# link. Downscaled independently of whatever full-res copy (if any) stays
+# local on the Physical Side, to keep MQTT payloads reasonable regardless
+# of camera resolution.
+MIDDLEMAN_PHOTO_TRANSFER_MAX_DIMENSION = 800
+MIDDLEMAN_PHOTO_TRANSFER_JPEG_QUALITY = 70

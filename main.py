@@ -47,6 +47,17 @@ from vision.storage import mongo_client
 from vision.services import deepseek_query
 from vision.config import OLLAMA_MODEL, NL_QUERY_FIELD_SAMPLE_SIZE
 
+# [WIRED] Middleman mode (Physical Control tab). Business logic
+# (networking/protocol/session/photo-transfer) lives entirely in these
+# modules — main.py only wires callables into them + reflects status in
+# the UI. See each module's docstring for the split.
+from vision.net_utils import get_local_ip
+from vision.services.middleman_physical_side import PhysicalSideController
+from vision.services.middleman_other_side import OtherSideController
+from vision.config import MQTT_BROKER_HOST, MQTT_BROKER_PORT
+from laser_control import channel_assignments
+from vision.services import hard_deck
+
 from laser_control import RelayController
 try:
     from PIL import Image, ImageTk
@@ -347,20 +358,34 @@ def safe_move_to_point(x, y, z=200, r=0):
     threading.Thread(target=move_to_point, args=(x, y, z, r), daemon=True).start()
 
 def move_to_point(x, y, z=200, r=0):
+    """Returns None on success/demo-mode-simulated, or an error string
+    (unreachable target, hard-deck rejection, or a real hardware move
+    error) on failure/rejection — callers (point-queue send, the Move
+    Joints button, _handle_move_command's remote path indirectly via
+    the same hard-deck check) can surface this instead of it being a
+    silent failure."""
     global m_x, m_y, m_z, m_j4    # declare global so the assignment below persists
     if is_jogging:
         # messagebox must run on the main thread — schedule it there safely
         root.after(0, lambda: messagebox.showwarning(
             "Robot Busy", "Cannot send move command while jogging!"))
-        return
+        return "Robot is currently jogging"
 
     try:
         sols = Ikinematics(x, y, z, r)
         if not sols:
-            print(f"Target ({x}, {y}) is unreachable.")
-            return
+            msg = f"Target ({x}, {y}) is unreachable."
+            print(msg)
+            return msg
 
         j1, j2, z_target, r_target = sols[0]
+
+        floor = _effective_hard_deck_z()
+        if floor is not None and z_target < floor:
+            msg = (f"Move rejected: target Z {z_target:.1f} is below the height floor "
+                   f"({floor:.1f}).")
+            print(f"[HARD DECK] {msg}")
+            return msg
 
         if ROBOT_CONNECTED and robot:
             # Re-enable only if the robot has fallen out of ENABLE state.
@@ -370,7 +395,7 @@ def move_to_point(x, y, z=200, r=0):
             move_error = robot.movement.joint_to_joint_move([j1, j2, z_target, r_target])
             if move_error is not None:
                 print(f"[MOVE ERROR]: {move_error}")
-                return   # do not sync position — robot did not move
+                return str(move_error)   # do not sync position — robot did not move
             print(f"[MOVE SUCCESS]: ({x}, {y}, {z})")
 
         else:
@@ -378,14 +403,32 @@ def move_to_point(x, y, z=200, r=0):
 
         # Only reached if the move succeeded (or demo mode) — safe to sync
         m_x, m_y, m_z, m_j4 = x, y, z, r_target
+        return None
 
     except Exception as e:
-        print(f"Robot command failed: {e}")
+        msg = f"Robot command failed: {e}"
+        print(msg)
+        return msg
 # --- NEW: Jogging Handlers ---
 # --- NEW AREA B: CONTINUOUS JOG HANDLERS ---
 # --- REFINED AREA B ---
-def handle_jog_press(axis_cmd):
+def handle_jog_press(axis_cmd, _via_remote=False):
     global is_jogging
+
+    mode = control_mode_var.get()
+
+    if not _via_remote:
+        if mode == "middleman_other":
+            # Redirect to the connected Physical Side instead of local
+            # hardware. send_move() itself refuses (returns False) unless
+            # this instance is currently the active controller.
+            if other_side_controller is not None:
+                other_side_controller.send_move({"jog": axis_cmd})
+            return
+
+        if mode == "middleman_physical" and _physical_side_locked_out():
+            return  # a remote controller is currently active — local jog locked out
+
     # Check 1: Is robot actually connected?
     # Check 2: Are we already jogging? (Prevents Windows key-repeat spam)
     if not ROBOT_CONNECTED or is_jogging or not manual_active.get():
@@ -400,8 +443,20 @@ def handle_jog_press(axis_cmd):
     if not error:
         is_jogging = True
 
-def handle_jog_release(event):
+def handle_jog_release(event, _via_remote=False):
     global is_jogging, m_x, m_y, m_z, m_j4
+
+    mode = control_mode_var.get()
+
+    if not _via_remote:
+        if mode == "middleman_other":
+            if other_side_controller is not None:
+                other_side_controller.send_move({"jog": "stop"})
+            return
+
+        if mode == "middleman_physical" and _physical_side_locked_out():
+            return
+
     if ROBOT_CONNECTED:
         robot.movement.safe_move_jog("stop", [])
         is_jogging = False
@@ -601,18 +656,578 @@ tab_database = tk.Frame(notebook)
 # notebook's own show/hide-per-tab logic and made every tab's content
 # render all at once regardless of which tab was selected, which is why
 # clicking between tabs looked like it wasn't doing anything.
-notebook.add(tab_arm, text="Arm Control")
+notebook.add(tab_arm, text="Physical Control")
 notebook.add(tab_camera, text="Camera")
 notebook.add(tab_server, text="Server")
 notebook.add(tab_database, text="Database")
 
-# Always boot straight into the Arm Control tab (demo mode banner and
-# all), regardless of insertion order above.
+# Always boot straight into the Physical Control tab (demo mode banner
+# and all), regardless of insertion order above.
 notebook.select(tab_arm)
 
-# Tab 1: Arm Control — everything below that packs into
-# main_container/left_container/frame ends up on this tab only.
+# Tab 1: Physical Control (renamed from "Arm Control") — everything
+# below that packs into main_container/left_container/frame ends up on
+# this tab only.
 main_container = tab_arm
+
+# =====================================================================
+# [WIRED] CONTROL MODE — Demo / Physical Manual / Middleman (Physical
+# Side) / Middleman (Other Side). See vision/services/middleman_*.py
+# for the actual networking/protocol logic — this section is UI +
+# thin glue only, per the "reduce creep" split agreed on.
+#
+# Default on startup (never auto-selected for either Middleman mode):
+#   no robot detected -> Demo
+#   robot connected    -> Physical Manual
+# =====================================================================
+control_mode_var = tk.StringVar(value="physical_manual" if ROBOT_CONNECTED else "demo")
+
+control_mode_frame = tk.LabelFrame(main_container, text=" Control Mode ", padx=10, pady=8)
+control_mode_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
+
+control_mode_radio_row = tk.Frame(control_mode_frame)
+control_mode_radio_row.pack(fill=tk.X)
+
+for _mode_value, _mode_label in [
+    ("demo", "Demo"),
+    ("physical_manual", "Physical Manual"),
+    ("middleman_physical", "Middleman \u2014 Physical Side"),
+    ("middleman_other", "Middleman \u2014 Other Side"),
+]:
+    tk.Radiobutton(control_mode_radio_row, text=_mode_label, variable=control_mode_var,
+                   value=_mode_value, command=lambda: on_control_mode_changed(),
+                   font=("Arial", 9)).pack(side=tk.LEFT, padx=(0, 12))
+
+control_mode_status_label = tk.Label(control_mode_frame, text="", fg="gray",
+                                      font=("Arial", 9), justify=tk.LEFT, wraplength=760)
+control_mode_status_label.pack(anchor=tk.W, pady=(4, 0))
+
+# Always-visible connectivity info: this machine's own IP (relevant if
+# it ends up running Middleman — Physical Side) and the MQTT broker
+# it's actually talking through (nothing connects to the IP directly —
+# see vision/net_utils.py's docstring).
+_this_machine_ip = get_local_ip(MQTT_BROKER_HOST, MQTT_BROKER_PORT)
+tk.Label(control_mode_frame,
+         text=f"This machine's IP: {_this_machine_ip}   |   MQTT broker: {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}",
+         fg="gray", font=("Arial", 8)).pack(anchor=tk.W, pady=(2, 0))
+
+# =====================================================================
+# [WIRED] HEIGHT FLOOR ("HARD DECK") — a Z value the end-effector is
+# never allowed to move below, local-only settable (never remotely),
+# enforced inside move_to_point() and _handle_move_command() (the two
+# funnels every planned/absolute move already goes through), plus a
+# reactive jog watchdog in update_gui_from_feedback() for continuous
+# jogging, which has no single predictable target to check in advance.
+#
+# Two tiers, per the agreed design:
+#   Base floor   - always enforced, every mode.
+#   Remote floor - optional, must be >= base floor. Enforced ADDITIONALLY
+#                  (as the stricter of the two) only while a Middleman —
+#                  Physical Side controller is actively driving this
+#                  machine. A remote-initiated move that violates
+#                  whichever floor is in effect is rejected AND an
+#                  explicit error is sent back to the controller that
+#                  sent it (see middleman_physical_side.py's
+#                  _publish_error) — never just silently ignored.
+# =====================================================================
+hard_deck_state = hard_deck.load()  # {"base_hard_deck_z": float|None, "remote_hard_deck_z": float|None}
+_HARD_DECK_STEP = 1.0  # matches "raise/lower by 1 at a time" for calibration
+
+
+def _being_remote_controlled() -> bool:
+    """True while this machine is Middleman — Physical Side AND a
+    remote controller is currently active (not just queued/idle)."""
+    return (control_mode_var.get() == "middleman_physical"
+            and physical_side_controller is not None
+            and physical_side_controller.queue.snapshot()["active"] is not None)
+
+
+def _effective_hard_deck_z():
+    """Returns the currently-enforced floor, or None if no floor is set
+    at all. remote_hard_deck_z (if set) only applies while actually
+    being remote-controlled, and only ever as the stricter of the two
+    (it's validated >= base at set-time, so this is just "prefer it
+    when active")."""
+    base = hard_deck_state.get("base_hard_deck_z")
+    remote = hard_deck_state.get("remote_hard_deck_z")
+    if _being_remote_controlled() and remote is not None:
+        return remote
+    return base
+
+
+def _hard_deck_violation(z_value, context: str):
+    """Shared check for every direct robot.movement.joint_to_joint_move
+    call site in the file (the pipeline sequences and the raw joint-space
+    Move Joints panel bypass move_to_point()/_handle_move_command()'s own
+    checks entirely, so they need this called explicitly before each
+    move). Returns an error string if z_value violates the effective
+    floor, else None."""
+    floor = _effective_hard_deck_z()
+    if floor is not None and z_value < floor:
+        msg = f"{context}: target Z {z_value:.1f} is below the height floor ({floor:.1f})."
+        print(f"[HARD DECK] {msg}")
+        return msg
+    return None
+
+
+hard_deck_frame = tk.LabelFrame(main_container, text=" Height Floor / Hard Deck (local only) ", padx=10, pady=8)
+hard_deck_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
+
+tk.Label(hard_deck_frame,
+         text="Jog Z close to the surface, then \"Set Base Floor\" to lock in the current height as a "
+              "limit no move can go below. Optionally set a stricter Remote Floor used only while "
+              "being remote-controlled via Middleman.",
+         fg="gray", font=("Arial", 8), wraplength=760, justify=tk.LEFT).pack(anchor=tk.W)
+
+hard_deck_status_label = tk.Label(hard_deck_frame, text="", font=("Arial", 9))
+hard_deck_status_label.pack(anchor=tk.W, pady=(4, 4))
+
+
+def _refresh_hard_deck_status_label():
+    base = hard_deck_state.get("base_hard_deck_z")
+    remote = hard_deck_state.get("remote_hard_deck_z")
+    base_text = f"{base:.1f}" if base is not None else "not set"
+    remote_text = f"{remote:.1f}" if remote is not None else "not set (uses base)"
+    hard_deck_status_label.config(text=f"Base floor: {base_text}    |    Remote floor: {remote_text}")
+
+
+_refresh_hard_deck_status_label()
+
+hard_deck_nudge_row = tk.Frame(hard_deck_frame)
+hard_deck_nudge_row.pack(anchor=tk.W)
+
+
+def _hard_deck_nudge_z(delta: float):
+    """Small step move on Z only, holding current X/Y/J4 — the
+    calibration workflow: nudge down/up by _HARD_DECK_STEP at a time
+    until close to the real floor, then lock it in below."""
+    if not ROBOT_CONNECTED:
+        messagebox.showwarning("No Robot", "Connect the robot first to calibrate a height floor.")
+        return
+    target_z = m_z + delta
+    error = move_to_point(m_x, m_y, target_z, m_j4)
+    if error:
+        messagebox.showwarning("Move Rejected", error)
+
+
+tk.Button(hard_deck_nudge_row, text=f"Z \u2212{_HARD_DECK_STEP:g}", width=6,
+          command=lambda: _hard_deck_nudge_z(-_HARD_DECK_STEP)).pack(side=tk.LEFT, padx=2)
+tk.Button(hard_deck_nudge_row, text=f"Z +{_HARD_DECK_STEP:g}", width=6,
+          command=lambda: _hard_deck_nudge_z(_HARD_DECK_STEP)).pack(side=tk.LEFT, padx=2)
+
+hard_deck_buttons_row = tk.Frame(hard_deck_frame)
+hard_deck_buttons_row.pack(anchor=tk.W, pady=(6, 0))
+
+
+def _set_hard_deck(tier: str):
+    """tier is 'base' or 'remote'. Reads the CURRENT live Z (not a typed
+    value) so the floor always matches a position the robot has
+    actually reached, per the described calibration workflow."""
+    if not ROBOT_CONNECTED or "cartesian" not in robot_data or robot_data["cartesian"] is None:
+        messagebox.showwarning("No Robot", "Connect the robot first to calibrate a height floor.")
+        return
+    current_z = robot_data["cartesian"][2]
+
+    base = hard_deck_state.get("base_hard_deck_z")
+    remote = hard_deck_state.get("remote_hard_deck_z")
+
+    if tier == "base":
+        if remote is not None and current_z > remote:
+            messagebox.showwarning(
+                "Base Floor Too High",
+                f"Base floor ({current_z:.1f}) would be above the existing remote floor "
+                f"({remote:.1f}) \u2014 remote floor must always be \u2265 base floor. "
+                f"Clear or raise the remote floor first.")
+            return
+        base = current_z
+    else:
+        if base is not None and current_z < base:
+            messagebox.showwarning(
+                "Remote Floor Too Low",
+                f"Remote floor must be \u2265 the base floor ({base:.1f}). "
+                f"Current position ({current_z:.1f}) is below that.")
+            return
+        remote = current_z
+
+    hard_deck_state["base_hard_deck_z"] = base
+    hard_deck_state["remote_hard_deck_z"] = remote
+    hard_deck.save(base, remote)
+    _refresh_hard_deck_status_label()
+
+
+def _clear_hard_deck(tier: str):
+    if not messagebox.askyesno("Clear Floor", f"Clear the {tier} height floor? This removes a safety limit."):
+        return
+    if tier == "base":
+        hard_deck_state["base_hard_deck_z"] = None
+    else:
+        hard_deck_state["remote_hard_deck_z"] = None
+    hard_deck.save(hard_deck_state["base_hard_deck_z"], hard_deck_state["remote_hard_deck_z"])
+    _refresh_hard_deck_status_label()
+
+
+tk.Button(hard_deck_buttons_row, text="Set Base Floor \u2190 Current Z", bg="lightblue",
+          command=lambda: _set_hard_deck("base")).pack(side=tk.LEFT, padx=2)
+tk.Button(hard_deck_buttons_row, text="Clear Base", bg="salmon",
+          command=lambda: _clear_hard_deck("base")).pack(side=tk.LEFT, padx=2)
+tk.Button(hard_deck_buttons_row, text="Set Remote Floor \u2190 Current Z", bg="lightblue",
+          command=lambda: _set_hard_deck("remote")).pack(side=tk.LEFT, padx=(16, 2))
+tk.Button(hard_deck_buttons_row, text="Clear Remote", bg="salmon",
+          command=lambda: _clear_hard_deck("remote")).pack(side=tk.LEFT, padx=2)
+
+# --- Middleman — Physical Side controls (shown/used only in that mode) ---
+middleman_physical_frame = tk.Frame(control_mode_frame)
+middleman_physical_queue_label = tk.Label(middleman_physical_frame, text="", fg="gray",
+                                           font=("Arial", 8), justify=tk.LEFT, wraplength=760)
+middleman_physical_queue_label.pack(anchor=tk.W)
+middleman_physical_disconnect_all_btn = tk.Button(
+    middleman_physical_frame, text="Disconnect All / Clear Queue", bg="salmon")
+middleman_physical_disconnect_all_btn.pack(anchor=tk.W, pady=(2, 0))
+
+# --- Middleman — Other Side controls (shown/used only in that mode) ---
+middleman_other_frame = tk.Frame(control_mode_frame)
+
+middleman_other_top_row = tk.Frame(middleman_other_frame)
+middleman_other_top_row.pack(fill=tk.X)
+tk.Label(middleman_other_top_row, text="Physical Side:", font=("Arial", 9)).pack(side=tk.LEFT)
+middleman_other_selected_ip = tk.StringVar(value="")
+middleman_other_dropdown = ttk.Combobox(middleman_other_top_row, textvariable=middleman_other_selected_ip,
+                                         width=32, state="readonly")
+middleman_other_dropdown.pack(side=tk.LEFT, padx=4)
+middleman_other_connect_btn = tk.Button(middleman_other_top_row, text="Connect")
+middleman_other_connect_btn.pack(side=tk.LEFT, padx=4)
+middleman_other_disconnect_btn = tk.Button(middleman_other_top_row, text="Disconnect")
+middleman_other_disconnect_btn.pack(side=tk.LEFT, padx=4)
+middleman_other_capture_btn = tk.Button(middleman_other_top_row, text="Capture Now", bg="khaki")
+middleman_other_capture_btn.pack(side=tk.LEFT, padx=4)
+
+# Per-channel laser toggles — this rig's lasers are 4 individually
+# relay-switched outputs (see the Laser Channels panel on the Physical
+# Side machine), not one on/off laser, so this mirrors that instead of
+# a single Laser On/Off pair. Names here are generic ("Ch 1".."Ch 4")
+# since the Other Side has no visibility into the Physical Side's local
+# channel names — only the physical machine (which configured them)
+# knows that mapping.
+middleman_other_laser_row = tk.Frame(middleman_other_frame)
+middleman_other_laser_row.pack(fill=tk.X, pady=(4, 0))
+tk.Label(middleman_other_laser_row, text="Lasers:", font=("Arial", 9)).pack(side=tk.LEFT)
+middleman_other_laser_buttons = {}  # channel(1-4) -> (on_btn, off_btn)
+for _ch in range(1, 5):
+    tk.Label(middleman_other_laser_row, text=f"Ch{_ch}", font=("Arial", 8)).pack(side=tk.LEFT, padx=(8, 2))
+    _on_btn = tk.Button(middleman_other_laser_row, text="ON", bg="lightgreen", width=4)
+    _on_btn.pack(side=tk.LEFT)
+    _off_btn = tk.Button(middleman_other_laser_row, text="OFF", bg="salmon", width=4)
+    _off_btn.pack(side=tk.LEFT, padx=(0, 2))
+    middleman_other_laser_buttons[_ch] = (_on_btn, _off_btn)
+
+# -----------------------------------------------------------------------
+# Middleman glue. All actual networking/protocol logic lives in
+# vision/services/middleman_physical_side.py and middleman_other_side.py
+# — everything below is: (a) small executor callables that wrap this
+# machine's already-existing hardware calls, and (b) UI plumbing.
+#
+# NOTE on scope: this wires jog moves, laser on/off, and single-shot
+# "capture all configured cameras at current position" through the
+# middleman link (the primitives explicitly agreed on). The point-queue
+# ("Add Point" -> batch "Send to robot") flow is NOT redirected here —
+# it only queues points locally regardless of mode; extending it to
+# middleman is a natural follow-up but wasn't part of this pass.
+# -----------------------------------------------------------------------
+physical_side_controller = None   # PhysicalSideController, once this mode is entered
+other_side_controller = None      # OtherSideController, once this mode is entered
+middleman_other_dropdown_ip_by_label = {}  # display label -> physical_side_ip
+
+
+def _physical_side_locked_out() -> bool:
+    """True while a remote controller is actively driving this machine
+    in Middleman — Physical Side mode (local jog/manual is blocked)."""
+    if physical_side_controller is None:
+        return False
+    return physical_side_controller.queue.snapshot()["active"] is not None
+
+
+def _middleman_laser_executor(channel, state: bool) -> None:
+    """Laser executor handed to PhysicalSideController. Per the board
+    photos, this rig's lasers are relay-switched (individually
+    configured on the "Laser Channels" panel below, using laser_ctl's
+    generic multi-channel CONFIG/SET commands) — not one PWM-dimmable
+    laser, so this is channel-addressed rather than a single on/off.
+    channel=None means "all channels currently configured" (used by the
+    timeout-safety path, which needs to kill every laser at once, not
+    guess which one channel was actually in use).
+
+    Requires the channels to already be configured locally first (see
+    laser_channels_frame below) — this cannot configure them remotely,
+    same as the single-laser panel it replaces for this hardware."""
+    if laser_ctl is None:
+        print("[MIDDLEMAN] Laser command ignored — ESP32 not connected locally on this Physical Side.")
+        return
+    if channel is not None:
+        channels = [int(channel)]
+    else:
+        channels = [int(ch_str) for ch_str in laser_channel_assignments.keys()]
+    if not channels:
+        print("[MIDDLEMAN] Laser command ignored — no laser channels configured locally yet.")
+        return
+    for ch in channels:
+        laser_ctl.set_channel(ch, state)
+
+
+def _middleman_capture_executor():
+    """Capture executor handed to PhysicalSideController: grabs one frame
+    from every locally-configured camera at the arm's current position.
+    Mirrors the existing 'Capture Photo — All Cameras' flow, minus the
+    local save/upload (photo_transfer.py handles relaying + the Other
+    Side's local save instead)."""
+    sample_id = new_sample_id()
+    frames = []
+    for camera_name in list_configured_cameras():
+        try:
+            frame = capture_frame(camera_name)
+            frames.append((camera_name, 0, frame))
+        except Exception as e:
+            print(f"[MIDDLEMAN] Capture failed for camera '{camera_name}': {e}")
+    values = {"num_images": len(frames)}
+    return sample_id, frames, values
+
+
+def _middleman_telemetry_provider() -> dict:
+    return {
+        "robot_connected": ROBOT_CONNECTED,
+        "joints": robot_data.get("joints"),
+        "cartesian": robot_data.get("cartesian"),
+    }
+
+
+def _on_physical_control_status_change(status: dict) -> None:
+    def apply():
+        active = status.get("active")
+        queue = status.get("queue", [])
+        queue_text = f"Active controller: {active or 'none'}"
+        if queue:
+            queue_text += f"  |  Queued: {', '.join(queue)}"
+        middleman_physical_queue_label.config(text=queue_text)
+        if control_mode_var.get() == "middleman_physical" and physical_side_controller is not None:
+            lock_note = (" Local controls locked out while a remote controller is active."
+                         if active else " No remote controller — local controls available.")
+            control_mode_status_label.config(
+                text=f"Middleman \u2014 Physical Side. Listening as {physical_side_controller.ip}.{lock_note}",
+                fg="blue")
+    root.after(0, apply)
+
+
+def _on_discovery_update(discovered: dict) -> None:
+    def apply():
+        middleman_other_dropdown_ip_by_label.clear()
+        labels = []
+        for ip, info in sorted(discovered.items()):
+            label = f"{info.get('name', '?')} ({ip})"
+            middleman_other_dropdown_ip_by_label[label] = ip
+            labels.append(label)
+        middleman_other_dropdown["values"] = labels
+    root.after(0, apply)
+
+
+def _on_telemetry_update(data: dict) -> None:
+    """Mirrors the Physical Side's live position onto this machine's own
+    plot while in Middleman \u2014 Other Side mode. Reuses the exact same
+    dot + blitting path as the local telemetry loop (update_gui_from_
+    feedback, see the tracking-lag fix) rather than a separate slower
+    code path \u2014 live_dot is otherwise idle on a controller-only machine
+    since update_gui_from_feedback only drives it from LOCAL robot
+    telemetry, gated on this machine's own ROBOT_CONNECTED."""
+    def apply():
+        global live_dot
+        if control_mode_var.get() != "middleman_other":
+            return  # stale telemetry from a since-abandoned connection
+
+        cartesian = data.get("cartesian")
+        if not cartesian:
+            return
+        try:
+            raw_x, raw_y, raw_z = cartesian[0], cartesian[1], cartesian[2]
+        except (TypeError, IndexError, KeyError):
+            return
+
+        angle_deg = 90  # same rotation as update_gui_from_feedback, for a
+                         # display that matches what Physical Manual mode
+                         # would show for the same real position
+        theta = np.radians(angle_deg)
+        rot_x = raw_x * np.cos(theta) - raw_y * np.sin(theta)
+        rot_y = raw_x * np.sin(theta) + raw_y * np.cos(theta)
+
+        if live_dot is None:
+            live_dot = ax.scatter(rot_x, rot_y, color='red', s=100, zorder=5, label="Live Robot Pos")
+            ax.legend()
+            canvas.draw()  # establishes the legend; also refreshes _plot_background
+        else:
+            live_dot.set_offsets(np.c_[rot_x, rot_y])
+            if _plot_background[0] is not None:
+                fig.canvas.restore_region(_plot_background[0])
+                ax.draw_artist(live_dot)
+                fig.canvas.blit(ax.bbox)
+            else:
+                fig.canvas.draw_idle()
+
+        if 'status_label' in globals() and status_label.winfo_exists():
+            remote_connected = data.get("robot_connected", False)
+            conn_note = "remote robot connected" if remote_connected else "remote in demo / no robot"
+            status_label.config(
+                text=f"Middleman remote | X: {raw_x:.1f} | Y: {raw_y:.1f} | Z: {raw_z:.1f} ({conn_note})")
+
+    root.after(0, apply)
+
+
+def _on_other_control_status_update(status: dict) -> None:
+    def apply():
+        if other_side_controller is None or control_mode_var.get() != "middleman_other":
+            return
+        active = status.get("active")
+        is_me = active == other_side_controller.controller_id
+        role_text = "You are the ACTIVE controller." if is_me else f"Waiting in queue (active: {active or 'none'})."
+        control_mode_status_label.config(
+            text=f"Middleman \u2014 Other Side, connected to {middleman_other_selected_ip.get()}. {role_text}",
+            fg="blue")
+    root.after(0, apply)
+
+
+def _on_photo_received(saved_paths: list) -> None:
+    def apply():
+        current = control_mode_status_label.cget("text")
+        control_mode_status_label.config(text=f"{current}  |  Received {len(saved_paths)} photo(s), saved locally.")
+        try:
+            refresh_recent_samples()
+        except NameError:
+            pass  # Database tab not built yet — harmless
+    root.after(0, apply)
+
+
+def _on_middleman_error_received(message: str) -> None:
+    """A command this instance sent (almost always a move, most notably a
+    hard-deck rejection) was refused by the Physical Side. Shown as a
+    popup rather than just a status-line update — a rejected move is
+    safety-relevant and easy to miss as passive text, same reasoning as
+    the existing 'Robot Busy' warning elsewhere in this file."""
+    def apply():
+        messagebox.showwarning("Command Rejected by Physical Side", message)
+    root.after(0, apply)
+
+
+def _middleman_other_connect():
+    ip = middleman_other_dropdown_ip_by_label.get(middleman_other_selected_ip.get())
+    if not ip:
+        messagebox.showwarning("No Physical Side selected", "Pick a Physical Side from the dropdown first.")
+        return
+    if other_side_controller is not None:
+        other_side_controller.connect(ip)
+
+
+def _middleman_other_disconnect():
+    if other_side_controller is not None:
+        other_side_controller.disconnect()
+
+
+def _middleman_other_capture():
+    if other_side_controller is not None:
+        if not other_side_controller.request_capture():
+            messagebox.showinfo("Not active", "You're not the active controller yet (queued or not connected).")
+
+
+def _middleman_other_laser(channel: int, state: bool):
+    if other_side_controller is not None:
+        if not other_side_controller.send_laser(channel, state):
+            messagebox.showinfo("Not active", "You're not the active controller yet (queued or not connected).")
+
+
+def _middleman_physical_disconnect_all():
+    if physical_side_controller is not None:
+        physical_side_controller.disconnect_all()
+
+
+def on_control_mode_changed():
+    global physical_side_controller, other_side_controller
+    mode = control_mode_var.get()
+
+    # Tear down whichever middleman role is no longer selected.
+    if physical_side_controller is not None and mode != "middleman_physical":
+        physical_side_controller.stop()
+        physical_side_controller = None
+        middleman_physical_frame.pack_forget()
+    if other_side_controller is not None and mode != "middleman_other":
+        other_side_controller.stop()
+        other_side_controller = None
+        middleman_other_frame.pack_forget()
+
+    if mode == "demo":
+        control_mode_status_label.config(
+            text="Demo — all actions simulated, no hardware touched.", fg="gray")
+
+    elif mode == "physical_manual":
+        if ROBOT_CONNECTED:
+            control_mode_status_label.config(
+                text="Physical Manual — driving the local robot directly.", fg="green")
+        else:
+            control_mode_status_label.config(
+                text="Physical Manual selected, but no robot is connected — acting as Demo.",
+                fg="orange")
+
+    elif mode == "middleman_physical":
+        middleman_physical_frame.pack(fill=tk.X, pady=(6, 0))
+        if physical_side_controller is None:
+            try:
+                candidate = PhysicalSideController(
+                    robot_connected_provider=lambda: ROBOT_CONNECTED,
+                    move_executor=_handle_move_command,
+                    laser_executor=_middleman_laser_executor,
+                    capture_executor=_middleman_capture_executor,
+                    telemetry_provider=_middleman_telemetry_provider,
+                    on_control_status_change=_on_physical_control_status_change,
+                    on_log=print,
+                )
+                candidate.start()
+                physical_side_controller = candidate
+            except Exception as e:
+                control_mode_status_label.config(
+                    text=f"Middleman \u2014 Physical Side failed to start: {e}", fg="red")
+                return
+        control_mode_status_label.config(
+            text=f"Middleman \u2014 Physical Side. Listening as {physical_side_controller.ip}. "
+                 f"No remote controller yet.", fg="blue")
+
+    elif mode == "middleman_other":
+        middleman_other_frame.pack(fill=tk.X, pady=(6, 0))
+        if other_side_controller is None:
+            try:
+                candidate = OtherSideController(
+                    on_discovery_update=_on_discovery_update,
+                    on_telemetry_update=_on_telemetry_update,
+                    on_control_status_update=_on_other_control_status_update,
+                    on_photo_received=_on_photo_received,
+                    on_error_received=_on_middleman_error_received,
+                    on_log=print,
+                )
+                candidate.start_discovery()
+                other_side_controller = candidate
+            except Exception as e:
+                control_mode_status_label.config(
+                    text=f"Middleman \u2014 Other Side failed to start: {e}", fg="red")
+                return
+        control_mode_status_label.config(
+            text="Middleman \u2014 Other Side. Select a Physical Side above, then Connect.", fg="blue")
+
+
+middleman_other_connect_btn.config(command=_middleman_other_connect)
+middleman_other_disconnect_btn.config(command=_middleman_other_disconnect)
+middleman_other_capture_btn.config(command=_middleman_other_capture)
+for _ch, (_on_btn, _off_btn) in middleman_other_laser_buttons.items():
+    _on_btn.config(command=lambda ch=_ch: _middleman_other_laser(ch, True))
+    _off_btn.config(command=lambda ch=_ch: _middleman_other_laser(ch, False))
+middleman_physical_disconnect_all_btn.config(command=_middleman_physical_disconnect_all)
+
+# Reflect the startup default (set on control_mode_var above) in the
+# status label immediately, without requiring the user to click a
+# radio button first.
+on_control_mode_changed()
 
 # Create left side container for plot and manual input
 left_container = tk.Frame(main_container)
@@ -788,6 +1403,30 @@ canvas = FigureCanvasTkAgg(fig, master=left_container)
 canvas.draw()
 canvas.get_tk_widget().pack(fill=tk.BOTH, expand=1)
 
+# --- Blitting cache for the live tracking dot ---
+# The workspace plot (contourf background + grid + saved-point scatters)
+# is expensive to redraw in full — doing that on every telemetry tick
+# (previously via fig.canvas.draw_idle() at 10Hz) is what actually caused
+# the tracking dot to visibly lag behind the real robot, especially under
+# any other GUI/thread load. Fix: snapshot everything static ONCE into
+# _plot_background, then each tick only blits the moved dot back onto
+# that cached snapshot — no re-render of the expensive stuff.
+#
+# _plot_background is auto-recaptured on ANY full canvas.draw() anywhere
+# else in this file (new saved-point markers, etc.) via the draw_event
+# hook below, so other code paths that add static plot content don't
+# need to know blitting exists — they just keep calling canvas.draw()
+# as before and the cache quietly stays correct.
+_plot_background = [None]
+
+
+def _capture_plot_background(event=None):
+    _plot_background[0] = fig.canvas.copy_from_bbox(ax.bbox)
+
+
+fig.canvas.mpl_connect('draw_event', _capture_plot_background)
+_capture_plot_background()
+
 # Frame for valid points list and buttons
 frame = tk.Frame(main_container)
 frame.pack(side=tk.RIGHT, fill=tk.Y)
@@ -899,29 +1538,49 @@ def add_dobot_instructions():
               f"claw={claw_text}, J4={j4_display}")
 
         def execute_point():
-            """Runs in background thread — move, sync, claw, then schedule next."""
+            """Runs in background thread — move, sync, claw, then schedule next.
+            Aborts the rest of the queue (rather than plowing ahead) if a
+            move is rejected — e.g. a hard-deck violation — since later
+            points were planned assuming this one actually happened."""
             try:
-                # 1. Move to target
-                move_to_point(x, y, point_z, j4_target)
+                if control_mode_var.get() == "middleman_other":
+                    # Redirect to the connected Physical Side instead of
+                    # local hardware — same IK solve move_to_point would
+                    # do locally, just sent as an absolute joint command
+                    # (with the claw riding along) over the existing
+                    # move-relay protocol instead of executed here.
+                    sols = Ikinematics(x, y, point_z, j4_target)
+                    if not sols:
+                        raise RuntimeError(f"Target ({x}, {y}) is unreachable.")
+                    j1, j2, z_target, r_target = sols[0]
+                    if other_side_controller is None or not other_side_controller.send_move(
+                            {"j1": j1, "j2": j2, "j3": z_target, "j4": r_target, "claw": claw_state}):
+                        raise RuntimeError("Not the active remote controller (queued or not connected).")
+                    print(f"Point complete (relayed): claw={claw_text}")
+                else:
+                    # 1. Move to target
+                    error = move_to_point(x, y, point_z, j4_target)
+                    if error:
+                        raise RuntimeError(error)
 
-                # 2. Block until the physical robot actually stops moving.
-                #    This replaces the fixed 3-second delay and handles both
-                #    short moves (no wasted wait) and long moves (no early fire).
-                if ROBOT_CONNECTED and robot:
-                    err = robot.movement.sync()
-                    if err:
-                        print(f"[SYNC WARNING]: {err}")
+                    # 2. Block until the physical robot actually stops moving.
+                    #    This replaces the fixed 3-second delay and handles both
+                    #    short moves (no wasted wait) and long moves (no early fire).
+                    if ROBOT_CONNECTED and robot:
+                        err = robot.movement.sync()
+                        if err:
+                            print(f"[SYNC WARNING]: {err}")
 
-                # 3. Fire claw after confirmed arrival
-                set_claw_dual_output(claw_state)
-                print(f"Point complete: claw={claw_text}")
+                    # 3. Fire claw after confirmed arrival
+                    set_claw_dual_output(claw_state)
+                    print(f"Point complete: claw={claw_text}")
 
             except Exception as e:
                 msg = str(e)
                 print(f"Sequence failed: {msg}")
                 finish_arm_operation()
                 root.after(0, lambda msg=msg: messagebox.showerror(
-                    "Robot Error", f"Point sequence failed: {msg}"))
+                    "Robot Error", f"Point sequence failed: {msg}\n\nRemaining queued points were NOT sent."))
                 return
 
             # 4. Remove point from GUI on the main thread, then trigger next
@@ -1070,6 +1729,9 @@ def run_automatic_capture_sequence(category: str, num_images: int,
 
         base_joints = list(robot_data["joints"]) if robot_data["joints"] else [0.0, 0.0, 200.0, 0.0]
         base_j1, base_j2, base_z, base_j4 = (base_joints + [0.0, 0.0, 200.0, 0.0])[:4]
+        hard_deck_error = _hard_deck_violation(base_z, "Capture rotation sequence")
+        if hard_deck_error:
+            raise RuntimeError(hard_deck_error)
 
         cameras_to_use = list_configured_cameras()
         failed_cameras = set()
@@ -1201,17 +1863,24 @@ def start_capture_command_listener() -> None:
 #                               joints hold their current position)
 # =============================================================================
 
-def _handle_move_command(payload: dict) -> None:
+def _handle_move_command(payload: dict):
+    """Returns None if accepted (incl. jog and demo-mode-simulated), or
+    an error string (hard-deck rejection, busy, real hardware move
+    error) — PhysicalSideController relays a non-None return back to
+    whoever sent the command as an explicit error (see
+    middleman_physical_side.py's _publish_error); the legacy generic
+    remote listener (start_move_command_listener) ignores the return
+    value, unchanged from before."""
     if "jog" in payload:
         axis_cmd = payload["jog"]
         if not ROBOT_CONNECTED or not manual_active.get():
             print(f"[REMOTE JOG IGNORED] robot not connected or manual mode off: {axis_cmd}")
-            return
+            return None  # not an error to report back — just a no-op in demo/disabled state
         if axis_cmd == "stop":
-            handle_jog_release(None)
+            handle_jog_release(None, _via_remote=True)
         else:
-            handle_jog_press(axis_cmd)
-        return
+            handle_jog_press(axis_cmd, _via_remote=True)
+        return None
 
     current = robot_data["joints"] if robot_data["joints"] else [0.0, 0.0, 200.0, 0.0]
     current = (list(current) + [0.0, 0.0, 200.0, 0.0])[:4]
@@ -1220,19 +1889,33 @@ def _handle_move_command(payload: dict) -> None:
     j3 = float(payload.get("j3", current[2]))
     j4 = float(payload.get("j4", current[3]))
 
+    floor = _effective_hard_deck_z()
+    if floor is not None and j3 < floor:
+        msg = f"Move rejected: target Z {j3:.1f} is below the height floor ({floor:.1f})."
+        print(f"[HARD DECK] {msg}")
+        return msg
+
     if not try_start_arm_operation("a remote move command"):
-        return
+        return "Robot is busy with another operation"
     try:
         if ROBOT_CONNECTED and robot:
             move_error = robot.movement.joint_to_joint_move([j1, j2, j3, j4])
             if move_error is not None:
                 print(f"[REMOTE MOVE ERROR]: {move_error}")
-            else:
-                robot.movement.sync()
-                sync_manual_position_from_feedback("remote MQTT move command")
+                return str(move_error)
+            robot.movement.sync()
+            sync_manual_position_from_feedback("remote MQTT move command")
         else:
             print(f"DEMO MODE: remote move to J1={j1:.1f} J2={j2:.1f} "
                   f"J3={j3:.1f} J4={j4:.1f}")
+
+        # Optional claw command riding along with the move — lets a
+        # queued point's pick/place action (see add_dobot_instructions)
+        # be relayed in one message instead of needing a second topic.
+        if "claw" in payload:
+            set_claw_dual_output(payload["claw"])
+
+        return None
     finally:
         finish_arm_operation()
 
@@ -1281,6 +1964,10 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
     # 1. Move to the object and grip it (reuses existing, tested logic)
     sols = Ikinematics(pickup_x, pickup_y, z=pickup_z)
     j1, j2, z_target, r_target = sols[0]
+    hard_deck_error = _hard_deck_violation(z_target, "Pipeline pickup move")
+    if hard_deck_error:
+        print(f"[PICKUP ABORTED]: {hard_deck_error}")
+        return
     if ROBOT_CONNECTED and robot:
         move_error = robot.movement.joint_to_joint_move([j1, j2, z_target, r_target])
         if move_error is not None:
@@ -1295,6 +1982,10 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
     # 2. Move to the fixed photo station (same marker shown as the yellow dot)
     station_sols = Ikinematics(PHOTO_STATION["x"], PHOTO_STATION["y"], z=PHOTO_STATION["z"])
     base_j1, base_j2, base_z, base_j4 = station_sols[0]
+    hard_deck_error = _hard_deck_violation(base_z, "Pipeline photo-station move")
+    if hard_deck_error:
+        print(f"[STATION MOVE ABORTED]: {hard_deck_error}")
+        return
     if ROBOT_CONNECTED and robot:
         move_error = robot.movement.joint_to_joint_move([base_j1, base_j2, base_z, base_j4])
         if move_error is not None:
@@ -2216,6 +2907,10 @@ def manual_joint_move():
         if not (J4_MIN <= j4 <= J4_MAX):
             messagebox.showerror("Out of Range", f"J4 must be between {J4_MIN} and {J4_MAX} degrees!")
             return
+        hard_deck_error = _hard_deck_violation(z, "Move Joints button")
+        if hard_deck_error:
+            messagebox.showerror("Move Rejected", hard_deck_error)
+            return
 
         def execute():
             if ROBOT_CONNECTED and robot:
@@ -2241,8 +2936,12 @@ def manual_joint_move():
 
 
 def update_gui_from_feedback():
-    """Refreshes the plot and labels with the robot's actual hardware position."""
-    global live_dot
+    """Refreshes the plot and labels with the robot's actual hardware
+    position. Uses blitting (see _plot_background above) so only the
+    small dot region gets redrawn each tick — the expensive workspace
+    background is never touched here — which is what keeps this able to
+    actually keep up with the 50Hz feedback feed instead of lagging."""
+    global live_dot, is_jogging
     
     if ROBOT_CONNECTED and "cartesian" in robot_data and robot_data["cartesian"] is not None:
         try:
@@ -2250,6 +2949,22 @@ def update_gui_from_feedback():
             raw_x = robot_data["cartesian"][0]
             raw_y = robot_data["cartesian"][1]
             live_z = robot_data["cartesian"][2]
+
+            # Reactive hard-deck watchdog, jog only: jogging has no single
+            # predictable target to check in advance (unlike move_to_point/
+            # _handle_move_command's absolute moves, which are blocked
+            # BEFORE they're ever sent instead — see the hard-deck checks
+            # there), so this force-stops the instant live Z crosses below
+            # the effective floor. Covers local AND remote-relayed jogging
+            # alike, since both drive the same is_jogging/robot_data
+            # globals regardless of who's driving.
+            floor = _effective_hard_deck_z()
+            if floor is not None and live_z < floor and is_jogging:
+                try:
+                    robot.movement.safe_move_jog("stop", [])
+                finally:
+                    is_jogging = False
+                print(f"[HARD DECK] Jog stopped \u2014 Z {live_z:.1f} crossed below floor ({floor:.1f}).")
             
             # 2. Apply rotation matrix to align with your physical desk setup
             angle_deg = 90  # Change to -90, 180, etc. based on your setup
@@ -2258,22 +2973,31 @@ def update_gui_from_feedback():
             rot_y = raw_x * np.sin(theta) + raw_y * np.cos(theta)
             
             # 3. Update the red tracking dot on the Matplotlib plot
-            if live_dot is not None:
-                live_dot.set_offsets(np.c_[rot_x, rot_y])
-            else:
+            if live_dot is None:
                 live_dot = ax.scatter(rot_x, rot_y, color='red', s=100, zorder=5, label="Live Robot Pos")
                 ax.legend()
-                
+                canvas.draw()  # one full draw to establish the legend; also
+                                # triggers _capture_plot_background via draw_event
+            else:
+                live_dot.set_offsets(np.c_[rot_x, rot_y])
+                if _plot_background[0] is not None:
+                    fig.canvas.restore_region(_plot_background[0])
+                    ax.draw_artist(live_dot)
+                    fig.canvas.blit(ax.bbox)
+                else:
+                    # Background not captured yet for some reason — fall
+                    # back to a full draw rather than showing a stale dot.
+                    fig.canvas.draw_idle()
+
             # 4. Update the text status label with X, Y, and Z
             if 'status_label' in globals() and status_label.winfo_exists():
                 status_label.config(text=f"Robot Connected | X: {raw_x:.1f} | Y: {raw_y:.1f} | Z: {live_z:.1f}")
-                
-            fig.canvas.draw_idle() 
         except Exception as e:
             print(f"GUI telemetry loop warning: {e}")
 
-    # Schedule this function to run again in 100ms
-    root.after(100, update_gui_from_feedback)
+    # ~30Hz — closely tracks the 50Hz feedback_loop() without over-driving
+    # the GUI thread. Blitting (above) is what makes this rate affordable.
+    root.after(33, update_gui_from_feedback)
 
 # Connect the click event
 fig.canvas.mpl_connect('button_press_event', onclick)
@@ -2656,6 +3380,116 @@ laser_off_btn = tk.Button(laser_fire_row, text="LASER OFF", bg="red", fg="white"
                           width=12, state=tk.DISABLED)
 laser_off_btn.pack(side=tk.LEFT)
 
+# =============================================================================
+# [WIRED] LASER RELAY CHANNELS — per the board photos, this rig's lasers are
+# each behind their own plain ON/OFF relay module (SRD-05VDC-SL-C, "1 Relay
+# Module High/Low Level Trigger"), not one PWM-dimmable laser. So these use
+# RelayController's generic multi-channel CONFIG/SET commands (channels
+# 1-16) — the SAME connection (laser_ctl) as the PWM panel above, just a
+# different command family. Connect above first; this section just adds
+# per-channel configure + individual ON/OFF toggles for up to 4 lasers.
+# =============================================================================
+laser_channels_frame = tk.LabelFrame(laser_frame.master, text=" Laser Channels \u2014 Relay On/Off (up to 4) ",
+                                      padx=8, pady=8)
+laser_channels_frame.pack(fill=tk.X, padx=4, pady=(4, 10))
+
+tk.Label(laser_channels_frame,
+         text="For relay-switched laser diodes (individual on/off, no dimming). "
+              "Uses the same ESP32 connection as the panel above \u2014 connect there first.",
+         fg="gray", font=("Arial", 8), wraplength=520, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 6))
+
+laser_channel_assignments = channel_assignments.load_assignments()  # "1".."4" -> {"name","pin"}
+laser_channel_rows_container = tk.Frame(laser_channels_frame)
+laser_channel_rows_container.pack(fill=tk.X)
+
+
+def _rebuild_laser_channel_rows():
+    for widget in laser_channel_rows_container.winfo_children():
+        widget.destroy()
+
+    for ch in range(1, 5):
+        saved = laser_channel_assignments.get(str(ch), {})
+        row = tk.Frame(laser_channel_rows_container)
+        row.pack(fill=tk.X, pady=2)
+
+        tk.Label(row, text=f"Ch {ch} \u2014 name:", width=10, anchor=tk.W).pack(side=tk.LEFT)
+        name_var = tk.StringVar(value=saved.get("name", f"Laser {ch}"))
+        tk.Entry(row, textvariable=name_var, width=12).pack(side=tk.LEFT, padx=(2, 8))
+
+        tk.Label(row, text="pin:").pack(side=tk.LEFT)
+        pin_var = tk.StringVar(value=str(saved.get("pin", "")))
+        tk.Entry(row, textvariable=pin_var, width=5).pack(side=tk.LEFT, padx=(2, 8))
+
+        configure_btn = tk.Button(row, text="Configure")
+        configure_btn.pack(side=tk.LEFT, padx=(0, 6))
+        on_btn = tk.Button(row, text="ON", bg="lightgreen", state=tk.DISABLED, width=6)
+        on_btn.pack(side=tk.LEFT, padx=(0, 4))
+        off_btn = tk.Button(row, text="OFF", bg="salmon", state=tk.DISABLED, width=6)
+        off_btn.pack(side=tk.LEFT, padx=(0, 4))
+        status_lbl = tk.Label(row, text="Not configured.", fg="gray", font=("Arial", 8))
+        status_lbl.pack(side=tk.LEFT, padx=(8, 0))
+
+        def make_configure(ch=ch, name_var=name_var, pin_var=pin_var,
+                            status_lbl=status_lbl, on_btn=on_btn, off_btn=off_btn,
+                            configure_btn=configure_btn):
+            def do_configure():
+                if laser_ctl is None:
+                    status_lbl.config(text="Connect the ESP32 above first.", fg="red")
+                    return
+                try:
+                    pin = int(pin_var.get())
+                except ValueError:
+                    status_lbl.config(text="Pin must be a whole number.", fg="red")
+                    return
+
+                configure_btn.config(state=tk.DISABLED)
+
+                def worker():
+                    ok, raw_lines = laser_ctl.configure_channel_verbose(ch, pin, active_high=True, safe_on=False)
+
+                    def finish():
+                        configure_btn.config(state=tk.NORMAL)
+                        if ok:
+                            on_btn.config(state=tk.NORMAL)
+                            off_btn.config(state=tk.NORMAL)
+                            status_lbl.config(text=f"Configured on pin {pin}.", fg="green")
+                            laser_channel_assignments[str(ch)] = {"name": name_var.get(), "pin": pin}
+                            channel_assignments.save_assignments(laser_channel_assignments)
+                        else:
+                            reason = " | ".join(raw_lines) if raw_lines else "(board sent no response)"
+                            status_lbl.config(text=f"Rejected: {reason}", fg="red")
+                    root.after(0, finish)
+
+                threading.Thread(target=worker, daemon=True).start()
+            return do_configure
+
+        def make_toggle(ch=ch, state=True, status_lbl=status_lbl):
+            def do_toggle():
+                if laser_ctl is None:
+                    return
+
+                def worker():
+                    ok = laser_ctl.set_channel(ch, state)
+
+                    def finish():
+                        if ok:
+                            status_lbl.config(text="ON" if state else "OFF",
+                                               fg="orange" if state else "gray")
+                        else:
+                            status_lbl.config(text="Command rejected by board.", fg="red")
+                    root.after(0, finish)
+
+                threading.Thread(target=worker, daemon=True).start()
+            return do_toggle
+
+        configure_btn.config(command=make_configure())
+        on_btn.config(command=make_toggle(state=True))
+        off_btn.config(command=make_toggle(state=False))
+
+
+_rebuild_laser_channel_rows()
+
+
 
 def _laser_set_status(text, fg="gray"):
     laser_status_label.config(text=text, fg=fg)
@@ -2781,7 +3615,7 @@ def _laser_configure():
 
     def worker():
         global laser_configured
-        ok = laser_ctl.laser_config(pin=pin, freq_hz=freq, max_duty_pct=maxduty)
+        ok, raw_lines = laser_ctl.laser_config_verbose(pin=pin, freq_hz=freq, max_duty_pct=maxduty)
 
         def finish():
             global laser_configured
@@ -2794,10 +3628,9 @@ def _laser_configure():
                     f"Disarmed / 0% until you click ARM.", fg="green")
             else:
                 laser_configured = False
+                board_reason = " | ".join(raw_lines) if raw_lines else "(board sent no response)"
                 _laser_set_status(
-                    "Laser configuration rejected by the board — check the pin "
-                    "isn't already used by a relay channel, and that frequency/"
-                    "duty are in range.", fg="red")
+                    f"Laser configuration rejected by the board: {board_reason}", fg="red")
         root.after(0, finish)
 
     threading.Thread(target=worker, daemon=True).start()
@@ -3081,6 +3914,25 @@ def on_app_close():
             laser_ctl.disconnect()
     except Exception as e:
         print(f"[CLEANUP] ESP32 laser controller cleanup skipped: {e}")
+
+    # Middleman controllers (if either mode was active) own their own
+    # separate MQTT client from the publisher/subscriber module below —
+    # stop them explicitly so a lingering session/heartbeat/discovery
+    # thread doesn't keep publishing after the window closes, and so a
+    # Physical Side properly announces itself offline (discovery "Last
+    # Will" also covers an unclean exit, but a clean stop() is faster
+    # for anyone watching the Other Side's dropdown).
+    try:
+        if physical_side_controller is not None:
+            physical_side_controller.stop()
+    except Exception as e:
+        print(f"[CLEANUP] Physical Side controller stop skipped: {e}")
+
+    try:
+        if other_side_controller is not None:
+            other_side_controller.stop()
+    except Exception as e:
+        print(f"[CLEANUP] Other Side controller stop skipped: {e}")
 
     try:
         from vision.messaging.publisher import disconnect as disconnect_mqtt
