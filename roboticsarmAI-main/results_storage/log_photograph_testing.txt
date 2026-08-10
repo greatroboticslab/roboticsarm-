@@ -1,0 +1,44 @@
+thon.exe g:/downloads/roboticsarmAI-finns-test-branch/roboticsarmAI-finns-test-branch/main.py
+Attempting to connect to robot at 192.168.1.6...
+here2
+Here3
+Robot connected and enabled successfully!
+Manual point added: (0.00, 400.00, z=200.0, claw=OFF)
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "C:\Users\great\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 1967, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\great\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 861, in callit
+    func(*args)
+  File "g:\downloads\roboticsarmAI-finns-test-branch\roboticsarmAI-finns-test-branch\main.py", line 804, in <lambda>
+    "Pipeline Error", f"Pickup/photograph sequence failed: {e}"))
+                                                            ^
+NameError: cannot access free variable 'e' where it is not associated with a value in enclosing scope
+Sending point: x=-393.29, y=-1.54, z=200.00, claw=OFF
+Moving to (-1.54,393.29) | J1=79.7° J2=21.0° Z=200.0
+[MOVE SUCCESS]: (-1.54, 393.29, 200.0)
+[VACUUM LATCH] Claw → INACTIVE
+[CLAW OK]: INACTIVE
+Point complete: claw=OFF
+Sending point: x=0.00, y=400.00, z=200.00, claw=OFF
+Moving to (400.0,-0.0) | J1=-0.0° J2=0.0° Z=200.0
+[MOVE SUCCESS]: (400.0, -0.0, 200.0)
+[VACUUM LATCH] Claw → INACTIVE
+[CLAW OK]: INACTIVE
+Point complete: claw=OFF
+All points complete.
+Exception in Tkinter callback
+Traceback (most recent call last):
+  File "C:\Users\great\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 1967, in __call__
+    return self.func(*args)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Users\great\AppData\Local\Programs\Python\Python311\Lib\tkinter\__init__.py", line 861, in callit
+    func(*args)
+  File "g:\downloads\roboticsarmAI-finns-test-branch\roboticsarmAI-finns-test-branch\main.py", line 804, in <lambda>
+    "Pipeline Error", f"Pickup/photograph sequence failed: {e}"))
+                                                            ^
+NameError: cannot access free variable 'e' where it is not associated with a value in enclosing scope
+
+
+# this is from when photograph testing failed the errors are from that 
