@@ -47,7 +47,7 @@ from vision.storage import mongo_client
 from vision.services import deepseek_query
 from vision.config import OLLAMA_MODEL, NL_QUERY_FIELD_SAMPLE_SIZE
 
-# [WIRED] Middleman mode (Physical Control tab). Business logic
+# [WIRED] Middleman mode (Virtual tab). Business logic
 # (networking/protocol/session/photo-transfer) lives entirely in these
 # modules — main.py only wires callables into them + reflects status in
 # the UI. See each module's docstring for the split.
@@ -615,19 +615,32 @@ manual_active = tk.BooleanVar(value=False)
 
 # =============================================================================
 # TABS
-#   Tab 1 "Arm Control"       — nothing but driving the robot: plot, manual/
-#                               joint controls, the point queue, and sending
-#                               instructions to the arm.
-#   Tab 2 "Camera"            — a bigger live webcam view, camera selection,
-#                               the pickup+photograph vision pipeline, and a
-#                               one-click "Capture Photo" that saves locally,
-#                               logs to MongoDB, and uploads to the server.
-#   Tab 3 "Server"            — the server URL (test-local by default),
-#                               connection testing, and the server-
-#                               triggered continuous-sweep automation.
-#   Tab 4 "Database"          — a browser for what's stored in the local
-#                               MongoDB (kept separate from "Server" so
-#                               either can grow independently later).
+#   Tab 1 "Arm"       — nothing but driving the physical robot directly:
+#                       the height floor / hard deck, plot, manual/joint
+#                       controls, the point queue, and sending instructions
+#                       to the arm. No control-mode/Middleman UI here — see
+#                       "Virtual".
+#   Tab 2 "Virtual"   — Control Mode (Demo / Physical Manual / Middleman —
+#                       Physical Side / Middleman — Other Side) and every
+#                       Middleman-specific panel (remote queue, discovery/
+#                       connect dropdown, remote capture, remote laser
+#                       toggles). Split out of the Arm tab so "driving this
+#                       machine directly" and "being/using a remote
+#                       controller" aren't competing for the same screen.
+#   Tab 3 "Camera"    — the working "Capture Photo" flow (save + log to
+#                       MongoDB + upload) at the top, live webcam view, and
+#                       camera selection. No laser controls here — see
+#                       "Laser".
+#   Tab 4 "Laser"     — the ESP32 laser controller: connect/disconnect,
+#                       PWM configure/arm/fire, and the per-channel relay
+#                       toggles. Split out of "Camera" so it reads as its
+#                       own subsystem rather than a camera accessory.
+#   Tab 5 "Server"    — the server URL (test-local by default), connection
+#                       testing, and the server-triggered continuous-sweep
+#                       automation.
+#   Tab 6 "Database"  — a browser for what's stored in the local MongoDB
+#                       (kept separate from "Server" so either can grow
+#                       independently later).
 # =============================================================================
 notebook = ttk.Notebook(root)
 notebook.pack(fill=tk.BOTH, expand=1)
@@ -646,7 +659,9 @@ _tab_style.map("TNotebook.Tab",
                foreground=[("selected", "white"), ("!selected", "black")])
 
 tab_arm = tk.Frame(notebook)
+tab_virtual = tk.Frame(notebook)
 tab_camera = tk.Frame(notebook)
+tab_laser = tk.Frame(notebook)
 tab_server = tk.Frame(notebook)
 tab_database = tk.Frame(notebook)
 
@@ -656,18 +671,21 @@ tab_database = tk.Frame(notebook)
 # notebook's own show/hide-per-tab logic and made every tab's content
 # render all at once regardless of which tab was selected, which is why
 # clicking between tabs looked like it wasn't doing anything.
-notebook.add(tab_arm, text="Physical Control")
+notebook.add(tab_arm, text="Arm")
+notebook.add(tab_virtual, text="Virtual")
 notebook.add(tab_camera, text="Camera")
+notebook.add(tab_laser, text="Laser")
 notebook.add(tab_server, text="Server")
 notebook.add(tab_database, text="Database")
 
-# Always boot straight into the Physical Control tab (demo mode banner
-# and all), regardless of insertion order above.
+# Always boot straight into the Arm tab (demo mode banner and all),
+# regardless of insertion order above.
 notebook.select(tab_arm)
 
-# Tab 1: Physical Control (renamed from "Arm Control") — everything
-# below that packs into main_container/left_container/frame ends up on
-# this tab only.
+# Tab 1: Arm — everything below that packs into main_container/
+# left_container/frame ends up on this tab only. Control Mode/Middleman
+# UI is parented on tab_virtual instead (see below) so it lands on the
+# "Virtual" tab.
 main_container = tab_arm
 
 # =====================================================================
@@ -682,7 +700,18 @@ main_container = tab_arm
 # =====================================================================
 control_mode_var = tk.StringVar(value="physical_manual" if ROBOT_CONNECTED else "demo")
 
-control_mode_frame = tk.LabelFrame(main_container, text=" Control Mode ", padx=10, pady=8)
+tk.Label(tab_virtual, text="Virtual / Remote Control", font=("Arial", 12, "bold")).pack(pady=(10, 0))
+tk.Label(tab_virtual, text="Choose how this machine is driven: purely local (Demo /\n"
+         "Physical Manual — see the 'Arm' tab for jogging and the point\n"
+         "queue) or over the network via Middleman, either as the\n"
+         "Physical Side (a robot being remote-driven) or the Other Side\n"
+         "(the remote driver).",
+         font=("Arial", 8), fg="gray", justify=tk.CENTER).pack(pady=(2, 8))
+
+# Parented on tab_virtual (not main_container/tab_arm) — Control Mode and
+# every Middleman panel live on the "Virtual" tab, separate from the Arm
+# tab's direct hard-deck/point-control UI.
+control_mode_frame = tk.LabelFrame(tab_virtual, text=" Control Mode ", padx=10, pady=8)
 control_mode_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
 
 control_mode_radio_row = tk.Frame(control_mode_frame)
@@ -949,16 +978,18 @@ def _physical_side_locked_out() -> bool:
 def _middleman_laser_executor(channel, state: bool) -> None:
     """Laser executor handed to PhysicalSideController. Per the board
     photos, this rig's lasers are relay-switched (individually
-    configured on the "Laser Channels" panel below, using laser_ctl's
-    generic multi-channel CONFIG/SET commands) — not one PWM-dimmable
-    laser, so this is channel-addressed rather than a single on/off.
-    channel=None means "all channels currently configured" (used by the
-    timeout-safety path, which needs to kill every laser at once, not
-    guess which one channel was actually in use).
+    configured on the "Laser Channels" panel on the "Laser" tab, using
+    laser_ctl's generic multi-channel CONFIG/SET commands) — not one
+    PWM-dimmable laser, so this is channel-addressed rather than a
+    single on/off. channel=None means "all channels currently
+    configured" (used by the timeout-safety path, which needs to kill
+    every laser at once, not guess which one channel was actually in
+    use).
 
-    Requires the channels to already be configured locally first (see
-    laser_channels_frame below) — this cannot configure them remotely,
-    same as the single-laser panel it replaces for this hardware."""
+    Requires the channels to already be configured locally first (on
+    the "Laser" tab's laser_channels_frame) — this cannot configure
+    them remotely, same as the single-laser panel it replaces for this
+    hardware."""
     if laser_ctl is None:
         print("[MIDDLEMAN] Laser command ignored — ESP32 not connected locally on this Physical Side.")
         return
@@ -2378,16 +2409,6 @@ error_button.pack(pady=5)
 test_points_button = tk.Button(frame, text="Add Test Points", command=add_test_points_from_list, )
 test_points_button.pack(pady=5)
 
-# --- Vision pipeline entry point (yellow star = photo station on the plot) ---
-tk.Label(tab_camera, text="Vision Pipeline", font=("Arial", 11, "bold")).pack(pady=(10, 2))
-tk.Label(tab_camera, text="Takes a photo from every configured camera at\n"
-         "the arm's CURRENT position (no movement) and\n"
-         "hands the set off to the identification pipeline.",
-         font=("Arial", 8), fg="gray", justify=tk.CENTER).pack()
-vision_button = tk.Button(tab_camera, text="Take Photograph (current position)",
-                           command=run_photograph_at_current_position, bg="khaki")
-vision_button.pack(pady=5)
-
 tk.Label(tab_server, text="Server Communication",
          font=("Arial", 12, "bold")).pack(pady=(10, 5))
 
@@ -3017,6 +3038,149 @@ gallery_frame = tk.Frame(tab_camera, bg="#f0f0f0")
 gallery_frame.pack(fill=tk.BOTH, expand=1, padx=10, pady=10)
 
 # =============================================================================
+# CAPTURE PHOTO — pinned to the TOP of the Camera tab (this is the flow
+# that actually stores something: save to disk, log to the local
+# MongoDB, and upload to the server). The old top-of-tab "Take
+# Photograph (current position)" button only saved locally and posted
+# over MQTT — it never touched MongoDB or the server upload endpoints,
+# so it's been dropped in favor of this one flow.
+# =============================================================================
+tk.Label(gallery_frame, text="Capture Photo",
+         font=("Arial", 12, "bold"), bg="#f0f0f0").pack(pady=(0, 2))
+tk.Label(gallery_frame, text="Grabs one frame from every configured camera (no arm\n"
+         "movement), saves it locally, logs it to the local MongoDB, and\n"
+         "uploads it to the server URL configured on the 'Server' tab.",
+         font=("Arial", 8), bg="#f0f0f0", fg="gray", justify=tk.CENTER).pack(pady=(0, 6))
+
+# --- Sample name/label — a preliminary tag you can attach before capturing,
+# stored alongside the sample in MongoDB (both as the "label" field and as
+# the upload category) so you can find this capture again later on the
+# "Database" tab or via the natural-language query box there, instead of
+# every capture being lumped under one generic "manual_snapshot" label.
+# The dropdown offers a few common preliminary names, but the box is fully
+# editable — type any name you want.
+capture_label_row = tk.Frame(gallery_frame, bg="#f0f0f0")
+capture_label_row.pack(pady=(0, 6))
+tk.Label(capture_label_row, text="Sample name (optional, for querying later):",
+         bg="#f0f0f0", font=("Arial", 9)).pack(side=tk.LEFT, padx=(0, 6))
+capture_label_var = tk.StringVar(value="")
+capture_label_combo = ttk.Combobox(
+    capture_label_row, textvariable=capture_label_var, width=26,
+    values=["uncategorized", "test_object", "calibration_shot",
+            "reference_photo", "manual_snapshot"])
+capture_label_combo.pack(side=tk.LEFT)
+
+capture_status_label = tk.Label(gallery_frame, text="", bg="#f0f0f0", fg="gray",
+                                 font=("Arial", 9), justify=tk.CENTER, wraplength=520)
+capture_status_label.pack(pady=(0, 4))
+
+
+def capture_photo_and_store():
+    """
+    One-click multi-camera snapshot (no arm movement, no rotation): grab
+    one frame from EVERY USB camera configured in vision/config.py
+    CAMERAS at once, save each to disk, log them all under a single
+    sample in the local MongoDB (bringing back local-copy storage), and
+    — if the server responds — upload each image too, through the same
+    /collection/submission + /collection/images/upload endpoints the
+    automatic capture sequence uses, against whatever SERVER_URL is
+    currently configured on the "Server" tab.
+
+    The "Sample name" box above (capture_label_var) is stored as both
+    the "label" field and the upload category, so a capture can be
+    found again later by that name — on the "Database" tab (recent
+    samples list / natural-language query) or via mongo_client.
+    find_samples() directly — instead of every capture being lumped
+    under one generic "manual_snapshot" bucket.
+    """
+    camera_names = list(live_feed_panels.keys()) or list(list_configured_cameras().keys())
+    sample_label = capture_label_var.get().strip() or "manual_snapshot"
+    capture_status_label.config(
+        text=f"Capturing '{sample_label}' from {len(camera_names)} camera(s): "
+             f"{', '.join(camera_names)}...",
+        fg="gray")
+
+    def worker():
+        sample_id = new_sample_id()
+        saved_paths = {}   # camera name -> image path
+        cam_errors = {}    # camera name -> error message
+
+        for cam in camera_names:
+            try:
+                frame = capture_frame(cam)
+                saved_paths[cam] = save_image(frame, sample_id, cam, 0)
+            except Exception as e:
+                cam_errors[cam] = str(e)
+
+        mongo_ok = False
+        if saved_paths:
+            try:
+                mongo_client.save_sample(sample_id, str(date.today()),
+                                          {"label": sample_label,
+                                           "predicted_label": sample_label,
+                                           "cameras": list(saved_paths.keys()),
+                                           "num_images": len(saved_paths)})
+                for cam, path in saved_paths.items():
+                    mongo_client.save_image_record(new_sample_id(), sample_id, path, cam, 0)
+                mongo_ok = True
+            except Exception as e:
+                print(f"[MONGO] Could not log capture locally: {e}")
+
+        uploaded = 0
+        if SERVER_URL and saved_paths:
+            try:
+                submit_response = requests.post(
+                    f"{SERVER_URL}/collection/submission",
+                    json={"category": sample_label, "date": str(date.today()),
+                          "data": {"label": sample_label,
+                                   "predicted_label": sample_label,
+                                   "num_images": len(saved_paths)}},
+                    timeout=5,
+                )
+                submit_response.raise_for_status()
+                remote_sample_id = submit_response.json()["sample_id"]
+                for cam, path in saved_paths.items():
+                    try:
+                        with open(path, "rb") as image_file:
+                            upload_response = requests.post(
+                                f"{SERVER_URL}/collection/images/upload",
+                                files={"file": image_file},
+                                data={"sample_id": remote_sample_id, "category": sample_label},
+                                timeout=10,
+                            )
+                        upload_response.raise_for_status()
+                        uploaded += 1
+                    except Exception as e:
+                        print(f"[UPLOAD] Could not upload '{cam}' image: {e}")
+            except Exception as e:
+                print(f"[UPLOAD] Could not create submission on server ({SERVER_URL}): {e}")
+
+        def report():
+            parts = [f"Saved {len(saved_paths)}/{len(camera_names)} camera(s) as '{sample_label}'"]
+            if cam_errors:
+                parts.append("Errors: " + ", ".join(
+                    f"{c} ({m})" for c, m in cam_errors.items()))
+            parts.append("MongoDB: OK" if mongo_ok else "MongoDB: failed")
+            parts.append(f"Upload: {uploaded}/{len(saved_paths)}" if saved_paths
+                         else "Upload: skipped")
+            color = "green" if (mongo_ok or uploaded) else "orange"
+            capture_status_label.config(text=" | ".join(parts), fg=color)
+            try:
+                refresh_recent_samples()
+            except NameError:
+                pass  # Database tab not built yet — harmless
+        root.after(0, report)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(gallery_frame, text="Capture Photo — All Cameras (Save + Upload)", bg="khaki",
+          font=("Arial", 10, "bold"),
+          command=capture_photo_and_store).pack(pady=6)
+
+tk.Frame(gallery_frame, height=2, bd=1, relief=tk.SUNKEN, bg="#f0f0f0").pack(fill=tk.X, padx=20, pady=(6, 10))
+
+# =============================================================================
 # Live camera feed — continuous preview from any configured camera
 # (vision.config.CAMERAS), not just a single snapshot. Runs as a
 # self-rescheduling root.after() loop: each tick grabs one frame in a
@@ -3302,6 +3466,8 @@ tk.Button(camera_assign_new_row, text="Add Camera", bg="lightgreen",
 tk.Button(camera_assign_new_row, text="Detect Cameras", bg="khaki",
           command=_do_detect_cameras).pack(side=tk.LEFT)
 
+tk.Label(tab_laser, text="Laser Control", font=("Arial", 12, "bold")).pack(pady=(10, 0))
+
 # =============================================================================
 # LASER CONTROL (ESP32) — controls the structured-light / scan laser via the
 # ESP32 GPIO+laser controller firmware (see ESP32_Laser_Control/src/main.cpp
@@ -3325,8 +3491,8 @@ laser_heartbeat_stop = threading.Event()
 laser_configured = False
 laser_armed_state = False
 
-laser_frame = tk.LabelFrame(gallery_frame, text=" Laser Control (ESP32) ", padx=8, pady=8)
-laser_frame.pack(fill=tk.X, padx=4, pady=(4, 10))
+laser_frame = tk.LabelFrame(tab_laser, text=" Laser Control (ESP32) ", padx=8, pady=8)
+laser_frame.pack(fill=tk.X, padx=10, pady=(10, 10))
 
 laser_status_label = tk.Label(laser_frame, text="Not connected.", fg="gray",
                                font=("Arial", 8), wraplength=520, justify=tk.LEFT)
@@ -3724,113 +3890,6 @@ laser_off_btn.config(command=_laser_force_off)
 
 _laser_refresh_ports()
 
-tk.Label(gallery_frame, text="Capture Photo",
-         font=("Arial", 11, "bold"), bg="#f0f0f0").pack(pady=(10, 5))
-
-capture_status_label = tk.Label(gallery_frame, text="", bg="#f0f0f0", fg="gray",
-                                 font=("Arial", 9), justify=tk.CENTER, wraplength=520)
-capture_status_label.pack(pady=(0, 4))
-
-
-def capture_photo_and_store():
-    """
-    One-click multi-camera snapshot (no arm movement, no rotation): grab
-    one frame from EVERY USB camera configured in vision/config.py
-    CAMERAS at once, save each to disk, log them all under a single
-    sample in the local MongoDB (bringing back local-copy storage), and
-    — if the server responds — upload each image too, through the same
-    /collection/submission + /collection/images/upload endpoints the
-    automatic capture sequence uses, against whatever SERVER_URL is
-    currently configured on the "Server" tab.
-    """
-    camera_names = list(live_feed_panels.keys()) or list(list_configured_cameras().keys())
-    capture_status_label.config(
-        text=f"Capturing from {len(camera_names)} camera(s): {', '.join(camera_names)}...",
-        fg="gray")
-
-    def worker():
-        sample_id = new_sample_id()
-        saved_paths = {}   # camera name -> image path
-        cam_errors = {}    # camera name -> error message
-
-        for cam in camera_names:
-            try:
-                frame = capture_frame(cam)
-                saved_paths[cam] = save_image(frame, sample_id, cam, 0)
-            except Exception as e:
-                cam_errors[cam] = str(e)
-
-        mongo_ok = False
-        if saved_paths:
-            try:
-                mongo_client.save_sample(sample_id, str(date.today()),
-                                          {"predicted_label": "manual_snapshot",
-                                           "cameras": list(saved_paths.keys()),
-                                           "num_images": len(saved_paths)})
-                for cam, path in saved_paths.items():
-                    mongo_client.save_image_record(new_sample_id(), sample_id, path, cam, 0)
-                mongo_ok = True
-            except Exception as e:
-                print(f"[MONGO] Could not log capture locally: {e}")
-
-        uploaded = 0
-        if SERVER_URL and saved_paths:
-            try:
-                submit_response = requests.post(
-                    f"{SERVER_URL}/collection/submission",
-                    json={"category": "manual_snapshot", "date": str(date.today()),
-                          "data": {"predicted_label": "manual_snapshot",
-                                   "num_images": len(saved_paths)}},
-                    timeout=5,
-                )
-                submit_response.raise_for_status()
-                remote_sample_id = submit_response.json()["sample_id"]
-                for cam, path in saved_paths.items():
-                    try:
-                        with open(path, "rb") as image_file:
-                            upload_response = requests.post(
-                                f"{SERVER_URL}/collection/images/upload",
-                                files={"file": image_file},
-                                data={"sample_id": remote_sample_id, "category": "manual_snapshot"},
-                                timeout=10,
-                            )
-                        upload_response.raise_for_status()
-                        uploaded += 1
-                    except Exception as e:
-                        print(f"[UPLOAD] Could not upload '{cam}' image: {e}")
-            except Exception as e:
-                print(f"[UPLOAD] Could not create submission on server ({SERVER_URL}): {e}")
-
-        def report():
-            parts = [f"Saved {len(saved_paths)}/{len(camera_names)} camera(s)"]
-            if cam_errors:
-                parts.append("Errors: " + ", ".join(
-                    f"{c} ({m})" for c, m in cam_errors.items()))
-            parts.append("MongoDB: OK" if mongo_ok else "MongoDB: failed")
-            parts.append(f"Upload: {uploaded}/{len(saved_paths)}" if saved_paths
-                         else "Upload: skipped")
-            color = "green" if (mongo_ok or uploaded) else "orange"
-            capture_status_label.config(text=" | ".join(parts), fg=color)
-            try:
-                refresh_recent_samples()
-            except NameError:
-                pass  # Database tab not built yet — harmless
-        root.after(0, report)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-tk.Button(gallery_frame, text="Capture Photo — All Cameras (Save + Upload)", bg="khaki",
-          font=("Arial", 10, "bold"),
-          command=capture_photo_and_store).pack(pady=6)
-
-tk.Label(gallery_frame, text="Captures are saved locally, logged to the local\n"
-         "MongoDB (browse them on the 'Database' tab), and\n"
-         "uploaded to the server URL configured on the\n"
-         "'Server' tab.",
-         font=("Arial", 8), bg="#f0f0f0", fg="gray",
-         justify=tk.CENTER).pack(pady=(0, 10))
-
 
 # --- KEYBOARD BINDINGS ---
 # --- NEW AREA C: JOGGING BINDINGS ---
@@ -3903,7 +3962,7 @@ def on_app_close():
     except Exception as e:
         print(f"[CLEANUP] Laser close skipped: {e}")
 
-    # The ESP32 laser controller wired up in the Camera tab (laser_ctl) is a
+    # The ESP32 laser controller wired up on the Laser tab (laser_ctl) is a
     # separate connection from the vision.camera.laser stub above — always
     # disarm before disconnecting so a live laser is never left armed/firing
     # if the app is closed mid-use.

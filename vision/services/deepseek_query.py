@@ -129,6 +129,21 @@ def _validate_filter(filter_obj) -> dict:
     return filter_obj
 
 
+def _repair_unquoted_operators(text: str) -> str:
+    """
+    Best-effort repair for a specific, observed failure mode: small local
+    models frequently emit MongoDB-shell/JS-style operator keys —
+    `{$gt: 10}` — instead of strict JSON's `{"$gt": 10}`. json.loads()
+    rejects the former ("Expecting property name enclosed in double
+    quotes"), even though it's an unambiguous, safe fix: wrap any bare
+    `$operator` immediately after `{` or `,` in double quotes. This is
+    intentionally narrow (only touches keys starting with "$", not
+    quotes anywhere else in the text) so it can't accidentally mangle a
+    legitimate string value.
+    """
+    return re.sub(r'([{,]\s*)(\$[A-Za-z]+)(\s*:)', r'\1"\2"\3', text)
+
+
 def _extract_json(raw_text: str) -> dict:
     """Best-effort extraction of a JSON object from a local model's
     response — small/reasoning models often wrap output in ```json
@@ -149,6 +164,12 @@ def _extract_json(raw_text: str) -> dict:
 
     try:
         return json.loads(text)
+    except json.JSONDecodeError:
+        pass  # try the operator-quoting repair below before giving up
+
+    repaired = _repair_unquoted_operators(text)
+    try:
+        return json.loads(repaired)
     except json.JSONDecodeError as e:
         raise DeepSeekQueryError(
             f"Couldn't parse a JSON filter from the model's response.\n"
@@ -174,6 +195,9 @@ def generate_mongo_filter(question: str, fields: list, model: str = OLLAMA_MODEL
         "Respond with ONLY a single JSON object usable as a MongoDB filter "
         "(e.g. referencing fields as \"data.<field>\" and/or \"date\"). "
         "No explanation, no markdown fences, no extra text — JSON only. "
+        "This must be STRICT JSON: every key, including operators, must "
+        "be in double quotes — write {\"data.count\": {\"$gt\": 10}}, "
+        "never {\"data.count\": {$gt: 10}}. "
         "Only use these operators if needed: "
         f"{', '.join(sorted(_ALLOWED_OPERATORS))}. "
         "Never include write operators."

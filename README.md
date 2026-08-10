@@ -69,6 +69,63 @@ When you start the application with `python main.py`, the GUI window will open a
 2. Confirm order in the FIFO list.
 3. Click `Send` to move the arm through the points in order.
 
+## GUI Tabs Overview
+`main.py`'s GUI is organized into six tabs. Screenshots below reflect the
+current layout.
+
+### Arm
+Direct physical control only: the Height Floor / Hard Deck safety limit,
+keyboard/manual jog overdrive, the manual XYZ and joint-move point
+controls, and the FIFO point queue. No Control Mode or Middleman UI lives
+here — see the "Virtual" tab for that.
+
+![Arm tab](docs/images/gui_tab_arm.jpg)
+
+### Virtual
+Control Mode selection (Demo / Physical Manual / Middleman — Physical
+Side / Middleman — Other Side) and every Middleman-specific panel: the
+remote controller queue, the Physical Side discovery/connect dropdown,
+remote capture, and remote laser toggles.
+
+![Virtual tab](docs/images/gui_tab_virtual.jpg)
+
+### Camera
+The "Capture Photo" action sits at the top of this tab — it's the flow
+that actually stores something: it saves each configured camera's frame
+locally, logs the sample to the local MongoDB, and uploads it to the
+server URL configured on the "Server" tab. An optional "Sample name"
+field lets you tag a capture (e.g. `test_object`) so it's easy to find
+again later on the "Database" tab. Below that is the live multi-camera
+feed and camera device-index assignment.
+
+![Camera tab](docs/images/gui_tab_camera.jpg)
+
+### Laser
+The ESP32 laser controller: serial connect/disconnect, PWM
+configure/arm/fire, and the per-channel relay on/off toggles (up to 4
+relay-switched laser diodes).
+
+![Laser tab](docs/images/gui_tab_laser.jpg)
+
+### Server
+The server URL used for uploads (test-local by default), a connection
+test, and the server-triggered continuous-sweep automation.
+
+![Server tab](docs/images/gui_tab_server.jpg)
+
+### Database
+Browse recent local captures (double-click a row to view its photo(s) in
+a popup viewer, shown below) and, if Ollama is running locally, ask
+plain-English questions against the local MongoDB via the "Ask (local
+AI, temporary)" panel.
+
+![Database tab](docs/images/gui_tab_database.jpg)
+
+**Sample photo viewer** (opens when you double-click a row on the
+Database tab):
+
+![Sample photo viewer](docs/images/gui_sample_photo_viewer.jpg)
+
 ## Images
 ![GUI Screenshot](images/example_forARM.png)
 
