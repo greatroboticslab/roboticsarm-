@@ -3546,6 +3546,28 @@ laser_off_btn = tk.Button(laser_fire_row, text="LASER OFF", bg="red", fg="white"
                           width=12, state=tk.DISABLED)
 laser_off_btn.pack(side=tk.LEFT)
 
+# --- Diagnostics row — for "ERR PIN_IS_RELAY" (a pin is already registered
+# as a relay channel on the board's flash-persisted config, so it refuses
+# PWM/relay double-duty on that pin) and similar conflicts. The board can
+# hold up to 16 relay channels but this tab only shows slots 1-4, so a
+# conflicting channel from earlier testing may not be visible above —
+# "Query Board Status" lists every channel the board actually has
+# configured (regardless of which GUI slot, if any, it's tracked in), and
+# "Remove Channel #" frees a specific one back up.
+laser_diag_row = tk.Frame(laser_frame)
+laser_diag_row.pack(fill=tk.X, pady=(8, 2))
+laser_status_query_btn = tk.Button(laser_diag_row, text="Query Board Status", state=tk.DISABLED)
+laser_status_query_btn.pack(side=tk.LEFT, padx=(0, 14))
+tk.Label(laser_diag_row, text="Remove channel #:").pack(side=tk.LEFT)
+laser_remove_ch_var = tk.StringVar(value="")
+tk.Entry(laser_diag_row, textvariable=laser_remove_ch_var, width=4).pack(side=tk.LEFT, padx=(2, 6))
+laser_remove_ch_btn = tk.Button(laser_diag_row, text="Remove Channel", state=tk.DISABLED)
+laser_remove_ch_btn.pack(side=tk.LEFT)
+
+laser_diag_output_label = tk.Label(laser_frame, text="", fg="gray", font=("Arial", 8),
+                                    wraplength=800, justify=tk.LEFT)
+laser_diag_output_label.pack(anchor=tk.W, pady=(2, 0))
+
 # =============================================================================
 # [WIRED] LASER RELAY CHANNELS — per the board photos, this rig's lasers are
 # each behind their own plain ON/OFF relay module (SRD-05VDC-SL-C, "1 Relay
@@ -3703,6 +3725,8 @@ def _laser_connect():
                     laser_connect_btn.config(state=tk.DISABLED)
                     laser_disconnect_btn.config(state=tk.NORMAL)
                     laser_configure_btn.config(state=tk.NORMAL)
+                    laser_status_query_btn.config(state=tk.NORMAL)
+                    laser_remove_ch_btn.config(state=tk.NORMAL)
                     laser_heartbeat_stop.clear()
                     threading.Thread(target=_laser_heartbeat_loop, daemon=True).start()
                 else:
@@ -3739,6 +3763,8 @@ def _laser_disconnect():
             laser_connect_btn.config(state=tk.NORMAL)
             laser_disconnect_btn.config(state=tk.DISABLED)
             laser_configure_btn.config(state=tk.DISABLED)
+            laser_status_query_btn.config(state=tk.DISABLED)
+            laser_remove_ch_btn.config(state=tk.DISABLED)
             laser_arm_btn.config(state=tk.DISABLED, text="ARM", bg="darkorange")
             laser_duty_scale.config(state=tk.DISABLED)
             laser_set_duty_btn.config(state=tk.DISABLED)
@@ -3761,6 +3787,85 @@ def _laser_heartbeat_loop():
             ctl.ping()
         except Exception:
             return
+
+
+def _laser_query_status():
+    """List every channel (1-16) the board actually has configured right
+    now, regardless of whether this GUI's 4 slots know about it. This is
+    the tool for tracking down an "ERR PIN_IS_RELAY"-type conflict: the
+    pin you want for the PWM laser may have been registered as a relay
+    channel in an earlier session (channel config persists in the board's
+    flash across power cycles/reconnects), under a channel number this
+    tab doesn't show a row for."""
+    if laser_ctl is None:
+        return
+    laser_status_query_btn.config(state=tk.DISABLED)
+
+    def worker():
+        channels = laser_ctl.status()
+
+        def finish():
+            laser_status_query_btn.config(state=tk.NORMAL)
+            configured = [c for c in channels if c.configured]
+            if not configured:
+                laser_diag_output_label.config(
+                    text="Board reports no relay channels configured (checked 1\u201316).",
+                    fg="gray")
+            else:
+                parts = [f"Ch {c.ch}: pin {c.pin} ({'HIGH' if c.active_high else 'LOW'}-active, "
+                         f"{'ON' if c.state else 'OFF'})" for c in configured]
+                laser_diag_output_label.config(
+                    text="Board has these relay channels configured: " + "; ".join(parts) +
+                         ". To free a pin for PWM use, remove its channel number above.",
+                    fg="black")
+        root.after(0, finish)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _laser_remove_channel():
+    """Send REMOVE <ch> to clear a relay channel's configuration on the
+    board (drives it to its safe state first). Use this when "Configure
+    Laser" (PWM) is rejected with ERR PIN_IS_RELAY for a pin that's
+    currently a relay channel — remove that channel number here, then
+    retry Configure Laser."""
+    if laser_ctl is None:
+        return
+    try:
+        ch = int(laser_remove_ch_var.get())
+    except ValueError:
+        laser_diag_output_label.config(text="Enter a whole channel number (1\u201316) to remove.", fg="red")
+        return
+
+    laser_remove_ch_btn.config(state=tk.DISABLED)
+
+    def worker():
+        ok = laser_ctl.remove_channel(ch)
+
+        def finish():
+            laser_remove_ch_btn.config(state=tk.NORMAL)
+            if ok:
+                laser_diag_output_label.config(
+                    text=f"Channel {ch} removed from the board \u2014 its pin is now free to reuse "
+                         f"(e.g. for the PWM laser above).", fg="green")
+                # If this was one of the 4 GUI-tracked slots, clear its saved
+                # assignment too so the row doesn't show a stale pin.
+                if str(ch) in laser_channel_assignments:
+                    del laser_channel_assignments[str(ch)]
+                    channel_assignments.save_assignments(laser_channel_assignments)
+                    _rebuild_laser_channel_rows()
+            else:
+                laser_diag_output_label.config(
+                    text=f"Board didn't confirm removing channel {ch} "
+                         f"(it may not have been configured, or the board didn't respond).",
+                    fg="red")
+        root.after(0, finish)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+laser_status_query_btn.config(command=_laser_query_status)
+laser_remove_ch_btn.config(command=_laser_remove_channel)
 
 
 def _laser_configure():
