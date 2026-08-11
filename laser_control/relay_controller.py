@@ -23,6 +23,7 @@ Dependencies:
 """
 
 import time
+import threading
 import serial
 import serial.tools.list_ports
 from dataclasses import dataclass
@@ -85,6 +86,18 @@ class RelayController:
         self.inter_line_timeout = inter_line_timeout
         self.connect_delay = connect_delay
         self._serial: Optional[serial.Serial] = None
+        # main.py drives this controller from multiple threads at once —
+        # a 1-second PING heartbeat (to satisfy the firmware's host-silence
+        # watchdog) runs continuously in the background alongside whatever
+        # thread a button click spins up (Configure/SET/STATUS/REMOVE/LASER
+        # ...). Without serializing access, two threads' write()/readline()
+        # calls can interleave on the same serial port — e.g. one thread's
+        # reset_input_buffer() discarding bytes the board already sent in
+        # response to a *different* thread's command — which shows up as a
+        # spurious "board sent no response" timeout with no board-side
+        # cause at all. Every command goes through _send(), so a single
+        # lock there covers every public method.
+        self._lock = threading.Lock()
 
     # ── Connection management ──────────────────────────────────────────────
 
@@ -112,8 +125,9 @@ class RelayController:
 
     def disconnect(self) -> None:
         """Close the serial port."""
-        if self._serial and self._serial.is_open:
-            self._serial.close()
+        with self._lock:
+            if self._serial and self._serial.is_open:
+                self._serial.close()
 
     def is_connected(self) -> bool:
         return self._serial is not None and self._serial.is_open
@@ -138,26 +152,27 @@ class RelayController:
         if not self.is_connected():
             raise ConnectionError("Not connected — call connect() first.")
 
-        self._serial.reset_input_buffer()
-        self._serial.write((cmd.strip() + "\n").encode())
+        with self._lock:
+            self._serial.reset_input_buffer()
+            self._serial.write((cmd.strip() + "\n").encode())
 
-        lines: list[str] = []
+            lines: list[str] = []
 
-        # First line: use the full timeout so the device has time to respond.
-        self._serial.timeout = self.timeout
-        first = self._serial.readline().decode(errors="replace").strip()
-        if first:
-            lines.append(first)
+            # First line: use the full timeout so the device has time to respond.
+            self._serial.timeout = self.timeout
+            first = self._serial.readline().decode(errors="replace").strip()
+            if first:
+                lines.append(first)
 
-        # Subsequent lines: short inter-line timeout.
-        self._serial.timeout = self.inter_line_timeout
-        while True:
-            line = self._serial.readline().decode(errors="replace").strip()
-            if not line:
-                break
-            lines.append(line)
+            # Subsequent lines: short inter-line timeout.
+            self._serial.timeout = self.inter_line_timeout
+            while True:
+                line = self._serial.readline().decode(errors="replace").strip()
+                if not line:
+                    break
+                lines.append(line)
 
-        return lines
+            return lines
 
     def _send_expecting_ok(self, cmd: str) -> bool:
         """Send a command and return True if the response contains 'OK'."""
