@@ -98,6 +98,10 @@ class RelayController:
         # cause at all. Every command goes through _send(), so a single
         # lock there covers every public method.
         self._lock = threading.Lock()
+        # Set by connect() on failure so callers (e.g. the GUI) can show the
+        # *actual* reason instead of a generic "no PING response" for every
+        # failure mode — see connect() for what gets stored here and why.
+        self.last_error: Optional[str] = None
 
     # ── Connection management ──────────────────────────────────────────────
 
@@ -106,21 +110,57 @@ class RelayController:
         Open the serial port and wait for the device to be ready.
 
         Returns True on success, False if the port cannot be opened or the
-        device does not respond to PING.
+        device does not respond to PING. On False, self.last_error holds
+        the actual reason (see below) — check it if a generic "no PING
+        response" message isn't enough to tell what's actually wrong.
         """
+        self.last_error = None
         try:
             self._serial = serial.Serial(
                 port=self.port,
                 baudrate=self.baud,
                 timeout=self.timeout,
             )
+        except serial.SerialException as exc:
+            # The port itself couldn't be opened — wrong/stale COM number,
+            # already held open by another process (a leftover python.exe,
+            # Arduino Serial Monitor, PuTTY, ...), or Windows hasn't
+            # finished re-enumerating the device yet right after a replug.
+            self.last_error = f"Could not open {self.port}: {exc}"
+            print(f"[RelayController] {self.last_error}")
+            return False
+
+        try:
             # The ESP32 resets when the serial port is opened (DTR toggle).
             # Wait for it to boot and print READY.
             time.sleep(self.connect_delay)
             self._serial.reset_input_buffer()
-            return self.ping()
+            if self.ping():
+                return True
+            # Port opened fine and stayed open, but the board never sent
+            # PONG within the timeout. Most likely causes: the board is
+            # sitting in its UART bootloader instead of running the
+            # sketch (needs a press of the physical EN/reset button — a
+            # brief USB unplug doesn't always clear this if the board is
+            # also powered from an external 5V rail through the relay
+            # terminal block, since it never actually loses power), or
+            # it's still finishing a slow boot.
+            self.last_error = (
+                "Port opened, but the board never responded to PING. If a "
+                "USB unplug/replug didn't help, try pressing the physical "
+                "EN/reset button on the board itself — a USB-only power "
+                "cycle won't reset it if it's also getting 5V from "
+                "elsewhere on the board."
+            )
+            return False
         except serial.SerialException as exc:
-            print(f"[RelayController] Could not open {self.port}: {exc}")
+            # A genuine I/O error mid-ping (not a timeout) — e.g. the OS
+            # driver hiccuping right after the device re-enumerated. This
+            # used to be silently swallowed and reported as the same
+            # generic "no PING response" as a real timeout, which hid
+            # what was actually going on.
+            self.last_error = f"I/O error while pinging {self.port}: {exc}"
+            print(f"[RelayController] {self.last_error}")
             return False
 
     def disconnect(self) -> None:

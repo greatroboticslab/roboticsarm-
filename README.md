@@ -103,7 +103,11 @@ feed and camera device-index assignment.
 ### Laser
 The ESP32 laser controller: serial connect/disconnect, PWM
 configure/arm/fire, and the per-channel relay on/off toggles (up to 4
-relay-switched laser diodes).
+relay-switched laser diodes). The Python client that talks to it lives
+in `laser_control/`; the board-side firmware it talks to is the
+PlatformIO project in [`ESP32_Laser_Control/`](ESP32_Laser_Control)
+(`src/main.cpp`) — flash that onto the ESP32 with `pio run -t upload`
+from inside that folder.
 
 ![Laser tab](docs/images/gui_tab_laser.jpg)
 

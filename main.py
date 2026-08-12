@@ -620,8 +620,8 @@ manual_active = tk.BooleanVar(value=False)
 #                       controls, the point queue, and sending instructions
 #                       to the arm. No control-mode/Middleman UI here — see
 #                       "Virtual".
-#   Tab 2 "Virtual"   — Control Mode (Demo / Physical Manual / Middleman —
-#                       Physical Side / Middleman — Other Side) and every
+#   Tab 2 "Virtual"   — Control Mode (Demo / Physical Manual /
+#                       Middleman (Robot Side) / Remote Control) and every
 #                       Middleman-specific panel (remote queue, discovery/
 #                       connect dropdown, remote capture, remote laser
 #                       toggles). Split out of the Arm tab so "driving this
@@ -703,9 +703,9 @@ control_mode_var = tk.StringVar(value="physical_manual" if ROBOT_CONNECTED else 
 tk.Label(tab_virtual, text="Virtual / Remote Control", font=("Arial", 12, "bold")).pack(pady=(10, 0))
 tk.Label(tab_virtual, text="Choose how this machine is driven: purely local (Demo /\n"
          "Physical Manual — see the 'Arm' tab for jogging and the point\n"
-         "queue) or over the network via Middleman, either as the\n"
-         "Physical Side (a robot being remote-driven) or the Other Side\n"
-         "(the remote driver).",
+         "queue) or over the network via Middleman: Middleman (Robot Side)\n"
+         "if this machine IS the robot being remote-driven, or Remote\n"
+         "Control if this machine is doing the driving.",
          font=("Arial", 8), fg="gray", justify=tk.CENTER).pack(pady=(2, 8))
 
 # Parented on tab_virtual (not main_container/tab_arm) — Control Mode and
@@ -717,11 +717,17 @@ control_mode_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
 control_mode_radio_row = tk.Frame(control_mode_frame)
 control_mode_radio_row.pack(fill=tk.X)
 
+# Display labels only — the underlying mode values ("middleman_physical",
+# "middleman_other") and all the Python identifiers/module names built on
+# them (physical_side_controller, middleman_physical_side.py, etc.) are
+# left as-is; only what's shown on screen changed:
+#   "Middleman — Physical Side"  -> "Middleman (Robot Side)"
+#   "Middleman — Other Side"     -> "Remote Control"
 for _mode_value, _mode_label in [
     ("demo", "Demo"),
     ("physical_manual", "Physical Manual"),
-    ("middleman_physical", "Middleman \u2014 Physical Side"),
-    ("middleman_other", "Middleman \u2014 Other Side"),
+    ("middleman_physical", "Middleman (Robot Side)"),
+    ("middleman_other", "Remote Control"),
 ]:
     tk.Radiobutton(control_mode_radio_row, text=_mode_label, variable=control_mode_var,
                    value=_mode_value, command=lambda: on_control_mode_changed(),
@@ -904,7 +910,7 @@ tk.Button(hard_deck_buttons_row, text="Set Remote Floor \u2190 Current Z", bg="l
 tk.Button(hard_deck_buttons_row, text="Clear Remote", bg="salmon",
           command=lambda: _clear_hard_deck("remote")).pack(side=tk.LEFT, padx=2)
 
-# --- Middleman — Physical Side controls (shown/used only in that mode) ---
+# --- Middleman (Robot Side) controls (shown/used only in that mode) ---
 middleman_physical_frame = tk.Frame(control_mode_frame)
 middleman_physical_queue_label = tk.Label(middleman_physical_frame, text="", fg="gray",
                                            font=("Arial", 8), justify=tk.LEFT, wraplength=760)
@@ -913,12 +919,12 @@ middleman_physical_disconnect_all_btn = tk.Button(
     middleman_physical_frame, text="Disconnect All / Clear Queue", bg="salmon")
 middleman_physical_disconnect_all_btn.pack(anchor=tk.W, pady=(2, 0))
 
-# --- Middleman — Other Side controls (shown/used only in that mode) ---
+# --- Remote Control controls (shown/used only in that mode) ---
 middleman_other_frame = tk.Frame(control_mode_frame)
 
 middleman_other_top_row = tk.Frame(middleman_other_frame)
 middleman_other_top_row.pack(fill=tk.X)
-tk.Label(middleman_other_top_row, text="Physical Side:", font=("Arial", 9)).pack(side=tk.LEFT)
+tk.Label(middleman_other_top_row, text="Robot Side:", font=("Arial", 9)).pack(side=tk.LEFT)
 middleman_other_selected_ip = tk.StringVar(value="")
 middleman_other_dropdown = ttk.Combobox(middleman_other_top_row, textvariable=middleman_other_selected_ip,
                                          width=32, state="readonly")
@@ -1042,7 +1048,7 @@ def _on_physical_control_status_change(status: dict) -> None:
             lock_note = (" Local controls locked out while a remote controller is active."
                          if active else " No remote controller — local controls available.")
             control_mode_status_label.config(
-                text=f"Middleman \u2014 Physical Side. Listening as {physical_side_controller.ip}.{lock_note}",
+                text=f"Middleman (Robot Side). Listening as {physical_side_controller.ip}.{lock_note}",
                 fg="blue")
     root.after(0, apply)
 
@@ -1061,9 +1067,10 @@ def _on_discovery_update(discovered: dict) -> None:
 
 def _on_telemetry_update(data: dict) -> None:
     """Mirrors the Physical Side's live position onto this machine's own
-    plot while in Middleman \u2014 Other Side mode. Reuses the exact same
-    dot + blitting path as the local telemetry loop (update_gui_from_
-    feedback, see the tracking-lag fix) rather than a separate slower
+    plot while in Remote Control mode (internal mode value:
+    middleman_other). Reuses the exact same dot + blitting path as the
+    local telemetry loop (update_gui_from_feedback, see the tracking-lag
+    fix) rather than a separate slower
     code path \u2014 live_dot is otherwise idle on a controller-only machine
     since update_gui_from_feedback only drives it from LOCAL robot
     telemetry, gated on this machine's own ROBOT_CONNECTED."""
@@ -1117,7 +1124,7 @@ def _on_other_control_status_update(status: dict) -> None:
         is_me = active == other_side_controller.controller_id
         role_text = "You are the ACTIVE controller." if is_me else f"Waiting in queue (active: {active or 'none'})."
         control_mode_status_label.config(
-            text=f"Middleman \u2014 Other Side, connected to {middleman_other_selected_ip.get()}. {role_text}",
+            text=f"Remote Control, connected to {middleman_other_selected_ip.get()}. {role_text}",
             fg="blue")
     root.after(0, apply)
 
@@ -1140,14 +1147,14 @@ def _on_middleman_error_received(message: str) -> None:
     safety-relevant and easy to miss as passive text, same reasoning as
     the existing 'Robot Busy' warning elsewhere in this file."""
     def apply():
-        messagebox.showwarning("Command Rejected by Physical Side", message)
+        messagebox.showwarning("Command Rejected by Robot", message)
     root.after(0, apply)
 
 
 def _middleman_other_connect():
     ip = middleman_other_dropdown_ip_by_label.get(middleman_other_selected_ip.get())
     if not ip:
-        messagebox.showwarning("No Physical Side selected", "Pick a Physical Side from the dropdown first.")
+        messagebox.showwarning("No robot selected", "Pick a robot (Robot Side) from the dropdown first.")
         return
     if other_side_controller is not None:
         other_side_controller.connect(ip)
@@ -1219,10 +1226,10 @@ def on_control_mode_changed():
                 physical_side_controller = candidate
             except Exception as e:
                 control_mode_status_label.config(
-                    text=f"Middleman \u2014 Physical Side failed to start: {e}", fg="red")
+                    text=f"Middleman (Robot Side) failed to start: {e}", fg="red")
                 return
         control_mode_status_label.config(
-            text=f"Middleman \u2014 Physical Side. Listening as {physical_side_controller.ip}. "
+            text=f"Middleman (Robot Side). Listening as {physical_side_controller.ip}. "
                  f"No remote controller yet.", fg="blue")
 
     elif mode == "middleman_other":
@@ -1241,10 +1248,10 @@ def on_control_mode_changed():
                 other_side_controller = candidate
             except Exception as e:
                 control_mode_status_label.config(
-                    text=f"Middleman \u2014 Other Side failed to start: {e}", fg="red")
+                    text=f"Remote Control failed to start: {e}", fg="red")
                 return
         control_mode_status_label.config(
-            text="Middleman \u2014 Other Side. Select a Physical Side above, then Connect.", fg="blue")
+            text="Remote Control. Select a robot (Robot Side) above, then Connect.", fg="blue")
 
 
 middleman_other_connect_btn.config(command=_middleman_other_connect)
@@ -3730,8 +3737,8 @@ def _laser_connect():
                     laser_heartbeat_stop.clear()
                     threading.Thread(target=_laser_heartbeat_loop, daemon=True).start()
                 else:
-                    _laser_set_status(f"Failed to connect on {port} "
-                                       f"(no PING response).", fg="red")
+                    reason = rc.last_error or "no PING response"
+                    _laser_set_status(f"Failed to connect on {port}: {reason}", fg="red")
                     laser_connect_btn.config(state=tk.NORMAL)
             root.after(0, finish)
         except Exception as e:
