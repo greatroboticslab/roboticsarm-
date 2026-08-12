@@ -121,13 +121,14 @@ class RelayController:
             self._serial.port = self.port
             self._serial.baudrate = self.baud
             self._serial.timeout = self.timeout
-            
+
+            # Now open the port safely
+            self._serial.open()
             # CRITICAL FIX: Disable DTR and RTS so the ESP32 doesn't get trapped in its bootloader
             self._serial.dtr = False
             self._serial.rts = False
             
-            # Now open the port safely
-            self._serial.open()
+            
             
         except serial.SerialException as exc:
             # The port itself couldn't be opened — wrong/stale COM number,
@@ -241,9 +242,36 @@ class RelayController:
     # ── Commands ──────────────────────────────────────────────────────────
 
     def ping(self) -> bool:
-        """Return True if the device responds with PONG."""
-        lines = self._send("PING")
-        return any("PONG" in ln for ln in lines)
+        """Send a PING command and check for a PONG response."""
+        if not self.is_connected():
+            return False
+
+        try:
+            with self._lock:
+                # Clear any lingering junk in the buffer
+                self._serial.reset_input_buffer()
+                
+                # Send PING with standard newline
+                self._serial.write(b"PING\n")
+                self._serial.flush()
+
+                # Read lines until timeout
+                start_time = time.time()
+                while time.time() - start_time < self.timeout:
+                    if self._serial.in_waiting > 0:
+                        line = self._serial.readline().decode("utf-8", errors="ignore").strip()
+                        if line:
+                            print(f"[ESP32 Says]: {line}")
+                            if "PONG" in line or "READY" in line:
+                                return True
+                    time.sleep(0.05)
+                
+                print("[RelayController] Ping timed out: No response received from ESP32.")
+                return False
+                
+        except Exception as e:
+            print(f"[RelayController] Ping error: {e}")
+            return False
 
     def configure_channel(
         self,
