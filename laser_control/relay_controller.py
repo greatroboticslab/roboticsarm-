@@ -116,11 +116,19 @@ class RelayController:
         """
         self.last_error = None
         try:
-            self._serial = serial.Serial(
-                port=self.port,
-                baudrate=self.baud,
-                timeout=self.timeout,
-            )
+            # Create the serial object WITHOUT opening it immediately
+            self._serial = serial.Serial()
+            self._serial.port = self.port
+            self._serial.baudrate = self.baud
+            self._serial.timeout = self.timeout
+            
+            # CRITICAL FIX: Disable DTR and RTS so the ESP32 doesn't get trapped in its bootloader
+            self._serial.dtr = False
+            self._serial.rts = False
+            
+            # Now open the port safely
+            self._serial.open()
+            
         except serial.SerialException as exc:
             # The port itself couldn't be opened — wrong/stale COM number,
             # already held open by another process (a leftover python.exe,
@@ -195,8 +203,10 @@ class RelayController:
         with self._lock:
             self._serial.reset_input_buffer()
             self._serial.write((cmd.strip() + "\n").encode())
+            self._serial.flush()  # CRITICAL FIX: Force Windows to send the command immediately
 
             lines: list[str] = []
+
 
             # First line: use the full timeout so the device has time to respond.
             self._serial.timeout = self.timeout
