@@ -54,25 +54,55 @@ def main() -> int:
         return 1
 
     print(f"Port open. DTR={ser.dtr} RTS={ser.rts} (whatever the OS default is)")
-    print("Listening for 4 seconds for ANY boot activity...\n")
+    print("Listening for 10 seconds for boot activity (long enough to see a "
+          "reset LOOP as a repeating pattern, if that's what's happening)...\n")
 
-    deadline = time.time() + 4.0
+    deadline = time.time() + 10.0
+    start = time.time()
     got_any_bytes = False
     buf = bytearray()
+    boot_banner_count = 0
+    saw_brownout = False
     while time.time() < deadline:
         chunk = ser.read(256)
         if chunk:
             got_any_bytes = True
             buf += chunk
+            t = time.time() - start
+            try:
+                text = chunk.decode("utf-8", errors="replace")
+            except Exception:
+                text = repr(chunk)
+            print(f"  [t={t:5.2f}s] {chunk!r}")
+            if "rst:" in text or "boot:" in text:
+                boot_banner_count += 1
+            if "Brownout" in text or "BROWNOUT" in text:
+                saw_brownout = True
         time.sleep(0.05)
 
     if buf:
-        print(f"Received {len(buf)} bytes during boot window:")
-        print("  raw :", buf)
+        print(f"\nReceived {len(buf)} bytes total during the 10s boot window.")
         try:
-            print("  text:", buf.decode("utf-8", errors="replace"))
+            print("  full text:", buf.decode("utf-8", errors="replace"))
         except Exception:
             pass
+        if saw_brownout:
+            print("\n*** Saw the literal 'Brownout detector was triggered' "
+                  "message. This IS a power problem: the 3.3V rail is "
+                  "sagging below ~2.4V, almost certainly when a relay "
+                  "energizes. Disconnect the external 5V feed to this board "
+                  "(if it's powered through the relay terminal block) and "
+                  "run on USB power alone to confirm -- if it stops "
+                  "resetting, the fix is a better/separate power supply for "
+                  "this board, not more software changes. ***")
+        elif boot_banner_count >= 2:
+            print(f"\n*** Saw {boot_banner_count} separate boot banners in "
+                  "10 seconds -- the board IS reset-looping, even though "
+                  "the literal 'Brownout' string didn't show up (it can be "
+                  "clipped by the baud mismatch). Try disconnecting external "
+                  "5V power and running on USB alone; if the resets stop, "
+                  "it's a power/brownout issue on this board specifically. "
+                  "***")
     else:
         print("Received NOTHING during the 4-second boot window.")
         print("-> The board never sent a single byte, not even a garbled ROM "
