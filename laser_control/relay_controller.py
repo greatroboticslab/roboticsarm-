@@ -122,13 +122,31 @@ class RelayController:
             self._serial.baudrate = self.baud
             self._serial.timeout = self.timeout
 
+            # dtr=False as the initial line state applied the moment the
+            # port opens, so GPIO0 isn't held low (which would force
+            # download/bootloader mode) during open().
+            self._serial.dtr = False
+
             # Now open the port safely
             self._serial.open()
-            # CRITICAL FIX: Disable DTR and RTS so the ESP32 doesn't get trapped in its bootloader
-            self._serial.dtr = False
-            self._serial.rts = False
-            
-            
+
+            # Force a clean, active reset into the app -- the same DTR/RTS
+            # sequence esptool.py uses for a "hard reset" (as opposed to
+            # entering the download/bootloader). This MUST happen after
+            # open(): pyserial can't drive a real voltage transition on a
+            # port that isn't open yet, so doing this before open() is a
+            # no-op. Just setting rts to a static value is also not enough:
+            # if the board is already sitting in the UART bootloader (e.g.
+            # left there from a manual BOOT+EN flash procedure), a static
+            # pin state never actually toggles EN, so the chip just stays
+            # wherever it was. This needs an actual pulse: assert reset
+            # (RTS=True), hold briefly, then release reset (RTS=False) --
+            # guaranteeing the chip leaves the bootloader and boots the
+            # flashed app on every single connect(), regardless of what
+            # state it was left in before.
+            self._serial.rts = True    # EN pulled low -> chip held in reset
+            time.sleep(0.1)
+            self._serial.rts = False   # EN released -> chip boots normally
             
         except serial.SerialException as exc:
             # The port itself couldn't be opened — wrong/stale COM number,
