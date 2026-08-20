@@ -64,6 +64,38 @@ class MongoNLPAgentError(Exception):
     unreachable, model not pulled, agent failure, etc."""
 
 
+# Models known to reliably support tool calling (required for this
+# toolkit's agent loop) at a size that's practical to run locally, per
+# mongodb-nlp-query-summary.txt. Shown in the GUI as "not installed yet
+# but recommended" alongside whatever's actually pulled in Ollama, each
+# with a one-line reason and the exact `ollama pull` command.
+RECOMMENDED_MODELS = [
+    {"name": "qwen2.5:7b", "note": "Good default — reliable tool calling, modest size."},
+    {"name": "qwen3:14b", "note": "Stronger reasoning than qwen2.5:7b, needs more RAM/VRAM."},
+    {"name": "llama3.1:8b", "note": "Solid alternative to qwen2.5:7b, similar size class."},
+    {"name": "llama4:scout", "note": "Newer/larger — best accuracy if your hardware can run it."},
+    {"name": "mistral-small", "note": "Lighter-weight option, recent versions only."},
+]
+
+
+def list_installed_models() -> list[str]:
+    """
+    Every model currently pulled in the local Ollama install (e.g.
+    ["qwen2.5:7b", "deepseek-r1:7b", ...]), for populating the GUI's
+    model-selection dropdown. Returns [] (not an exception) if Ollama
+    isn't reachable — callers should treat an empty list as "show the
+    recommendations, nothing's installed / can't tell yet" rather than
+    a hard failure, since this is meant to be safe to call opportunistically
+    (e.g. every time the Database tab is opened) without risking a crash.
+    """
+    try:
+        resp = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        resp.raise_for_status()
+        return sorted(m.get("name", "") for m in resp.json().get("models", []) if m.get("name"))
+    except (requests.RequestException, ValueError, AttributeError):
+        return []
+
+
 # Lazily built — constructing the agent talks to Ollama and Mongo, so
 # this only happens on first actual use (or explicit availability
 # check), never at import time.

@@ -296,11 +296,21 @@ def save_image(frame, sample_id: str, source: str, view_index: int = 0) -> str:
     can never collide/overwrite each other (each gets its own
     timestamp), which the old `{source}_{view_index}.jpg`-only naming
     did not guarantee.
+
+    Returns an ABSOLUTE path. This matters: the path returned here gets
+    stored verbatim in MongoDB (via capture_pipeline.record_capture) and
+    is later opened by main.py's image viewer, possibly in a different
+    process launched from a different working directory than the one
+    that originally wrote the file. A relative path resolves against
+    whatever the CURRENT process's cwd happens to be, which silently
+    breaks ("No such file or directory") the moment the app is launched
+    from anywhere other than the exact directory used at capture time —
+    an absolute path always resolves to the same file regardless.
     """
     _require_cv2()
     sample_dir = ensure_sample_dir(sample_id)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    image_path = os.path.join(sample_dir, f"{timestamp}_{source}_{view_index}.jpg")
+    image_path = os.path.abspath(os.path.join(sample_dir, f"{timestamp}_{source}_{view_index}.jpg"))
     ok = cv2.imwrite(image_path, frame)
     if not ok:
         raise IOError(f"Failed to write image to {image_path}")

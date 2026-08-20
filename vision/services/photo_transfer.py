@@ -134,7 +134,7 @@ def save_photo_bundle_files(bundle: dict, save_root: str = "images/middleman") -
         # save_image, so filenames are sortable/searchable regardless of
         # which machine/path wrote them.
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(sample_dir, f"{timestamp}_{source}_{view_index}.jpg")
+        path = os.path.abspath(os.path.join(sample_dir, f"{timestamp}_{source}_{view_index}.jpg"))
         with open(path, "wb") as f:
             f.write(jpeg_bytes)
         paths_by_source[source] = path

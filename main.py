@@ -6,10 +6,10 @@ import os
 import json
 import re
 import uuid
-from datetime import date
+from datetime import date, datetime
 import tkinter as tk
 from tkinter import ttk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox, simpledialog, filedialog
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -38,7 +38,7 @@ from vision.config import (
 )
 from vision.messaging.publisher import publish_captured, publish_capture_status
 from vision.messaging.subscriber import subscribe
-from vision.storage import mongo_client, object_catalog, excel_export, attribute_schema, session_manager, query_safety
+from vision.storage import mongo_client, object_catalog, excel_export, attribute_schema, session_manager, query_safety, package_export
 from vision.storage.capture_pipeline import record_capture
 from vision.services import rotation_coordinator
 from vision.config import DATA_AUTHORITY_MODE
@@ -70,6 +70,40 @@ try:
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
+
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_image_path(path: str) -> str:
+    """
+    Best-effort resolution for an image path pulled out of Mongo.
+
+    Paths written from this session on are already absolute (see
+    vision.camera.capture.save_image / vision.services.photo_transfer.
+    save_photo_bundle_files), so this is normally a no-op. It exists for
+    two real situations that otherwise show up as a bare "No such file
+    or directory" with no indication of why:
+      1. Older data captured before that fix, where a RELATIVE path got
+         stored — which only ever resolved correctly if the app
+         happened to be launched from the exact same working directory
+         used at capture time. Retry it relative to this repo's own
+         root (where `images/` actually lives) before giving up.
+      2. The images/ folder itself got moved to a different machine or
+         a different location on this one (e.g. after using Export
+         Package + Import Package — see below) — nothing can fully
+         recover from that automatically, but the caller gets back the
+         best-guess path so the resulting error at least shows a path
+         that makes it obvious what to check.
+    """
+    if os.path.isabs(path) and os.path.exists(path):
+        return path
+    if os.path.exists(path):
+        return os.path.abspath(path)
+    candidate = os.path.join(_REPO_ROOT, path)
+    if os.path.exists(candidate):
+        return candidate
+    return path  # doesn't exist anywhere we know to look — let the caller's
+                 # own error handling report exactly what was tried
 
 # ---------------------------------------------------------------------------
 # Server URL — where images/samples get uploaded and where the
@@ -2601,6 +2635,10 @@ tk.Label(obj_filter_frame, text="Name contains:").pack(side=tk.LEFT)
 obj_filter_name = tk.Entry(obj_filter_frame, width=14)
 obj_filter_name.pack(side=tk.LEFT, padx=(2, 8))
 
+tk.Label(obj_filter_frame, text="Object ID (exact):").pack(side=tk.LEFT)
+obj_filter_object_id = tk.Entry(obj_filter_frame, width=14)
+obj_filter_object_id.pack(side=tk.LEFT, padx=(2, 8))
+
 obj_filter_today_only = tk.BooleanVar(value=False)
 tk.Checkbutton(obj_filter_frame, text="Captured today only",
                variable=obj_filter_today_only).pack(side=tk.LEFT, padx=(0, 8))
@@ -2615,8 +2653,30 @@ tk.Checkbutton(obj_filter_frame, text="Captured today only",
 obj_adv_query_frame = tk.Frame(tab_objects_log)
 obj_adv_query_frame.pack(fill=tk.X, pady=(2, 0))
 tk.Label(obj_adv_query_frame, text="Advanced Query (MongoDB filter, JSON):").pack(anchor=tk.W)
-obj_adv_query_entry = tk.Entry(obj_adv_query_frame, width=90)
+obj_adv_query_entry = tk.Entry(obj_adv_query_frame, width=70)
 obj_adv_query_entry.pack(side=tk.LEFT, fill=tk.X, expand=1, padx=(0, 4))
+
+
+def _insert_obj_example_today():
+    """Fills the Advanced Query box with a working, ready-to-run example
+    — filters to whatever session_id today's date resolves to, which is
+    the simplest correct "today" query (see find_objects()'s docstring
+    for the equivalent captured_at-range version, for arbitrary time
+    windows rather than a whole calendar day)."""
+    obj_adv_query_entry.delete(0, tk.END)
+    example = json.dumps({"session_id": session_manager.today_session_id()})
+    obj_adv_query_entry.insert(0, example)
+
+
+tk.Button(obj_adv_query_frame, text="Example: Today",
+          command=_insert_obj_example_today).pack(side=tk.LEFT, padx=(0, 8))
+
+tk.Label(obj_adv_query_frame, text="Sort:").pack(side=tk.LEFT)
+obj_sort_order = ttk.Combobox(obj_adv_query_frame, width=11, state="readonly",
+                               values=["Newest first", "Oldest first"])
+obj_sort_order.set("Newest first")
+obj_sort_order.pack(side=tk.LEFT)
+
 tk.Label(tab_objects_log,
          text='Fields: data.name, data.category, data.color, data.size, '
               'data.position_x, data.position_y, data.position_z, '
@@ -2684,6 +2744,14 @@ def _build_object_filter() -> dict:
     name_text = obj_filter_name.get().strip()
     if name_text:
         mongo_filter["data.name"] = {"$regex": re.escape(name_text), "$options": "i"}
+    object_id_text = obj_filter_object_id.get().strip()
+    if object_id_text:
+        # Exact match, not a regex — this is the same random object_id
+        # generated at capture time (see capture_pipeline.record_capture)
+        # and shown in the detail viewer's read-only "Object ID" field,
+        # meant for jumping straight back to one specific capture rather
+        # than a fuzzy search.
+        mongo_filter["_id"] = object_id_text
     if obj_filter_today_only.get():
         mongo_filter["session_id"] = session_manager.today_session_id()
 
@@ -2708,11 +2776,12 @@ def refresh_objects_list():
     def worker():
         err = None
         try:
+            ascending = (obj_sort_order.get() == "Oldest first")
             mongo_filter = _build_object_filter()
             if mongo_filter:
-                objects = mongo_client.find_objects(mongo_filter, limit=100)
+                objects = mongo_client.find_objects(mongo_filter, limit=100, sort_ascending=ascending)
             else:
-                objects = mongo_client.list_recent_objects(limit=30)
+                objects = mongo_client.list_recent_objects(limit=30, sort_ascending=ascending)
         except Exception as e:
             objects = None
             err = str(e)
@@ -2742,25 +2811,21 @@ def clear_object_filters():
     obj_filter_category.set("(any)")
     obj_filter_color.set("(any)")
     obj_filter_name.delete(0, tk.END)
+    obj_filter_object_id.delete(0, tk.END)
     obj_filter_today_only.set(False)
     obj_adv_query_entry.delete(0, tk.END)
     refresh_objects_list()
 
 
-def open_object_detail_viewer(event=None):
-    """Pop up a window showing the double-clicked object's fixed +
-    freeform attributes AND every image logged against it — the
-    "click an object, see its images and attributes" view."""
-    selection = objects_listbox.curselection()
-    if not selection:
-        return
-    idx = selection[0]
-    if idx >= len(_recent_object_ids):
-        return  # clicked a placeholder row like "(no objects yet)" or "Error: ..."
-    object_id = _recent_object_ids[idx]
-
+def show_object_detail(object_id: str, viewer_title_prefix: str = "Object"):
+    """Pop up a window showing one object's fixed + freeform attributes
+    AND every image logged against it, oldest-first — the "click an
+    object, see its images and attributes, even with multiple photos"
+    view. Shared by the Objects (Log), Images, and Inventory tabs'
+    double-click handlers so there's exactly one viewer implementation
+    instead of three near-duplicates."""
     viewer = tk.Toplevel(root)
-    viewer.title(f"Object {object_id}")
+    viewer.title(f"{viewer_title_prefix} {object_id}")
     viewer.geometry("800x650")
     loading_label = tk.Label(viewer, text="Loading...", padx=20, pady=20)
     loading_label.pack()
@@ -2769,6 +2834,12 @@ def open_object_detail_viewer(event=None):
         try:
             obj = mongo_client.get_object(object_id)
             image_docs = mongo_client.get_images_for_object(object_id)
+            # Oldest-first within the viewer regardless of whatever order
+            # Mongo happened to return them in — matches "sort images in
+            # time order". Docs without a captured_at (shouldn't happen
+            # for anything captured through this pipeline, but a
+            # defensive fallback) sort first via datetime.min.
+            image_docs.sort(key=lambda d: d.get("captured_at") or datetime.min)
             err = None
         except Exception as e:
             obj, image_docs, err = None, None, str(e)
@@ -2779,11 +2850,30 @@ def open_object_detail_viewer(event=None):
                 tk.Label(viewer, text=f"Could not load object:\n{err}",
                          fg="red", padx=20, pady=20).pack()
                 return
+            if obj is None:
+                tk.Label(viewer, text=f"No object found with id {object_id}.",
+                         fg="red", padx=20, pady=20).pack()
+                return
 
             # --- Attributes panel (fixed columns + freeform "why") ---
             attrs_frame = tk.LabelFrame(viewer, text=" Attributes ", padx=8, pady=8)
             attrs_frame.pack(fill=tk.X, padx=10, pady=(10, 4))
             data = (obj or {}).get("data") or {}
+
+            # Object ID is deliberately shown (and copy-able via normal
+            # text selection) here even though it's not one of
+            # attribute_schema's fixed columns — it's how you search for
+            # this exact object again later, e.g. Advanced Query
+            # {"_id": "<this>"} on the Objects tab.
+            id_row = tk.Frame(attrs_frame)
+            id_row.pack(fill=tk.X)
+            tk.Label(id_row, text="Object ID:", font=("Arial", 9, "bold"),
+                     width=14, anchor="w").pack(side=tk.LEFT)
+            id_entry = tk.Entry(id_row, font=("Courier", 9))
+            id_entry.insert(0, object_id)
+            id_entry.config(state="readonly")
+            id_entry.pack(side=tk.LEFT, fill=tk.X, expand=1)
+
             labels = attribute_schema.display_labels()
             for key in attribute_schema.fixed_column_keys():
                 value = data.get(key)
@@ -2832,12 +2922,14 @@ def open_object_detail_viewer(event=None):
 
             viewer._photo_refs = []  # keep references so Tk doesn't garbage-collect them
             for doc in image_docs:
-                path = doc.get("image_path", "")
+                raw_path = doc.get("image_path", "")
+                path = resolve_image_path(raw_path)
                 source = doc.get("source", "?")
                 view_index = doc.get("view_index", "?")
+                when = doc.get("captured_at", "")
                 row = tk.Frame(inner_frame, pady=8)
                 row.pack(fill=tk.X)
-                tk.Label(row, text=f"{source} — view {view_index}",
+                tk.Label(row, text=f"{source} — view {view_index}  ({when})",
                          font=("Arial", 9, "bold")).pack()
                 try:
                     img = Image.open(path)
@@ -2846,12 +2938,24 @@ def open_object_detail_viewer(event=None):
                     viewer._photo_refs.append(photo)
                     tk.Label(row, image=photo).pack()
                 except Exception as e:
-                    tk.Label(row, text=f"Could not load '{path}': {e}",
+                    hint = ("" if path == raw_path else f"\n(tried: {path})")
+                    tk.Label(row, text=f"Could not load '{raw_path}': {e}{hint}",
                              fg="red", wraplength=680).pack()
 
         root.after(0, build_ui)
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def open_object_detail_viewer(event=None):
+    """Objects (Log) tab double-click handler."""
+    selection = objects_listbox.curselection()
+    if not selection:
+        return
+    idx = selection[0]
+    if idx >= len(_recent_object_ids):
+        return  # clicked a placeholder row like "(no objects yet)" or "Error: ..."
+    show_object_detail(_recent_object_ids[idx])
 
 
 objects_listbox.bind("<Double-Button-1>", open_object_detail_viewer)
@@ -2890,8 +2994,28 @@ tk.Checkbutton(img_filter_frame, text="Captured today only",
 img_adv_query_frame = tk.Frame(tab_images_log)
 img_adv_query_frame.pack(fill=tk.X, pady=(2, 0))
 tk.Label(img_adv_query_frame, text="Advanced Query (MongoDB filter, JSON):").pack(anchor=tk.W)
-img_adv_query_entry = tk.Entry(img_adv_query_frame, width=90)
+img_adv_query_entry = tk.Entry(img_adv_query_frame, width=70)
 img_adv_query_entry.pack(side=tk.LEFT, fill=tk.X, expand=1, padx=(0, 4))
+
+
+def _insert_img_example_today():
+    """Same idea as the Objects tab's Example: Today button — see
+    find_images()'s docstring for why session_id is the simplest
+    correct "today" filter."""
+    img_adv_query_entry.delete(0, tk.END)
+    example = json.dumps({"session_id": session_manager.today_session_id()})
+    img_adv_query_entry.insert(0, example)
+
+
+tk.Button(img_adv_query_frame, text="Example: Today",
+          command=_insert_img_example_today).pack(side=tk.LEFT, padx=(0, 8))
+
+tk.Label(img_adv_query_frame, text="Sort:").pack(side=tk.LEFT)
+img_sort_order = ttk.Combobox(img_adv_query_frame, width=11, state="readonly",
+                               values=["Newest first", "Oldest first"])
+img_sort_order.set("Newest first")
+img_sort_order.pack(side=tk.LEFT)
+
 tk.Label(tab_images_log,
          text='Fields: source, view_index, object_id, session_id, captured_at. '
               'Operators: $eq $ne $gt $gte $lt $lte $in $nin $and $or $nor $not $regex $exists. '
@@ -2901,6 +3025,12 @@ tk.Label(tab_images_log,
 
 images_listbox = tk.Listbox(tab_images_log, height=12)
 images_listbox.pack(fill=tk.BOTH, expand=1, pady=4)
+
+# Same pattern as _recent_object_ids on the Objects tab — the object_id
+# each row's image belongs to, kept in lockstep with the listbox rows
+# so double-clicking a photo can jump straight to that object's full
+# detail view (attributes + every one of its images, however many).
+_recent_image_object_ids = []
 
 
 def _populate_image_filter_dropdown():
@@ -2949,16 +3079,18 @@ def refresh_images_list():
     def worker():
         err = None
         try:
+            ascending = (img_sort_order.get() == "Oldest first")
             mongo_filter = _build_image_filter()
             if mongo_filter:
-                images = mongo_client.find_images(mongo_filter, limit=200)
+                images = mongo_client.find_images(mongo_filter, limit=200, sort_ascending=ascending)
             else:
-                images = mongo_client.list_recent_images(limit=30)
+                images = mongo_client.list_recent_images(limit=30, sort_ascending=ascending)
         except Exception as e:
             images, err = None, str(e)
 
         def apply():
             images_listbox.delete(0, tk.END)
+            _recent_image_object_ids.clear()
             if images is None:
                 images_listbox.insert(tk.END, f"Error: {err}")
                 return
@@ -2972,10 +3104,32 @@ def refresh_images_list():
                     f"{when}  |  {i.get('source', '?')}  |  view {i.get('view_index', '?')}"
                     f"  |  object {i.get('object_id', '?')}"
                 )
+                _recent_image_object_ids.append(i.get("object_id"))
 
         root.after(0, apply)
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def open_image_object_detail(event=None):
+    """Images tab double-click handler — jumps to the SAME detail
+    viewer the Objects tab uses, for whichever object this particular
+    photo belongs to (showing that object's attributes and ALL of its
+    images, not just the one row that was clicked)."""
+    selection = images_listbox.curselection()
+    if not selection:
+        return
+    idx = selection[0]
+    if idx >= len(_recent_image_object_ids):
+        return  # clicked a placeholder row like "(no images...)" or "Error: ..."
+    object_id = _recent_image_object_ids[idx]
+    if not object_id:
+        messagebox.showinfo("No object link", "This image record has no linked object_id.")
+        return
+    show_object_detail(object_id)
+
+
+images_listbox.bind("<Double-Button-1>", open_image_object_detail)
 
 
 def clear_image_filters():
@@ -3014,6 +3168,7 @@ def refresh_inventory_list():
 
         def apply():
             inventory_listbox.delete(0, tk.END)
+            _recent_catalog_ids.clear()
             if entries is None:
                 inventory_listbox.insert(tk.END, f"Error: {err}")
                 return
@@ -3026,11 +3181,92 @@ def refresh_inventory_list():
                     f"{e.get('name', '?')}  |  seen {e.get('times_seen', 0)}x  |  "
                     f"last {e.get('last_seen', '?')}  |  {e.get('category', '')}"
                 )
+                _recent_catalog_ids.append(e.get("_id"))
 
         root.after(0, apply)
 
     threading.Thread(target=worker, daemon=True).start()
 
+
+def open_catalog_detail_viewer(event=None):
+    """Inventory tab double-click handler. A catalog entry can be linked
+    to several captures (times_seen > 1), so this shows the catalog
+    summary plus every linked capture as its own row — double-clicking
+    ONE of those opens the full per-object viewer (attributes + all of
+    THAT capture's images) via the same show_object_detail() the other
+    two tabs use."""
+    selection = inventory_listbox.curselection()
+    if not selection:
+        return
+    idx = selection[0]
+    if idx >= len(_recent_catalog_ids):
+        return  # clicked a placeholder row like "(no distinct objects...)" or "Error: ..."
+    catalog_id = _recent_catalog_ids[idx]
+
+    viewer = tk.Toplevel(root)
+    viewer.title(f"Catalog entry {catalog_id}")
+    viewer.geometry("600x450")
+    loading_label = tk.Label(viewer, text="Loading...", padx=20, pady=20)
+    loading_label.pack()
+
+    def worker():
+        try:
+            entries = object_catalog.list_inventory(limit=200)
+            entry = next((e for e in entries if e.get("_id") == catalog_id), None)
+            err = None
+        except Exception as e:
+            entry, err = None, str(e)
+
+        def build_ui():
+            loading_label.destroy()
+            if err is not None:
+                tk.Label(viewer, text=f"Could not load catalog entry:\n{err}",
+                         fg="red", padx=20, pady=20).pack()
+                return
+            if entry is None:
+                tk.Label(viewer, text=f"No catalog entry found with id {catalog_id}.",
+                         fg="red", padx=20, pady=20).pack()
+                return
+
+            summary_frame = tk.LabelFrame(viewer, text=" Summary ", padx=8, pady=8)
+            summary_frame.pack(fill=tk.X, padx=10, pady=(10, 4))
+            for label, value in [
+                ("Name", entry.get("name", "?")),
+                ("Category", entry.get("category") or "(none)"),
+                ("Times seen", entry.get("times_seen", 0)),
+                ("First seen", entry.get("first_seen", "?")),
+                ("Last seen", entry.get("last_seen", "?")),
+            ]:
+                row = tk.Frame(summary_frame)
+                row.pack(fill=tk.X)
+                tk.Label(row, text=f"{label}:", font=("Arial", 9, "bold"),
+                         width=12, anchor="w").pack(side=tk.LEFT)
+                tk.Label(row, text=str(value), anchor="w").pack(side=tk.LEFT)
+
+            linked_ids = entry.get("linked_object_ids", []) or []
+            tk.Label(viewer, text=f"Linked captures ({len(linked_ids)}) — "
+                                   f"double-click one to see its photos + attributes:",
+                     padx=10, pady=(8, 2), anchor="w").pack(fill=tk.X)
+            linked_listbox = tk.Listbox(viewer, height=10)
+            linked_listbox.pack(fill=tk.BOTH, expand=1, padx=10, pady=(0, 10))
+            for linked_id in linked_ids:
+                linked_listbox.insert(tk.END, linked_id)
+
+            def on_linked_double_click(_event=None):
+                sel = linked_listbox.curselection()
+                if not sel:
+                    return
+                show_object_detail(linked_listbox.get(sel[0]))
+
+            linked_listbox.bind("<Double-Button-1>", on_linked_double_click)
+
+        root.after(0, build_ui)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+_recent_catalog_ids = []
+inventory_listbox.bind("<Double-Button-1>", open_catalog_detail_viewer)
 
 tk.Button(tab_inventory, text="Refresh", command=refresh_inventory_list,
           bg="lightblue").pack(anchor=tk.W, pady=4)
@@ -3105,6 +3341,108 @@ if DATA_AUTHORITY_MODE == "excel":
               bg="khaki").pack(side=tk.LEFT, padx=4)
 
 # =====================================================================
+# DATA PACKAGE — export a self-contained folder (images + a portable
+# CSV, relative paths) for handing captured data off to another
+# machine, archiving it, or backing it up; import reads one of these
+# folders back in and replays each row through the same
+# capture_pipeline.record_capture() every other capture path uses, so
+# an imported object gets identical session/catalog/CSV/Excel
+# treatment. See vision/storage/package_export.py's module docstring
+# for why this is a separate thing from the live CSV/Excel report
+# above (that one uses THIS machine's absolute image paths — not
+# portable to a different machine on its own; a package's paths are
+# relative to the package folder and its images are physically copied
+# alongside it).
+# =====================================================================
+package_frame = tk.LabelFrame(tab_database, text=" Data Package (Export / Import) ", padx=10, pady=10)
+package_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(package_frame,
+         text="Export copies images + a portable CSV into one folder you can move to another "
+              "machine, back up, or archive. Import reads that folder back in.",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+package_status_label = tk.Label(package_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+package_status_label.pack(anchor=tk.W, pady=(2, 4))
+
+package_btn_row = tk.Frame(package_frame)
+package_btn_row.pack(fill=tk.X)
+
+
+def export_package_gui(all_history: bool):
+    parent_dir = filedialog.askdirectory(title="Choose where to create the export folder")
+    if not parent_dir:
+        return  # user cancelled
+    folder_name = f"export_{'all_history' if all_history else session_manager.today_session_id()}_{datetime.now().strftime('%H%M%S')}"
+    dest_dir = os.path.join(parent_dir, folder_name)
+
+    package_status_label.config(text="Exporting package...", fg="gray")
+
+    def worker():
+        try:
+            path, count, warnings = package_export.export_package(dest_dir, all_history=all_history)
+            msg = f"Exported {count} object(s) to {path}."
+            if warnings:
+                msg += f" {len(warnings)} warning(s) — see console."
+                for w in warnings:
+                    print(f"[EXPORT PACKAGE] {w}")
+            color = "green" if not warnings else "orange"
+        except Exception as e:
+            msg, color = f"Export failed: {e}", "red"
+        root.after(0, lambda: package_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def import_package_gui():
+    package_dir = filedialog.askdirectory(title="Choose a package folder to import (must contain captures_log.csv)")
+    if not package_dir:
+        return  # user cancelled
+
+    if not messagebox.askyesno(
+            "Import package",
+            f"Import every capture from:\n{package_dir}\n\n"
+            f"Each row becomes a NEW object in this machine's MongoDB (fresh "
+            f"object_id, images copied into local storage) — this does not "
+            f"overwrite or deduplicate against anything already here. Continue?"):
+        return
+
+    package_status_label.config(text="Importing package...", fg="gray")
+
+    def worker():
+        try:
+            imported, skipped, warnings = package_export.import_package(package_dir)
+            msg = f"Imported {imported} object(s), skipped {skipped}."
+            if warnings:
+                msg += f" {len(warnings)} warning(s) — see console."
+                for w in warnings:
+                    print(f"[IMPORT PACKAGE] {w}")
+            color = "green" if not warnings and skipped == 0 else "orange"
+        except Exception as e:
+            msg, color = f"Import failed: {e}", "red"
+
+        def apply():
+            package_status_label.config(text=msg, fg=color)
+            try:
+                refresh_objects_list()
+                refresh_images_list()
+                refresh_inventory_list()
+            except NameError:
+                pass
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(package_btn_row, text="Export Today's Package", command=lambda: export_package_gui(False),
+          bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(package_btn_row, text="Export Full History Package", command=lambda: export_package_gui(True),
+          bg="lightgreen").pack(side=tk.LEFT, padx=4)
+tk.Button(package_btn_row, text="Import Package...", command=import_package_gui,
+          bg="khaki").pack(side=tk.LEFT, padx=4)
+
+# =====================================================================
 # ASK (optional secondary NL layer — langchain-mongodb agent via local
 # Ollama). See vision/services/mongo_nlp_agent.py's module docstring for
 # why this is secondary and what it needs. Disabled automatically (not
@@ -3117,6 +3455,24 @@ nl_query_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
 nl_query_status_label = tk.Label(nl_query_frame, text="Checking local AI availability...", fg="gray")
 nl_query_status_label.pack(anchor=tk.W)
+
+# ---- Model selection: whatever's actually installed in Ollama right
+# now, plus a note about tool-calling-capable models worth installing
+# that aren't. Selecting a different model re-checks availability
+# against THAT model (installed doesn't necessarily mean "supports tool
+# calling well" — see mongo_nlp_agent.RECOMMENDED_MODELS' notes) and
+# uses it for every subsequent "Ask".
+nl_model_row = tk.Frame(nl_query_frame)
+nl_model_row.pack(fill=tk.X, pady=(4, 0))
+tk.Label(nl_model_row, text="Model:").pack(side=tk.LEFT)
+nl_model_selector = ttk.Combobox(nl_model_row, width=22, state="readonly")
+nl_model_selector.pack(side=tk.LEFT, padx=(4, 8))
+tk.Button(nl_model_row, text="Refresh models",
+          command=lambda: _refresh_nl_model_list()).pack(side=tk.LEFT)
+
+nl_recommended_label = tk.Label(nl_query_frame, text="", fg="gray", font=("Arial", 8),
+                                 wraplength=680, justify=tk.LEFT)
+nl_recommended_label.pack(anchor=tk.W, pady=(2, 0))
 
 nl_query_input_row = tk.Frame(nl_query_frame)
 nl_query_input_row.pack(fill=tk.X, pady=(4, 2))
@@ -3132,16 +3488,55 @@ nl_query_answer_label = tk.Label(nl_query_frame, text="", fg="gray", wraplength=
 nl_query_answer_label.pack(anchor=tk.W, pady=(4, 0))
 
 
+def _refresh_nl_model_list():
+    """Populates the model dropdown from Ollama's actual installed
+    models, and lists any RECOMMENDED_MODELS entries not yet installed
+    underneath with their `ollama pull` command — so recommendations
+    are always shown alongside, never instead of, what's really there.
+    Re-checks availability for whatever ends up selected."""
+    def worker():
+        installed = mongo_nlp_agent.list_installed_models()
+
+        def apply():
+            values = installed if installed else [NLP_AGENT_MODEL]
+            nl_model_selector["values"] = values
+            # Prefer NLP_AGENT_MODEL if it's actually installed; otherwise
+            # just default to whatever's first rather than a model that
+            # isn't there.
+            default = NLP_AGENT_MODEL if NLP_AGENT_MODEL in values else values[0]
+            nl_model_selector.set(default)
+
+            not_installed = [
+                m for m in mongo_nlp_agent.RECOMMENDED_MODELS
+                if not any(name.startswith(m["name"]) for name in installed)
+            ]
+            if not_installed:
+                lines = "; ".join(f'{m["name"]} ({m["note"]}) — ollama pull {m["name"]}'
+                                   for m in not_installed)
+                nl_recommended_label.config(text=f"Recommended, not installed: {lines}")
+            else:
+                nl_recommended_label.config(text="All recommended tool-calling models are installed.")
+
+            _check_nl_query_availability()
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def _check_nl_query_availability():
-    """Runs once at startup (and can be re-run manually) to enable/
-    disable the Ask button based on whether Ollama + the langchain-
-    mongodb toolkit are actually available. Never crashes the GUI —
-    worst case the feature just stays disabled with an explanatory
-    error, while standard MongoDB browsing above keeps working."""
+    """Runs at startup and whenever the model selection changes, to
+    enable/disable the Ask button based on whether Ollama + the
+    langchain-mongodb toolkit are actually available FOR THE CURRENTLY
+    SELECTED MODEL. Never crashes the GUI — worst case the feature just
+    stays disabled with an explanatory error, while standard MongoDB
+    browsing above keeps working."""
+    model = nl_model_selector.get() or NLP_AGENT_MODEL
+
     def worker():
         try:
-            mongo_nlp_agent.check_agent_available(NLP_AGENT_MODEL)
-            msg, color, enabled = f"Local AI ready ({NLP_AGENT_MODEL})", "green", tk.NORMAL
+            mongo_nlp_agent.check_agent_available(model)
+            msg, color, enabled = f"Local AI ready ({model})", "green", tk.NORMAL
         except Exception as e:
             msg, color, enabled = f"Local AI unavailable — disabled: {e}", "red", tk.DISABLED
 
@@ -3156,20 +3551,22 @@ def _check_nl_query_availability():
 
 def run_nl_query_from_gui():
     """Runs the NL question through the langchain-mongodb agent
-    (vision.services.mongo_nlp_agent) and shows its answer text. Unlike
-    the old deepseek_query layer, this doesn't repopulate the Objects
-    listbox — the agent's generate -> validate -> execute steps and
-    result are summarized in its own answer instead."""
+    (vision.services.mongo_nlp_agent), using whichever model is
+    currently selected in the dropdown, and shows its answer text.
+    Unlike the old deepseek_query layer, this doesn't repopulate the
+    Objects listbox — the agent's generate -> validate -> execute steps
+    and result are summarized in its own answer instead."""
     question = nl_query_entry.get().strip()
     if not question:
         return
+    model = nl_model_selector.get() or NLP_AGENT_MODEL
 
     nl_query_ask_btn.config(state=tk.DISABLED)
     nl_query_answer_label.config(text="Thinking...", fg="gray")
 
     def worker():
         try:
-            answer = mongo_nlp_agent.ask(question, model=NLP_AGENT_MODEL)
+            answer = mongo_nlp_agent.ask(question, model=model)
             err = None
         except mongo_nlp_agent.MongoNLPAgentError as e:
             answer, err = None, str(e)
@@ -3190,8 +3587,9 @@ def run_nl_query_from_gui():
 
 nl_query_ask_btn.config(command=run_nl_query_from_gui)
 nl_query_entry.bind("<Return>", lambda event: run_nl_query_from_gui())
+nl_model_selector.bind("<<ComboboxSelected>>", lambda event: _check_nl_query_availability())
 
-_check_nl_query_availability()
+_refresh_nl_model_list()
 
 # =====================================================================
 # DATA COLLECTION TAB — "pick up an object, rotate it via J4, take N

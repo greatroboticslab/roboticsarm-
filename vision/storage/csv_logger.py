@@ -21,6 +21,7 @@ easy to find on their own.
 from __future__ import annotations
 
 import csv
+import json
 import os
 from datetime import datetime
 
@@ -67,7 +68,12 @@ def append_capture_row(object_id: str, session_id: str, catalog_id: str,
     }
     for key in attribute_schema.fixed_column_keys():
         row[key] = data.get(key, "")
-    row[freeform_col] = data.get(freeform_col, {})
+    # json.dumps, not the raw dict — csv.DictWriter would otherwise
+    # write Python's str(dict) repr (single-quoted, not valid JSON),
+    # which silently breaks any later round-trip (package_export.py's
+    # import_package, or anything else that reads this column back with
+    # json.loads) even though the CSV file itself looks fine to a human.
+    row[freeform_col] = json.dumps(data.get(freeform_col, {}), ensure_ascii=False)
 
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_header())
