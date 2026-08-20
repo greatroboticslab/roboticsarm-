@@ -20,7 +20,8 @@ class ViewResult:
     image_path: str
     label: str
     confidence: float
-    pose: dict            # robot joint/cartesian state at capture time
+    pose: dict             # robot joint/cartesian state at capture time
+    attributes: dict        # per-view attributes dict from identify()
 
 
 # Station camera trusted more (controlled lighting/distance/no motion blur).
@@ -41,13 +42,22 @@ def classify_multi_source(views: List[dict]) -> Dict:
         {
             "predicted_label": str,
             "vote_scores": {label: score, ...},
+            "attributes": {...merged freeform attributes...},
             "per_view": [ViewResult-as-dict, ...],
         }
+        `attributes` is the winning view's (the view whose label matches
+        predicted_label, highest-confidence among those) attributes
+        dict, merged under per-view keys so nothing is silently
+        dropped — see _merge_attributes() below. This whole "attributes"
+        value is what vision.storage.capture_pipeline.record_capture()
+        should pass through as its `attributes=` argument (it lands in
+        the freeform column, not the fixed ones — see
+        vision.storage.attribute_schema).
     """
     results: List[ViewResult] = []
 
     for view in views:
-        label, confidence = identify(view["image_path"])
+        label, confidence, attributes = identify(view["image_path"])
         results.append(ViewResult(
             source=view["source"],
             view_index=view["view_index"],
@@ -55,6 +65,7 @@ def classify_multi_source(views: List[dict]) -> Dict:
             label=label,
             confidence=confidence,
             pose=view["pose"],
+            attributes=attributes or {},
         ))
 
     tally: Dict[str, float] = {}
@@ -67,5 +78,19 @@ def classify_multi_source(views: List[dict]) -> Dict:
     return {
         "predicted_label": best_label,
         "vote_scores": tally,
+        "attributes": _merge_attributes(results, best_label),
         "per_view": [asdict(r) for r in results],
     }
+
+
+def _merge_attributes(results: List[ViewResult], best_label: str) -> Dict:
+    """Freeform attributes from every view that voted for the winning
+    label, namespaced by source/view_index so two views disagreeing on
+    e.g. "color" is visible rather than one silently overwriting the
+    other. Returns {} if there were no results (nothing captured)."""
+    merged: Dict = {}
+    for r in results:
+        if r.label != best_label or not r.attributes:
+            continue
+        merged[f"{r.source}_{r.view_index}"] = r.attributes
+    return merged

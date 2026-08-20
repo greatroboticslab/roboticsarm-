@@ -86,8 +86,47 @@ else:
 # view_data.py can browse the "objects" category with zero changes on
 # its side.
 MONGO_DB_NAME = "Collections"
-MONGO_OBJECTS_COLLECTION = "objects"
-MONGO_IMAGES_COLLECTION = "images"
+MONGO_OBJECTS_COLLECTION = "objects"          # one doc per capture (the "log")
+MONGO_IMAGES_COLLECTION = "images"            # one doc per photo
+MONGO_SESSIONS_COLLECTION = "sessions"        # one doc per calendar day
+MONGO_OBJECT_CATALOG_COLLECTION = "object_catalog"  # one doc per distinct known object ("inventory")
+
+# ===========================================================================
+# ATTRIBUTE / CSV / EXCEL LOGGING
+# ===========================================================================
+# Editable attribute-table definition (fixed columns + reserved slots for
+# later + freeform key/value). Kept as a plain JSON file (not hardcoded
+# constants) specifically so the columns can be changed later — add/rename/
+# remove a fixed attribute — without touching any Python code. See
+# vision/storage/attribute_schema.py for the loader/editor functions.
+ATTRIBUTE_SCHEMA_PATH = "vision/storage/attribute_schema.json"
+
+# Everything CSV/Excel writes lives under its own subfolder, separate from
+# the raw per-object image folders (IMAGES_ROOT below), so "give me the
+# spreadsheet(s)" and "give me the photos" are two clearly separate places.
+DATA_LOGS_DIR = "data_logs"
+CSV_LOG_DIR = "data_logs/csv"
+CSV_LOG_FILENAME = "captures_log.csv"          # single, ever-growing append log
+EXCEL_EXPORT_DIR = "data_logs/excel"
+EXCEL_EXPORT_FILENAME = "captures_report.xlsx"  # regenerated report (log + inventory sheets)
+
+# DATA_AUTHORITY_MODE controls whether the Database tab offers "Reconcile
+# from Excel" (hand-edit the .xlsx, pull those edits back into MongoDB):
+#   "excel" -> testing/now: hand-editing the report is expected; reconcile
+#              is offered.
+#   "mongo" -> the goal state: MongoDB is authoritative, Excel is a
+#              read-only generated report; no reconcile needed.
+# Regardless of this setting, MongoDB is always written first/live on every
+# capture (the only side safe for concurrent/live writes) and the CSV log
+# is always appended to — this flag only changes whether manual Excel edits
+# are expected/pulled back in.
+DATA_AUTHORITY_MODE = "excel"
+
+# Catalog auto-matching: name-string match only for now (no real
+# re-identification model yet) — normalized (casefold + strip whitespace),
+# optionally narrowed by category. Treated as a loose *suggestion* link,
+# not a hard guarantee — see vision/storage/object_catalog.py.
+CATALOG_MATCH_ON_CATEGORY = True
 
 # ===========================================================================
 # SWEEP SETTINGS
@@ -171,23 +210,32 @@ TOPIC_ARM_MOVE_COMMAND = "arm/command/move"
 # ---------------------------------------------------------------------------
 
 # ===========================================================================
-# [TEMP] LOCAL LLM (NATURAL-LANGUAGE MONGO QUERY) — see
-# vision/services/deepseek_query.py for why this is marked temporary.
+# LOCAL LLM (NATURAL-LANGUAGE MONGO QUERY) — see
+# vision/services/mongo_nlp_agent.py for the full explanation.
+#
+# This is deliberately kept SECONDARY to standard/direct MongoDB access
+# (vision.storage.mongo_client) — the "Objects"/"Images"/"Inventory" browser
+# on the Database tab never touches an LLM at all. This section only
+# configures the optional "Ask" box layered on top of it.
 # ===========================================================================
 # Points at a local Ollama install (https://ollama.com), not a hosted API —
 # no key needed. Requires `ollama pull <model>` for whichever model is
 # selected before it will work.
 OLLAMA_HOST = "http://localhost:11434"
 
-# Default model. "deepseek-r1:7b" is the safer default for correctness on
-# multi-condition questions; "deepseek-r1:1.5b" is a lighter/faster option
-# that still tends to be fine for this narrow a task (short question + a
-# handful of field names -> one JSON filter). Swap here, or override
-# per-call from the GUI.
+# The langchain-mongodb agent toolkit needs a model that reliably supports
+# tool/function calling — reasoning models (deepseek-r1) and small (<7B)
+# general models do NOT reliably support this (see
+# mongodb-nlp-query-summary.txt). qwen2.5:7b+ and llama3.1:8b+ do.
+NLP_AGENT_MODEL = "qwen2.5:7b"
+
+# Old DeepSeek-via-Ollama defaults, kept only because
+# vision/services/deepseek_query.py (the previous, now-superseded NL layer)
+# still references them. Not used by mongo_nlp_agent.py.
 OLLAMA_MODEL = "deepseek-r1:7b"
 OLLAMA_MODEL_LIGHTWEIGHT = "deepseek-r1:1.5b"
 
-# How many recent sample documents to scan when building the "known
+# How many recent object documents to scan when building the "known
 # fields" list handed to the model as context. User-adjustable from the
 # GUI; this is just the default.
 NL_QUERY_FIELD_SAMPLE_SIZE = 50

@@ -68,9 +68,20 @@ class PhysicalSideController:
                                    lasers are relay-switched (1-4), not
                                    one PWM-dimmable laser; channel=None
                                    means "all configured channels".
-        capture_executor:         () -> (sample_id: str,
+        capture_executor:         (object_id: str | None) -> (sample_id: str,
                                           frames: list[(source, view_idx, frame)],
                                           values: dict)
+                                   object_id is passed straight through
+                                   from the capture-request payload —
+                                   None means an ad hoc single "Capture
+                                   Now" press (mint a fresh sample_id as
+                                   before); a real value means "this is
+                                   one step of a rotation sequence the
+                                   Other Side is coordinating — reuse
+                                   this exact id as sample_id" so every
+                                   step's bundle carries the same id and
+                                   the Other Side's rotation_coordinator
+                                   can group them into one object.
         telemetry_provider:       () -> dict (JSON-serializable)
         on_control_status_change: (snapshot: dict) -> None — called from a
                                    background thread; caller is responsible
@@ -226,8 +237,11 @@ class PhysicalSideController:
         if not self.capture_executor:
             return
         try:
-            sample_id, frames, values = self.capture_executor()
-            bundle = photo_transfer.build_photo_bundle(sample_id, frames, self.ip, values)
+            object_id = payload.get("object_id")
+            view_index = payload.get("view_index")
+            sample_id, frames, values = self.capture_executor(object_id)
+            bundle = photo_transfer.build_photo_bundle(
+                sample_id, frames, self.ip, values, view_index=view_index)
             self._client.publish(self._photo_topic, json.dumps(bundle))
         except Exception as e:
             self.on_log(f"[MIDDLEMAN] Capture-request error: {e}")

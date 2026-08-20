@@ -59,16 +59,20 @@ import requests
 from vision.config import OLLAMA_HOST, OLLAMA_MODEL, NL_QUERY_FIELD_SAMPLE_SIZE
 from vision.storage.mongo_client import find_samples, sample_recent_data_fields
 
-# Only these operators are allowed in a model-generated filter. Anything
-# else (most notably $where, and all write operators — $set, $unset,
-# $push, etc.) gets rejected before the filter ever reaches MongoDB.
-_ALLOWED_OPERATORS = {
-    "$eq", "$ne", "$gt", "$gte", "$lt", "$lte",
-    "$in", "$nin", "$and", "$or", "$nor", "$not",
-    "$regex", "$options", "$exists",
-}
+# Kept for reference — the operator whitelist now lives in
+# vision.storage.query_safety, shared with the Database tab's manual
+# "Advanced Query" box. DeepSeekQueryError stays a distinct exception
+# type since this module's callers (if any remain) expect it.
+from vision.storage.query_safety import ALLOWED_OPERATORS as _ALLOWED_OPERATORS, \
+    validate_filter as _shared_validate_filter
 
-_OLLAMA_TIMEOUT_SECONDS = 30
+# deepseek-r1 is a reasoning model: it spends a lot of time generating an
+# internal <think>...</think> block before producing the actual answer.
+# That phase alone can run well past 30s on CPU, especially for the 7b
+# variant -- 30s was cutting off legitimate, still-in-progress requests,
+# not just genuinely hung ones. 120s gives the thinking phase room while
+# still failing (rather than hanging forever) if Ollama is actually stuck.
+_OLLAMA_TIMEOUT_SECONDS = 120
 
 
 class DeepSeekQueryError(Exception):
@@ -110,23 +114,14 @@ def check_ollama_available(model: str = OLLAMA_MODEL) -> None:
 
 def _validate_filter(filter_obj) -> dict:
     """Recursively check that a parsed filter only uses whitelisted
-    operators and contains no operator-like keys sneaking into field
-    positions. Raises DeepSeekQueryError on anything disallowed."""
-    if not isinstance(filter_obj, dict):
-        raise DeepSeekQueryError("Model output was not a JSON object.")
-
-    for key, value in filter_obj.items():
-        if key.startswith("$") and key not in _ALLOWED_OPERATORS:
-            raise DeepSeekQueryError(f"Disallowed operator in filter: {key}")
-
-        if isinstance(value, dict):
-            _validate_filter(value)
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    _validate_filter(item)
-
-    return filter_obj
+    operators — delegates to vision.storage.query_safety, translating
+    its generic QueryValidationError into this module's
+    DeepSeekQueryError so existing callers' except clauses still work."""
+    from vision.storage.query_safety import QueryValidationError
+    try:
+        return _shared_validate_filter(filter_obj)
+    except QueryValidationError as e:
+        raise DeepSeekQueryError(str(e))
 
 
 def _repair_unquoted_operators(text: str) -> str:
@@ -144,11 +139,37 @@ def _repair_unquoted_operators(text: str) -> str:
     return re.sub(r'([{,]\s*)(\$[A-Za-z]+)(\s*:)', r'\1"\2"\3', text)
 
 
+def _strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks that reasoning models
+    like deepseek-r1 emit before their actual answer. Without this, the
+    JSON-extraction logic below can grab braces from INSIDE the model's
+    reasoning (e.g. it reasoning out loud about what the filter should
+    look like) instead of the real, final answer -- producing either a
+    parse error or a filter that doesn't match what the model actually
+    intended. If the model's response got cut off mid-think (e.g. by a
+    slow generation), there may be no closing tag; in that case there's
+    no usable answer left, so this returns an empty string rather than
+    guessing."""
+    if "<think>" in text:
+        if "</think>" in text:
+            return text.split("</think>", 1)[1].strip()
+        return ""  # still inside <think> when generation stopped -- no answer yet
+    return text.strip()
+
+
 def _extract_json(raw_text: str) -> dict:
     """Best-effort extraction of a JSON object from a local model's
     response — small/reasoning models often wrap output in ```json
     fences or add explanation text despite being told not to."""
-    text = raw_text.strip()
+    text = _strip_think_blocks(raw_text)
+
+    if not text:
+        raise DeepSeekQueryError(
+            "The model's response was still inside a <think> reasoning "
+            "block with no answer after it (generation was likely cut "
+            "off). Try again, or use a smaller/faster model — see "
+            "OLLAMA_MODEL in vision/config.py."
+        )
 
     # Strip ```json ... ``` or ``` ... ``` fences if present.
     fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
@@ -206,7 +227,17 @@ def generate_mongo_filter(question: str, fields: list, model: str = OLLAMA_MODEL
     try:
         resp = requests.post(
             f"{OLLAMA_HOST}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                # Caps response length. The answer itself is a small JSON
+                # object; 800 tokens is generous headroom for the <think>
+                # block too, but stops a stuck/rambling generation from
+                # running indefinitely and guarantees the request finishes
+                # (successfully or not) well inside _OLLAMA_TIMEOUT_SECONDS.
+                "options": {"num_predict": 800},
+            },
             timeout=_OLLAMA_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()

@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import uuid
 import threading
+from datetime import datetime
 
 try:
     import cv2
@@ -286,13 +287,20 @@ def frame_to_rgb(frame):
 def save_image(frame, sample_id: str, source: str, view_index: int = 0) -> str:
     """
     [WIRED] Persist a captured frame to disk and return its path.
-    Mirrors 4DAI's Server/main.py image storage layout
-    (images/<category>/<sample_id>/<id>.jpg) so the two systems'
-    on-disk data stays consistent.
+
+    Filename is `YYYYMMDD_HHMMSS_<source>_<view_index>.jpg` (per the
+    plan: date + time + the existing source/view_index naming), inside
+    the existing images/<sample_id>/ per-object folder — so filenames
+    stay sortable/searchable on their own, folder-per-object grouping
+    is unchanged, and two captures of the same object/source/view_index
+    can never collide/overwrite each other (each gets its own
+    timestamp), which the old `{source}_{view_index}.jpg`-only naming
+    did not guarantee.
     """
     _require_cv2()
     sample_dir = ensure_sample_dir(sample_id)
-    image_path = os.path.join(sample_dir, f"{source}_{view_index}.jpg")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    image_path = os.path.join(sample_dir, f"{timestamp}_{source}_{view_index}.jpg")
     ok = cv2.imwrite(image_path, frame)
     if not ok:
         raise IOError(f"Failed to write image to {image_path}")

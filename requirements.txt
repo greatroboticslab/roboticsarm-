@@ -9,3 +9,7 @@ paho-mqtt
 pymongo
 Pillow
 requests
+openpyxl
+langchain-mongodb
+langchain-ollama
+langgraph

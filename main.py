@@ -4,6 +4,7 @@ from time import sleep
 import time
 import os
 import json
+import re
 import uuid
 from datetime import date
 import tkinter as tk
@@ -37,15 +38,20 @@ from vision.config import (
 )
 from vision.messaging.publisher import publish_captured, publish_capture_status
 from vision.messaging.subscriber import subscribe
-from vision.storage import mongo_client
+from vision.storage import mongo_client, object_catalog, excel_export, attribute_schema, session_manager, query_safety
+from vision.storage.capture_pipeline import record_capture
+from vision.services import rotation_coordinator
+from vision.config import DATA_AUTHORITY_MODE
 
-# [TEMP] Local-LLM (DeepSeek via Ollama) natural-language Mongo query —
-# see vision/services/deepseek_query.py's module docstring for why this
-# is temporary. Imported here (not inline in the Database tab code) so
-# it's a single, obvious place to delete/replace later. Only used inside
-# the "Database" tab below, and only when Ollama is actually reachable.
-from vision.services import deepseek_query
-from vision.config import OLLAMA_MODEL, NL_QUERY_FIELD_SAMPLE_SIZE
+# Optional local-LLM (langchain-mongodb agent toolkit via Ollama) natural-
+# language Mongo query — see vision/services/mongo_nlp_agent.py's module
+# docstring. Imported here (not inline in the Database tab code) so it's a
+# single, obvious place to swap out later. Only used inside the "Database"
+# tab's "Ask" box, and only when Ollama + the toolkit are actually
+# available — the standard Objects/Images/Inventory browser never touches
+# this or any LLM.
+from vision.services import mongo_nlp_agent
+from vision.config import NLP_AGENT_MODEL, NL_QUERY_FIELD_SAMPLE_SIZE
 
 # [WIRED] Middleman mode (Virtual tab). Business logic
 # (networking/protocol/session/photo-transfer) lives entirely in these
@@ -664,6 +670,7 @@ tab_camera = tk.Frame(notebook)
 tab_laser = tk.Frame(notebook)
 tab_server = tk.Frame(notebook)
 tab_database = tk.Frame(notebook)
+tab_data_collection = tk.Frame(notebook)
 
 # NOTE: widgets added to a Notebook via notebook.add(...) are already
 # geometry-managed BY the notebook — do not also call .pack()/.grid() on
@@ -677,6 +684,7 @@ notebook.add(tab_camera, text="Camera")
 notebook.add(tab_laser, text="Laser")
 notebook.add(tab_server, text="Server")
 notebook.add(tab_database, text="Database")
+notebook.add(tab_data_collection, text="Data Collection")
 
 # Always boot straight into the Arm tab (demo mode banner and all),
 # regardless of insertion order above.
@@ -1010,13 +1018,22 @@ def _middleman_laser_executor(channel, state: bool) -> None:
         laser_ctl.set_channel(ch, state)
 
 
-def _middleman_capture_executor():
+def _middleman_capture_executor(object_id: str = None):
     """Capture executor handed to PhysicalSideController: grabs one frame
     from every locally-configured camera at the arm's current position.
     Mirrors the existing 'Capture Photo — All Cameras' flow, minus the
     local save/upload (photo_transfer.py handles relaying + the Other
-    Side's local save instead)."""
-    sample_id = new_sample_id()
+    Side's local save instead).
+
+    object_id: passed straight through from the incoming capture-request
+    payload (see PhysicalSideController's docstring). None = an ad hoc
+    single "Capture Now" press, mint a fresh id as before. A real value
+    means this is one step of a rotation sequence the Other Side is
+    coordinating — reuse it as sample_id so every step's bundle carries
+    the same id and the Other Side's rotation_coordinator groups them
+    into one object instead of each becoming its own.
+    """
+    sample_id = object_id or new_sample_id()
     frames = []
     for camera_name in list_configured_cameras():
         try:
@@ -1134,7 +1151,8 @@ def _on_photo_received(saved_paths: list) -> None:
         current = control_mode_status_label.cget("text")
         control_mode_status_label.config(text=f"{current}  |  Received {len(saved_paths)} photo(s), saved locally.")
         try:
-            refresh_recent_samples()
+            refresh_objects_list()
+            refresh_images_list()
         except NameError:
             pass  # Database tab not built yet — harmless
     root.after(0, apply)
@@ -2513,6 +2531,10 @@ tk.Button(
 # window into the same data, not a separate copy. Kept on its own
 # "Database" tab (split from "Server") so there's room to grow either
 # one independently later.
+#
+# Standard MongoDB access (this whole section, all three sub-tabs below)
+# is the DEFAULT and never touches an LLM. The optional "Ask" box further
+# down is a secondary layer on top — see vision/services/mongo_nlp_agent.py.
 # =====================================================================
 tk.Label(tab_database, text="Local Database",
          font=("Arial", 12, "bold")).pack(pady=(10, 5))
@@ -2526,7 +2548,7 @@ mongo_status_label.pack(anchor=tk.W)
 def test_mongo_connection():
     def worker():
         try:
-            mongo_client.list_recent_samples(limit=1)
+            mongo_client.list_recent_objects(limit=1)
             msg, color = "Connected", "green"
         except Exception as e:
             msg, color = f"Unavailable: {e}", "red"
@@ -2539,85 +2561,260 @@ mongo_btn_row.pack(fill=tk.X, pady=(2, 6))
 tk.Button(mongo_btn_row, text="Test Mongo Connection", command=test_mongo_connection,
           bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
 
-tk.Label(mongo_frame, text="Recent local captures (newest first) — double-click a row to view its photo(s):").pack(anchor=tk.W)
-recent_samples_listbox = tk.Listbox(mongo_frame, height=12)
-recent_samples_listbox.pack(fill=tk.BOTH, expand=1, pady=4)
+# --- Three collections, three sub-tabs: Log (objects, default view),
+# Images, and Inventory (object_catalog — see vision/storage/
+# object_catalog.py). Same underlying data as the plan describes; each
+# sub-tab is just a different read query against it.
+db_subtabs = ttk.Notebook(mongo_frame)
+db_subtabs.pack(fill=tk.BOTH, expand=1, pady=4)
 
-# Listbox rows are plain text, but we need the actual sample _id behind
-# each row to look up its images — kept in lockstep with the listbox's
-# rows (same index = same row) and rebuilt every refresh.
-_recent_sample_ids = []
+tab_objects_log = tk.Frame(db_subtabs)
+tab_images_log = tk.Frame(db_subtabs)
+tab_inventory = tk.Frame(db_subtabs)
+db_subtabs.add(tab_objects_log, text="Objects (Log)")
+db_subtabs.add(tab_images_log, text="Images")
+db_subtabs.add(tab_inventory, text="Inventory")
+
+# ---- Objects (Log) sub-tab -------------------------------------------------
+tk.Label(tab_objects_log,
+         text="Recent captures (newest first) — double-click a row to see its images + attributes:"
+         ).pack(anchor=tk.W, pady=(4, 0))
+
+# Standard (non-NLP) query filter bar. This is the "always available,
+# no LLM required" way to narrow the Objects list — the "Ask" box
+# elsewhere on this tab is a secondary, optional path on top of the
+# same find_objects() this calls directly. Dropdown values are pulled
+# from what's actually in Mongo (distinct_object_categories/colors), so
+# this never drifts from attribute_schema.json or goes stale.
+obj_filter_frame = tk.Frame(tab_objects_log)
+obj_filter_frame.pack(fill=tk.X, pady=(2, 0))
+
+tk.Label(obj_filter_frame, text="Category:").pack(side=tk.LEFT)
+obj_filter_category = ttk.Combobox(obj_filter_frame, width=12, state="readonly")
+obj_filter_category.pack(side=tk.LEFT, padx=(2, 8))
+
+tk.Label(obj_filter_frame, text="Color:").pack(side=tk.LEFT)
+obj_filter_color = ttk.Combobox(obj_filter_frame, width=12, state="readonly")
+obj_filter_color.pack(side=tk.LEFT, padx=(2, 8))
+
+tk.Label(obj_filter_frame, text="Name contains:").pack(side=tk.LEFT)
+obj_filter_name = tk.Entry(obj_filter_frame, width=14)
+obj_filter_name.pack(side=tk.LEFT, padx=(2, 8))
+
+obj_filter_today_only = tk.BooleanVar(value=False)
+tk.Checkbutton(obj_filter_frame, text="Captured today only",
+               variable=obj_filter_today_only).pack(side=tk.LEFT, padx=(0, 8))
+
+# ---- Advanced Query: raw MongoDB filter syntax, for anything the
+# dropdowns above don't cover — size, position, freeform attributes,
+# session_id, captured_at ranges, $or/$in across several fields, etc.
+# Runs through query_safety.validate_filter() before ever reaching
+# pymongo (same whitelist the old NLP layer's generated filters used),
+# so a typo or a deliberately hostile filter can't smuggle in $where or
+# a write operator — it just gets rejected with a clear error instead.
+obj_adv_query_frame = tk.Frame(tab_objects_log)
+obj_adv_query_frame.pack(fill=tk.X, pady=(2, 0))
+tk.Label(obj_adv_query_frame, text="Advanced Query (MongoDB filter, JSON):").pack(anchor=tk.W)
+obj_adv_query_entry = tk.Entry(obj_adv_query_frame, width=90)
+obj_adv_query_entry.pack(side=tk.LEFT, fill=tk.X, expand=1, padx=(0, 4))
+tk.Label(tab_objects_log,
+         text='Fields: data.name, data.category, data.color, data.size, '
+              'data.position_x, data.position_y, data.position_z, '
+              'data.reserved_1/2/3, data.attributes.<key>, session_id, captured_at. '
+              'Operators: $eq $ne $gt $gte $lt $lte $in $nin $and $or $nor $not $regex $exists. '
+              'Example: {"data.size": "large", "data.position_x": {"$gt": 10}}',
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT
+         ).pack(anchor=tk.W, padx=2)
+
+objects_listbox = tk.Listbox(tab_objects_log, height=12)
+objects_listbox.pack(fill=tk.BOTH, expand=1, pady=4)
+
+# Listbox rows are plain text, but we need the actual object _id behind
+# each row to look it up — kept in lockstep with the listbox's rows
+# (same index = same row) and rebuilt every refresh.
+_recent_object_ids = []
 
 
-def refresh_recent_samples():
-    """Pull the most recent sample documents from local MongoDB and show
-    them in the listbox. Safe to call even if MongoDB isn't running —
-    shows the error in the list instead of crashing the GUI."""
+def _populate_object_filter_dropdowns():
+    """Fill the Category/Color dropdowns from whatever values actually
+    exist in Mongo right now. Safe to call even if Mongo's unreachable —
+    just leaves the dropdowns empty (the "Any" default still works)."""
     def worker():
-        err = None
         try:
-            samples = mongo_client.list_recent_samples(limit=30)
-        except Exception as e:
-            samples = None
-            err = str(e)
+            categories = mongo_client.distinct_object_categories()
+            colors = mongo_client.distinct_object_colors()
+        except Exception:
+            categories, colors = [], []
 
         def apply():
-            recent_samples_listbox.delete(0, tk.END)
-            _recent_sample_ids.clear()
-            if samples is None:
-                recent_samples_listbox.insert(tk.END, f"Error: {err}")
-                return
-            if not samples:
-                recent_samples_listbox.insert(tk.END, "(no samples captured yet)")
-                return
-            for s in samples:
-                sid = s.get("_id", "?")
-                sdate = s.get("date", "?")
-                label = (s.get("data") or {}).get("predicted_label", "")
-                recent_samples_listbox.insert(tk.END, f"{sdate}  |  {label}  |  {sid}")
-                _recent_sample_ids.append(sid)
+            obj_filter_category["values"] = ["(any)"] + categories
+            obj_filter_category.set("(any)")
+            obj_filter_color["values"] = ["(any)"] + colors
+            obj_filter_color.set("(any)")
 
         root.after(0, apply)
 
     threading.Thread(target=worker, daemon=True).start()
 
 
-def open_sample_photo_viewer(event=None):
-    """Pop up a window showing every image logged against the
-    double-clicked sample (one row per camera/view, scrollable if there
-    are several)."""
-    selection = recent_samples_listbox.curselection()
+def _build_object_filter() -> dict:
+    """Turn the filter bar widgets into a Mongo filter dict using only
+    known, hardcoded field names — the same safety rule find_objects()'s
+    docstring calls out (never pass raw user text straight in as part of
+    the filter). The one bit of free text (Name contains) goes in as the
+    *value* of a fixed field's $regex, with special characters escaped
+    via re.escape so it's always a literal substring match, never an
+    attacker-controlled regex pattern.
+
+    The Advanced Query box, if non-empty, is parsed as JSON, validated
+    through query_safety (whitelisted operators only — raises
+    QueryValidationError on anything else, e.g. $where), and merged in
+    on top of the dropdown-built filter — its keys win on collision.
+    Raises ValueError (invalid JSON) or query_safety.QueryValidationError
+    (disallowed operator) so the caller can show a clear message instead
+    of silently ignoring a bad query.
+    """
+    mongo_filter = {}
+    category = obj_filter_category.get()
+    if category and category != "(any)":
+        mongo_filter["data.category"] = category
+    color = obj_filter_color.get()
+    if color and color != "(any)":
+        mongo_filter["data.color"] = color
+    name_text = obj_filter_name.get().strip()
+    if name_text:
+        mongo_filter["data.name"] = {"$regex": re.escape(name_text), "$options": "i"}
+    if obj_filter_today_only.get():
+        mongo_filter["session_id"] = session_manager.today_session_id()
+
+    advanced_text = obj_adv_query_entry.get().strip()
+    if advanced_text:
+        try:
+            advanced_filter = json.loads(advanced_text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Advanced Query isn't valid JSON: {e}")
+        query_safety.validate_filter(advanced_filter)
+        mongo_filter.update(advanced_filter)
+
+    return mongo_filter
+
+
+def refresh_objects_list():
+    """Pull object documents from local MongoDB and show them in the
+    listbox — filtered by the filter bar above if any filter is set,
+    otherwise the same "most recent 30" view as before. Safe to call
+    even if MongoDB isn't running — shows the error in the list instead
+    of crashing the GUI."""
+    def worker():
+        err = None
+        try:
+            mongo_filter = _build_object_filter()
+            if mongo_filter:
+                objects = mongo_client.find_objects(mongo_filter, limit=100)
+            else:
+                objects = mongo_client.list_recent_objects(limit=30)
+        except Exception as e:
+            objects = None
+            err = str(e)
+
+        def apply():
+            objects_listbox.delete(0, tk.END)
+            _recent_object_ids.clear()
+            if objects is None:
+                objects_listbox.insert(tk.END, f"Error: {err}")
+                return
+            if not objects:
+                objects_listbox.insert(tk.END, "(no objects match this filter)")
+                return
+            for o in objects:
+                oid = o.get("_id", "?")
+                odate = o.get("date", "?")
+                name = (o.get("data") or {}).get("name", "")
+                objects_listbox.insert(tk.END, f"{odate}  |  {name}  |  {oid}")
+                _recent_object_ids.append(oid)
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def clear_object_filters():
+    obj_filter_category.set("(any)")
+    obj_filter_color.set("(any)")
+    obj_filter_name.delete(0, tk.END)
+    obj_filter_today_only.set(False)
+    obj_adv_query_entry.delete(0, tk.END)
+    refresh_objects_list()
+
+
+def open_object_detail_viewer(event=None):
+    """Pop up a window showing the double-clicked object's fixed +
+    freeform attributes AND every image logged against it — the
+    "click an object, see its images and attributes" view."""
+    selection = objects_listbox.curselection()
     if not selection:
         return
     idx = selection[0]
-    if idx >= len(_recent_sample_ids):
-        return  # clicked on a placeholder row like "(no samples yet)" or "Error: ..."
-    sample_id = _recent_sample_ids[idx]
-
-    if not _PIL_AVAILABLE:
-        messagebox.showwarning("Pillow Required", "Run: pip install Pillow")
-        return
+    if idx >= len(_recent_object_ids):
+        return  # clicked a placeholder row like "(no objects yet)" or "Error: ..."
+    object_id = _recent_object_ids[idx]
 
     viewer = tk.Toplevel(root)
-    viewer.title(f"Sample {sample_id}")
-    viewer.geometry("760x600")
-    loading_label = tk.Label(viewer, text="Loading images...", padx=20, pady=20)
+    viewer.title(f"Object {object_id}")
+    viewer.geometry("800x650")
+    loading_label = tk.Label(viewer, text="Loading...", padx=20, pady=20)
     loading_label.pack()
 
     def worker():
         try:
-            image_docs = mongo_client.get_images_for_sample(sample_id)
+            obj = mongo_client.get_object(object_id)
+            image_docs = mongo_client.get_images_for_object(object_id)
+            err = None
         except Exception as e:
-            err = str(e)
-            root.after(0, lambda: loading_label.config(
-                text=f"Could not load images for this sample:\n{err}"))
-            return
+            obj, image_docs, err = None, None, str(e)
 
         def build_ui():
             loading_label.destroy()
+            if err is not None:
+                tk.Label(viewer, text=f"Could not load object:\n{err}",
+                         fg="red", padx=20, pady=20).pack()
+                return
+
+            # --- Attributes panel (fixed columns + freeform "why") ---
+            attrs_frame = tk.LabelFrame(viewer, text=" Attributes ", padx=8, pady=8)
+            attrs_frame.pack(fill=tk.X, padx=10, pady=(10, 4))
+            data = (obj or {}).get("data") or {}
+            labels = attribute_schema.display_labels()
+            for key in attribute_schema.fixed_column_keys():
+                value = data.get(key)
+                if value in (None, ""):
+                    continue  # never attempted / not applicable — omit the row entirely
+                row = tk.Frame(attrs_frame)
+                row.pack(fill=tk.X)
+                tk.Label(row, text=f"{labels.get(key, key)}:", font=("Arial", 9, "bold"),
+                         width=14, anchor="w").pack(side=tk.LEFT)
+                is_unknown = (value == attribute_schema.UNKNOWN)
+                tk.Label(
+                    row, text=str(value), anchor="w",
+                    fg="gray" if is_unknown else "black",
+                    font=("Arial", 9, "italic") if is_unknown else ("Arial", 9),
+                ).pack(side=tk.LEFT)
+            freeform = data.get(attribute_schema.freeform_key()) or {}
+            if freeform:
+                tk.Label(attrs_frame, text="Freeform (why):", font=("Arial", 9, "bold"),
+                         anchor="w").pack(fill=tk.X, pady=(6, 0))
+                tk.Label(attrs_frame, text=json.dumps(freeform, indent=2),
+                         justify=tk.LEFT, anchor="w", fg="gray",
+                         font=("Courier", 8)).pack(fill=tk.X)
+
+            # --- Images panel ---
             if not image_docs:
-                tk.Label(viewer, text="No images found for this sample.",
-                         padx=20, pady=20).pack()
+                tk.Label(viewer, text="No images found for this object.",
+                         padx=20, pady=10).pack()
+                return
+            if not _PIL_AVAILABLE:
+                tk.Label(viewer, text="Install Pillow to view images: pip install Pillow",
+                         fg="red", padx=20, pady=10).pack()
                 return
 
             canvas_frame = tk.Frame(viewer)
@@ -2657,20 +2854,265 @@ def open_sample_photo_viewer(event=None):
     threading.Thread(target=worker, daemon=True).start()
 
 
-recent_samples_listbox.bind("<Double-Button-1>", open_sample_photo_viewer)
+objects_listbox.bind("<Double-Button-1>", open_object_detail_viewer)
+obj_buttons_frame = tk.Frame(tab_objects_log)
+obj_buttons_frame.pack(anchor=tk.W, pady=4)
+tk.Button(obj_buttons_frame, text="Apply Filters", command=refresh_objects_list,
+          bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(obj_buttons_frame, text="Clear Filters", command=clear_object_filters
+          ).pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(obj_buttons_frame, text="Refresh", command=refresh_objects_list,
+          bg="lightblue").pack(side=tk.LEFT)
+_populate_object_filter_dropdowns()
 
-tk.Button(mongo_btn_row, text="Refresh", command=refresh_recent_samples,
+# ---- Images sub-tab ---------------------------------------------------
+tk.Label(tab_images_log,
+         text="Recent photos (newest first, across all objects):").pack(anchor=tk.W, pady=(4, 0))
+
+# Standard (non-NLP) filter bar for the Images view. "Captured today
+# only" is the literal "photos taken today" example query — checking it
+# calls mongo_client.find_images({"session_id": session_manager.today_session_id()}),
+# the same session_id pattern find_images()'s own docstring recommends
+# over a raw captured_at datetime range for whole-day queries.
+img_filter_frame = tk.Frame(tab_images_log)
+img_filter_frame.pack(fill=tk.X, pady=(2, 0))
+
+tk.Label(img_filter_frame, text="Source:").pack(side=tk.LEFT)
+img_filter_source = ttk.Combobox(img_filter_frame, width=12, state="readonly")
+img_filter_source.pack(side=tk.LEFT, padx=(2, 8))
+
+img_filter_today_only = tk.BooleanVar(value=False)
+tk.Checkbutton(img_filter_frame, text="Captured today only",
+               variable=img_filter_today_only).pack(side=tk.LEFT, padx=(0, 8))
+
+# ---- Advanced Query: raw MongoDB filter syntax — same safety model as
+# the Objects tab's Advanced Query box (see its comment for details).
+img_adv_query_frame = tk.Frame(tab_images_log)
+img_adv_query_frame.pack(fill=tk.X, pady=(2, 0))
+tk.Label(img_adv_query_frame, text="Advanced Query (MongoDB filter, JSON):").pack(anchor=tk.W)
+img_adv_query_entry = tk.Entry(img_adv_query_frame, width=90)
+img_adv_query_entry.pack(side=tk.LEFT, fill=tk.X, expand=1, padx=(0, 4))
+tk.Label(tab_images_log,
+         text='Fields: source, view_index, object_id, session_id, captured_at. '
+              'Operators: $eq $ne $gt $gte $lt $lte $in $nin $and $or $nor $not $regex $exists. '
+              'Example: {"view_index": {"$gte": 3}}',
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT
+         ).pack(anchor=tk.W, padx=2)
+
+images_listbox = tk.Listbox(tab_images_log, height=12)
+images_listbox.pack(fill=tk.BOTH, expand=1, pady=4)
+
+
+def _populate_image_filter_dropdown():
+    def worker():
+        try:
+            sources = mongo_client.distinct_image_sources()
+        except Exception:
+            sources = []
+
+        def apply():
+            img_filter_source["values"] = ["(any)"] + sources
+            img_filter_source.set("(any)")
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _build_image_filter() -> dict:
+    """Same safety rule as _build_object_filter(): only known,
+    hardcoded field names go into the filter from the dropdowns — the
+    Advanced Query box's free-form JSON is parsed and passed through
+    query_safety.validate_filter() before being merged in, same as the
+    Objects tab (see _build_object_filter()'s docstring for details)."""
+    mongo_filter = {}
+    source = img_filter_source.get()
+    if source and source != "(any)":
+        mongo_filter["source"] = source
+    if img_filter_today_only.get():
+        # DEMO QUERY — "photos taken today":
+        mongo_filter["session_id"] = session_manager.today_session_id()
+
+    advanced_text = img_adv_query_entry.get().strip()
+    if advanced_text:
+        try:
+            advanced_filter = json.loads(advanced_text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Advanced Query isn't valid JSON: {e}")
+        query_safety.validate_filter(advanced_filter)
+        mongo_filter.update(advanced_filter)
+
+    return mongo_filter
+
+
+def refresh_images_list():
+    def worker():
+        err = None
+        try:
+            mongo_filter = _build_image_filter()
+            if mongo_filter:
+                images = mongo_client.find_images(mongo_filter, limit=200)
+            else:
+                images = mongo_client.list_recent_images(limit=30)
+        except Exception as e:
+            images, err = None, str(e)
+
+        def apply():
+            images_listbox.delete(0, tk.END)
+            if images is None:
+                images_listbox.insert(tk.END, f"Error: {err}")
+                return
+            if not images:
+                images_listbox.insert(tk.END, "(no images match this filter)")
+                return
+            for i in images:
+                when = str(i.get("captured_at", ""))
+                images_listbox.insert(
+                    tk.END,
+                    f"{when}  |  {i.get('source', '?')}  |  view {i.get('view_index', '?')}"
+                    f"  |  object {i.get('object_id', '?')}"
+                )
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def clear_image_filters():
+    img_filter_source.set("(any)")
+    img_filter_today_only.set(False)
+    img_adv_query_entry.delete(0, tk.END)
+    refresh_images_list()
+
+
+img_buttons_frame = tk.Frame(tab_images_log)
+img_buttons_frame.pack(anchor=tk.W, pady=4)
+tk.Button(img_buttons_frame, text="Apply Filters", command=refresh_images_list,
+          bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(img_buttons_frame, text="Clear Filters", command=clear_image_filters
+          ).pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(img_buttons_frame, text="Refresh", command=refresh_images_list,
+          bg="lightblue").pack(side=tk.LEFT)
+_populate_image_filter_dropdown()
+
+# ---- Inventory sub-tab (object_catalog — distinct known objects) -----
+tk.Label(tab_inventory,
+         text="Distinct known objects (auto-matched by name — see "
+              "vision/storage/object_catalog.py), most recently seen first:"
+         ).pack(anchor=tk.W, pady=(4, 0))
+inventory_listbox = tk.Listbox(tab_inventory, height=12)
+inventory_listbox.pack(fill=tk.BOTH, expand=1, pady=4)
+
+
+def refresh_inventory_list():
+    def worker():
+        err = None
+        try:
+            entries = object_catalog.list_inventory(limit=100)
+        except Exception as e:
+            entries, err = None, str(e)
+
+        def apply():
+            inventory_listbox.delete(0, tk.END)
+            if entries is None:
+                inventory_listbox.insert(tk.END, f"Error: {err}")
+                return
+            if not entries:
+                inventory_listbox.insert(tk.END, "(no distinct objects catalogued yet)")
+                return
+            for e in entries:
+                inventory_listbox.insert(
+                    tk.END,
+                    f"{e.get('name', '?')}  |  seen {e.get('times_seen', 0)}x  |  "
+                    f"last {e.get('last_seen', '?')}  |  {e.get('category', '')}"
+                )
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(tab_inventory, text="Refresh", command=refresh_inventory_list,
+          bg="lightblue").pack(anchor=tk.W, pady=4)
+
+# Populate all three sub-tabs once at startup.
+refresh_objects_list()
+refresh_images_list()
+refresh_inventory_list()
+
+# =====================================================================
+# CSV / EXCEL — regenerated report + (mode-dependent) reconcile.
+# See vision/storage/csv_logger.py and vision/storage/excel_export.py.
+# Every capture always appends to the CSV log and (best-effort) refreshes
+# this report already — these buttons are for an on-demand full/manual
+# refresh, and for pulling hand-edited Excel values back into MongoDB.
+# =====================================================================
+excel_frame = tk.LabelFrame(tab_database, text=" CSV / Excel Report ", padx=10, pady=10)
+excel_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(excel_frame, text=f"Mode: {DATA_AUTHORITY_MODE}  "
+         f"({'MongoDB is authoritative; report is generated-only' if DATA_AUTHORITY_MODE == 'mongo' else 'hand-edit the Excel report, then Reconcile to push edits into MongoDB'})",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+excel_status_label = tk.Label(excel_frame, text="", fg="gray")
+excel_status_label.pack(anchor=tk.W, pady=(2, 4))
+
+excel_btn_row = tk.Frame(excel_frame)
+excel_btn_row.pack(fill=tk.X)
+
+
+def export_excel_report(session_only: bool = False):
+    excel_status_label.config(text="Exporting...", fg="gray")
+
+    def worker():
+        try:
+            from vision.storage import session_manager
+            sid = session_manager.today_session_id() if session_only else None
+            path = excel_export.build_report(session_id=sid)
+            msg, color = f"Report written to {path}", "green"
+        except Exception as e:
+            msg, color = f"Export failed: {e}", "red"
+        root.after(0, lambda: excel_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def reconcile_from_excel_gui():
+    excel_status_label.config(text="Reconciling...", fg="gray")
+
+    def worker():
+        try:
+            updated, warnings = excel_export.reconcile_from_excel()
+            msg = f"Reconciled {updated} row(s)."
+            if warnings:
+                msg += f" {len(warnings)} warning(s) — see console."
+                for w in warnings:
+                    print(f"[RECONCILE] {w}")
+            color = "green" if not warnings else "orange"
+        except Exception as e:
+            msg, color = f"Reconcile failed: {e}", "red"
+        root.after(0, lambda: excel_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(excel_btn_row, text="Export Today's Report", command=lambda: export_excel_report(True),
+          bg="lightblue").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(excel_btn_row, text="Export Full History", command=lambda: export_excel_report(False),
           bg="lightblue").pack(side=tk.LEFT, padx=4)
+if DATA_AUTHORITY_MODE == "excel":
+    tk.Button(excel_btn_row, text="Reconcile from Excel", command=reconcile_from_excel_gui,
+              bg="khaki").pack(side=tk.LEFT, padx=4)
 
 # =====================================================================
-# [TEMP] NATURAL-LANGUAGE QUERY (DeepSeek via local Ollama)
-# See vision/services/deepseek_query.py's module docstring for why this
-# is temporary and what should replace it. Disabled automatically (not
-# just erroring on click) if Ollama isn't reachable or the configured
-# model isn't pulled, so the rest of the Database tab keeps working
-# with zero dependency on this being set up.
+# ASK (optional secondary NL layer — langchain-mongodb agent via local
+# Ollama). See vision/services/mongo_nlp_agent.py's module docstring for
+# why this is secondary and what it needs. Disabled automatically (not
+# just erroring on click) if Ollama/the toolkit aren't available, so the
+# rest of the Database tab keeps working with zero dependency on this
+# being set up.
 # =====================================================================
-nl_query_frame = tk.LabelFrame(tab_database, text=" Ask (local AI, temporary) ", padx=10, pady=10)
+nl_query_frame = tk.LabelFrame(tab_database, text=" Ask (optional local AI) ", padx=10, pady=10)
 nl_query_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
 nl_query_status_label = tk.Label(nl_query_frame, text="Checking local AI availability...", fg="gray")
@@ -2686,30 +3128,20 @@ nl_query_entry.pack(side=tk.LEFT, fill=tk.X, expand=1, padx=4)
 nl_query_ask_btn = tk.Button(nl_query_input_row, text="Ask", state=tk.DISABLED)
 nl_query_ask_btn.pack(side=tk.LEFT, padx=(4, 0))
 
-nl_query_fields_row = tk.Frame(nl_query_frame)
-nl_query_fields_row.pack(fill=tk.X, pady=(2, 2))
-
-tk.Label(nl_query_fields_row, text="Fields to sample from recent docs:").pack(side=tk.LEFT)
-nl_query_field_sample_var = tk.StringVar(value=str(NL_QUERY_FIELD_SAMPLE_SIZE))
-tk.Entry(nl_query_fields_row, textvariable=nl_query_field_sample_var, width=6).pack(side=tk.LEFT, padx=4)
-tk.Label(nl_query_fields_row, text="(how many recent samples to scan for known field names)",
-         fg="gray", font=("Arial", 8)).pack(side=tk.LEFT)
-
-nl_query_filter_label = tk.Label(nl_query_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
-nl_query_filter_label.pack(anchor=tk.W, pady=(4, 0))
+nl_query_answer_label = tk.Label(nl_query_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+nl_query_answer_label.pack(anchor=tk.W, pady=(4, 0))
 
 
 def _check_nl_query_availability():
     """Runs once at startup (and can be re-run manually) to enable/
-    disable the Ask button based on whether Ollama + the configured
-    model are actually available. Never crashes the GUI — worst case
-    the feature just stays disabled with an explanatory error."""
+    disable the Ask button based on whether Ollama + the langchain-
+    mongodb toolkit are actually available. Never crashes the GUI —
+    worst case the feature just stays disabled with an explanatory
+    error, while standard MongoDB browsing above keeps working."""
     def worker():
         try:
-            deepseek_query.check_ollama_available(OLLAMA_MODEL)
-            msg, color, enabled = f"Local AI ready ({OLLAMA_MODEL})", "green", tk.NORMAL
-        except deepseek_query.DeepSeekQueryError as e:
-            msg, color, enabled = f"Local AI unavailable — disabled: {e}", "red", tk.DISABLED
+            mongo_nlp_agent.check_agent_available(NLP_AGENT_MODEL)
+            msg, color, enabled = f"Local AI ready ({NLP_AGENT_MODEL})", "green", tk.NORMAL
         except Exception as e:
             msg, color, enabled = f"Local AI unavailable — disabled: {e}", "red", tk.DISABLED
 
@@ -2723,52 +3155,33 @@ def _check_nl_query_availability():
 
 
 def run_nl_query_from_gui():
-    """Runs the NL question through vision.services.deepseek_query and
-    reuses the existing recent-samples listbox + double-click photo
-    viewer to show results — no separate results UI needed."""
+    """Runs the NL question through the langchain-mongodb agent
+    (vision.services.mongo_nlp_agent) and shows its answer text. Unlike
+    the old deepseek_query layer, this doesn't repopulate the Objects
+    listbox — the agent's generate -> validate -> execute steps and
+    result are summarized in its own answer instead."""
     question = nl_query_entry.get().strip()
     if not question:
         return
 
-    try:
-        field_sample_size = int(nl_query_field_sample_var.get())
-    except ValueError:
-        field_sample_size = NL_QUERY_FIELD_SAMPLE_SIZE
-
     nl_query_ask_btn.config(state=tk.DISABLED)
-    nl_query_filter_label.config(text="Thinking...", fg="gray")
+    nl_query_answer_label.config(text="Thinking...", fg="gray")
 
     def worker():
         try:
-            samples, mongo_filter = deepseek_query.run_nl_query(
-                question, field_sample_size=field_sample_size, model=OLLAMA_MODEL
-            )
+            answer = mongo_nlp_agent.ask(question, model=NLP_AGENT_MODEL)
             err = None
-        except deepseek_query.DeepSeekQueryError as e:
-            samples, mongo_filter, err = None, None, str(e)
+        except mongo_nlp_agent.MongoNLPAgentError as e:
+            answer, err = None, str(e)
         except Exception as e:
-            samples, mongo_filter, err = None, None, str(e)
+            answer, err = None, str(e)
 
         def apply():
             nl_query_ask_btn.config(state=tk.NORMAL)
-
             if err is not None:
-                nl_query_filter_label.config(text=f"Couldn't run that query: {err}", fg="red")
-                return
-
-            nl_query_filter_label.config(text=f"Filter used: {json.dumps(mongo_filter)}", fg="gray")
-
-            recent_samples_listbox.delete(0, tk.END)
-            _recent_sample_ids.clear()
-            if not samples:
-                recent_samples_listbox.insert(tk.END, "(no matching samples)")
-                return
-            for s in samples:
-                sid = s.get("_id", "?")
-                sdate = s.get("date", "?")
-                label = (s.get("data") or {}).get("predicted_label", "")
-                recent_samples_listbox.insert(tk.END, f"{sdate}  |  {label}  |  {sid}")
-                _recent_sample_ids.append(sid)
+                nl_query_answer_label.config(text=f"Couldn't run that query: {err}", fg="red")
+            else:
+                nl_query_answer_label.config(text=answer, fg="black")
 
         root.after(0, apply)
 
@@ -2779,6 +3192,443 @@ nl_query_ask_btn.config(command=run_nl_query_from_gui)
 nl_query_entry.bind("<Return>", lambda event: run_nl_query_from_gui())
 
 _check_nl_query_availability()
+
+# =====================================================================
+# DATA COLLECTION TAB — "pick up an object, rotate it via J4, take N
+# photos, log ONE object with all N images." Works in three
+# control_mode_var states:
+#   - "physical_manual" / "demo": this machine drives the arm + camera
+#     directly (mirrors the proven run_automatic_capture_sequence loop
+#     a few hundred lines up, but logs through capture_pipeline.
+#     record_capture() once at the end instead of the old 4DAI REST
+#     submission flow that function still uses).
+#   - "middleman_other" (Remote Control): this machine has no local arm/
+#     camera. It drives J4 moves and requests captures over MQTT via
+#     other_side_controller, coordinating the async photo bundles with
+#     vision.services.rotation_coordinator so all N views land under
+#     ONE object, then calls record_capture() itself once done — this
+#     machine's Mongo/CSV/Excel is authoritative either way, matching
+#     "the controller still has all of this work, and Excel is used
+#     for data collection there."
+#   - "middleman_physical" (Robot Side): this machine's arm/camera are
+#     being driven remotely — the Start button here is refused with an
+#     explanatory message, since starting a second, locally-initiated
+#     sequence at the same time as a remote-driven one would fight over
+#     the same hardware.
+# =====================================================================
+tk.Label(tab_data_collection,
+         text="Pick up an object (Arm tab), then rotate + photograph it here to "
+              "log it as one object with multiple views.",
+         font=("Arial", 10, "bold"), wraplength=680, justify=tk.LEFT
+         ).pack(anchor=tk.W, padx=10, pady=(10, 4))
+
+dc_mode_note_label = tk.Label(tab_data_collection, text="", wraplength=680, justify=tk.LEFT)
+dc_mode_note_label.pack(anchor=tk.W, padx=10)
+
+# ---- Object metadata (what we know before a real classifier exists) ----
+dc_meta_frame = tk.LabelFrame(tab_data_collection, text=" Object Info ", padx=10, pady=10)
+dc_meta_frame.pack(fill=tk.X, padx=10, pady=(8, 4))
+
+tk.Label(dc_meta_frame, text="Name (required):").grid(row=0, column=0, sticky=tk.W, pady=2)
+dc_name_entry = tk.Entry(dc_meta_frame, width=24)
+dc_name_entry.grid(row=0, column=1, sticky=tk.W, padx=(4, 20))
+
+tk.Label(dc_meta_frame, text="Category:").grid(row=0, column=2, sticky=tk.W, pady=2)
+dc_category_entry = tk.Entry(dc_meta_frame, width=16)
+dc_category_entry.grid(row=0, column=3, sticky=tk.W, padx=4)
+
+tk.Label(dc_meta_frame, text="Color:").grid(row=1, column=0, sticky=tk.W, pady=2)
+dc_color_entry = tk.Entry(dc_meta_frame, width=24)
+dc_color_entry.grid(row=1, column=1, sticky=tk.W, padx=(4, 20))
+
+tk.Label(dc_meta_frame, text="Size:").grid(row=1, column=2, sticky=tk.W, pady=2)
+dc_size_entry = tk.Entry(dc_meta_frame, width=16)
+dc_size_entry.grid(row=1, column=3, sticky=tk.W, padx=4)
+
+tk.Label(dc_meta_frame,
+         text="Leave any of these blank if unknown for now — a classifier can fill "
+              "them in later (see vision/model/classifier.py). Position and any "
+              "other fixed columns can be set/edited afterward on the Database tab.",
+         fg="gray", font=("Arial", 8), wraplength=640, justify=tk.LEFT
+         ).grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(4, 0))
+
+# ---- Rotation sequence controls ----
+dc_sweep_frame = tk.LabelFrame(tab_data_collection, text=" Rotation Sweep ", padx=10, pady=10)
+dc_sweep_frame.pack(fill=tk.X, padx=10, pady=4)
+
+tk.Label(dc_sweep_frame, text="Number of views:").grid(row=0, column=0, sticky=tk.W, pady=2)
+dc_num_views_entry = tk.Entry(dc_sweep_frame, width=6)
+dc_num_views_entry.insert(0, str(NUM_VIEWS))
+dc_num_views_entry.grid(row=0, column=1, sticky=tk.W, padx=(4, 20))
+
+tk.Label(dc_sweep_frame, text="Degrees per step:").grid(row=0, column=2, sticky=tk.W, pady=2)
+dc_degrees_entry = tk.Entry(dc_sweep_frame, width=8)
+dc_degrees_entry.insert(0, str(round(360.0 / NUM_VIEWS, 1)))
+dc_degrees_entry.grid(row=0, column=3, sticky=tk.W, padx=4)
+
+tk.Label(dc_sweep_frame, text="Settle time (s):").grid(row=1, column=0, sticky=tk.W, pady=2)
+dc_interval_entry = tk.Entry(dc_sweep_frame, width=6)
+dc_interval_entry.insert(0, str(VIEW_SETTLE_SECONDS))
+dc_interval_entry.grid(row=1, column=1, sticky=tk.W, padx=(4, 20))
+
+dc_status_label = tk.Label(tab_data_collection, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+dc_status_label.pack(anchor=tk.W, padx=10, pady=(4, 0))
+
+dc_progress = ttk.Progressbar(tab_data_collection, mode="determinate", length=300)
+dc_progress.pack(anchor=tk.W, padx=10, pady=(2, 4))
+
+dc_cancel_event = threading.Event()
+
+
+def _dc_set_status(text: str, color: str = "gray") -> None:
+    root.after(0, lambda: dc_status_label.config(text=text, fg=color))
+
+
+def _dc_set_progress(done: int, total: int) -> None:
+    def apply():
+        dc_progress["maximum"] = max(total, 1)
+        dc_progress["value"] = done
+    root.after(0, apply)
+
+
+def _dc_finish_ui(refresh: bool = True) -> None:
+    def apply():
+        dc_start_btn.config(state=tk.NORMAL)
+        dc_cancel_btn.config(state=tk.DISABLED)
+        if refresh:
+            try:
+                refresh_objects_list()
+                refresh_images_list()
+                refresh_inventory_list()
+                refresh_dc_today_list()
+            except NameError:
+                pass  # Database tab / this tab's own list not built yet — harmless
+    root.after(0, apply)
+
+
+def run_data_collection_rotation_local(name, category, color, size,
+                                        num_views, degrees_per_step, interval_seconds):
+    """Local-camera version — this machine drives the arm (if connected;
+    DEMO MODE otherwise) and its own configured camera(s) directly.
+    Mirrors run_automatic_capture_sequence's proven move+capture loop
+    (same base-joint/hard-deck handling), but logs through
+    capture_pipeline.record_capture() once at the end — ONE object,
+    num_views * num_cameras images — instead of the old 4DAI REST
+    submission flow that function still uses."""
+    all_pairs = []  # list of (source, path) — see record_capture()'s docstring
+                     # for why this must be a list, not a dict, once the same
+                     # camera contributes more than one image (every view here).
+    object_id = None
+    try:
+        base_joints = list(robot_data["joints"]) if robot_data["joints"] else [0.0, 0.0, 200.0, 0.0]
+        base_j1, base_j2, base_z, base_j4 = (base_joints + [0.0, 0.0, 200.0, 0.0])[:4]
+        hard_deck_error = _hard_deck_violation(base_z, "Data Collection rotation sequence")
+        if hard_deck_error:
+            raise RuntimeError(hard_deck_error)
+
+        cameras_to_use = list_configured_cameras()
+        failed_cameras = set()
+        sample_id = new_sample_id()  # just a disk-folder id (images/<id>/) — unrelated
+                                      # to the Mongo object_id record_capture() mints below
+
+        for i in range(num_views):
+            if dc_cancel_event.is_set():
+                raise RuntimeError("Cancelled by user.")
+
+            j4_target = base_j4 + (i * degrees_per_step)
+            if ROBOT_CONNECTED and robot:
+                move_error = robot.movement.joint_to_joint_move([base_j1, base_j2, base_z, j4_target])
+                if move_error is not None:
+                    raise RuntimeError(f"Move failed at view {i + 1}: {move_error}")
+                robot.movement.sync()
+                sync_manual_position_from_feedback("data collection rotation step")
+            else:
+                print(f"DEMO MODE: rotating to J4={j4_target:.1f} deg (view {i + 1}/{num_views})")
+
+            sleep(interval_seconds)
+
+            _dc_set_status(f"View {i + 1}/{num_views}: capturing...")
+            captured_this_step = False
+            for camera_name in list(cameras_to_use):
+                if camera_name in failed_cameras:
+                    continue
+                try:
+                    frame = capture_frame(camera_name)
+                except (RuntimeError, ImportError) as e:
+                    print(f"[DATA COLLECTION] '{camera_name}' unavailable: {e}")
+                    failed_cameras.add(camera_name)
+                    continue
+                path = save_image(frame, sample_id, camera_name, i)
+                all_pairs.append((camera_name, path))
+                captured_this_step = True
+
+            if not captured_this_step:
+                print(f"[DATA COLLECTION WARNING] No camera produced a frame for view {i + 1}")
+            _dc_set_progress(i + 1, num_views)
+
+        if not all_pairs:
+            raise RuntimeError("Rotation sequence produced zero images — check camera connections.")
+
+        object_id, warnings = record_capture(
+            name=name, image_paths_by_source=all_pairs,
+            category=category or None, color=color or None, size=size or None,
+        )
+        for w in warnings:
+            print(f"[DATA COLLECTION] {w}")
+        _dc_set_status(
+            f"Done — object {object_id}, {len(all_pairs)} image(s) recorded."
+            + (f" ({len(warnings)} warning(s), see console)" if warnings else ""),
+            "green" if not warnings else "orange")
+
+    except Exception as e:
+        _dc_set_status(f"Rotation sequence failed: {e}", "red")
+    finally:
+        _dc_finish_ui()
+    return object_id
+
+
+def run_data_collection_rotation_remote(name, category, color, size,
+                                         num_views, degrees_per_step, interval_seconds):
+    """Middleman 'Other Side' (Remote Control) version — no local arm/
+    camera. Drives J4 via other_side_controller.send_move() and
+    requests each view's photo via request_capture(object_id=...),
+    coordinating the async bundles with rotation_coordinator so all
+    num_views land under ONE shared object. THIS machine still owns
+    Mongo/CSV/Excel — record_capture() is called here, once, after
+    every view arrives, regardless of which machine's camera actually
+    took the photos."""
+    if other_side_controller is None or not other_side_controller.is_active_controller():
+        _dc_set_status(
+            "Not the active controller on the connected Robot Side — connect and wait "
+            "for 'You are the ACTIVE controller' on the Arm tab first.", "red")
+        _dc_finish_ui(refresh=False)
+        return None
+
+    object_id = str(uuid.uuid4())
+    rotation_coordinator.begin_sequence(object_id)
+    all_pairs = []
+    try:
+        for i in range(num_views):
+            if dc_cancel_event.is_set():
+                raise RuntimeError("Cancelled by user.")
+
+            j4_target = i * degrees_per_step  # absolute targets built up from 0 — Remote
+                                               # Control mode has no reliable "current J4"
+                                               # to add a delta to the way local mode does
+            if not other_side_controller.send_move({"j4": j4_target}):
+                raise RuntimeError(f"Move command for view {i + 1} was refused/blocked "
+                                    f"(not active controller, or Robot Side rejected it).")
+            sleep(interval_seconds)
+
+            _dc_set_status(f"View {i + 1}/{num_views}: requesting capture...")
+            if not other_side_controller.request_capture(object_id=object_id, view_index=i):
+                raise RuntimeError(f"Capture request for view {i + 1} was refused/blocked.")
+
+            paths = rotation_coordinator.wait_for_view(object_id, timeout=15.0)
+            for source, path in paths.items():
+                all_pairs.append((source, path))
+            _dc_set_progress(i + 1, num_views)
+
+        if not all_pairs:
+            raise RuntimeError("Rotation sequence produced zero images — check the Robot Side's camera.")
+
+        recorded_id, warnings = record_capture(
+            name=name, image_paths_by_source=all_pairs,
+            category=category or None, color=color or None, size=size or None,
+        )
+        for w in warnings:
+            print(f"[DATA COLLECTION] {w}")
+        _dc_set_status(
+            f"Done — object {recorded_id}, {len(all_pairs)} image(s) recorded via Remote Control."
+            + (f" ({len(warnings)} warning(s), see console)" if warnings else ""),
+            "green" if not warnings else "orange")
+        object_id = recorded_id
+
+    except Exception as e:
+        _dc_set_status(f"Rotation sequence failed: {e}", "red")
+    finally:
+        rotation_coordinator.end_sequence(object_id)
+        _dc_finish_ui()
+    return object_id
+
+
+def start_data_collection_sequence():
+    name = dc_name_entry.get().strip()
+    if not name:
+        messagebox.showerror("Name required", "Enter an object name before starting a rotation sequence.")
+        return
+    category = dc_category_entry.get().strip()
+    color = dc_color_entry.get().strip()
+    size = dc_size_entry.get().strip()
+
+    try:
+        num_views = int(dc_num_views_entry.get().strip())
+        degrees_per_step = float(dc_degrees_entry.get().strip())
+        interval_seconds = float(dc_interval_entry.get().strip())
+        if num_views < 1:
+            raise ValueError("Number of views must be at least 1.")
+    except ValueError as e:
+        messagebox.showerror("Invalid input", f"Check the rotation sweep fields: {e}")
+        return
+
+    mode = control_mode_var.get()
+    if mode == "middleman_physical":
+        messagebox.showerror(
+            "Driven remotely",
+            "This machine's arm/camera are in 'Middleman (Robot Side)' mode — a "
+            "connected Remote Control machine drives rotation sequences here. Use "
+            "the Data Collection tab on THAT machine instead.")
+        return
+
+    if not try_start_arm_operation("a Data Collection rotation sequence"):
+        return
+    runner = run_data_collection_rotation_remote if mode == "middleman_other" \
+        else run_data_collection_rotation_local
+
+    dc_cancel_event.clear()
+    dc_start_btn.config(state=tk.DISABLED)
+    dc_cancel_btn.config(state=tk.NORMAL)
+    _dc_set_progress(0, num_views)
+    _dc_set_status("Starting rotation sequence...")
+
+    def worker():
+        try:
+            runner(name, category, color, size, num_views, degrees_per_step, interval_seconds)
+        finally:
+            finish_arm_operation()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def cancel_data_collection_sequence():
+    dc_cancel_event.set()
+    dc_status_label.config(text="Cancelling...", fg="orange")
+
+
+def _dc_update_mode_note(*_args):
+    mode = control_mode_var.get()
+    if mode == "middleman_physical":
+        dc_mode_note_label.config(
+            text="This machine is the Robot Side — rotation sequences here are driven "
+                 "by the connected Remote Control machine, not by this Start button.",
+            fg="orange")
+    elif mode == "middleman_other":
+        dc_mode_note_label.config(
+            text="Remote Control mode — Start will drive the connected Robot Side's "
+                 "arm/camera over the network and record the result in THIS machine's "
+                 "Mongo/CSV/Excel.", fg="blue")
+    else:
+        dc_mode_note_label.config(
+            text="Local mode — this machine's own arm and camera(s) will be used directly.",
+            fg="gray")
+
+
+control_mode_var.trace_add("write", _dc_update_mode_note)
+_dc_update_mode_note()
+
+dc_btn_row = tk.Frame(tab_data_collection)
+dc_btn_row.pack(anchor=tk.W, padx=10, pady=(0, 4))
+dc_start_btn = tk.Button(dc_btn_row, text="Start Rotation Capture", bg="lightgreen",
+                          font=("Arial", 10, "bold"), command=start_data_collection_sequence)
+dc_start_btn.pack(side=tk.LEFT, padx=(0, 4))
+dc_cancel_btn = tk.Button(dc_btn_row, text="Cancel", bg="salmon", state=tk.DISABLED,
+                           command=cancel_data_collection_sequence)
+dc_cancel_btn.pack(side=tk.LEFT)
+
+# ---- "Photo collection can also be managed from there" — today's
+# captures, with a way to discard a bad one (e.g. arm bumped the object
+# mid-sweep) without leaving Mongo/CSV/Excel out of sync with each
+# other, which deleting through Excel or Mongo directly would risk. ----
+dc_manage_frame = tk.LabelFrame(tab_data_collection, text=" Today's Captures ", padx=10, pady=10)
+dc_manage_frame.pack(fill=tk.BOTH, expand=1, padx=10, pady=(8, 10))
+
+dc_today_listbox = tk.Listbox(dc_manage_frame, height=8)
+dc_today_listbox.pack(fill=tk.BOTH, expand=1)
+_dc_today_object_ids = []
+
+
+def refresh_dc_today_list():
+    def worker():
+        try:
+            objects = mongo_client.find_objects(
+                {"session_id": session_manager.today_session_id()}, limit=200)
+            err = None
+        except Exception as e:
+            objects, err = None, str(e)
+
+        def apply():
+            dc_today_listbox.delete(0, tk.END)
+            _dc_today_object_ids.clear()
+            if objects is None:
+                dc_today_listbox.insert(tk.END, f"Error: {err}")
+                return
+            if not objects:
+                dc_today_listbox.insert(tk.END, "(nothing captured yet today)")
+                return
+            for o in objects:
+                data = o.get("data") or {}
+                # There's no forward image_ids array on the object doc —
+                # images link back via their own object_id field, so
+                # counting them means asking the images side directly
+                # (get_images_for_object does the reverse lookup).
+                image_count = len(mongo_client.get_images_for_object(o.get("_id")))
+                dc_today_listbox.insert(
+                    tk.END,
+                    f"{data.get('name', '?')}  |  {data.get('category') or '(no category)'}  |  "
+                    f"{image_count} image(s)  |  {o.get('_id', '?')}")
+                _dc_today_object_ids.append(o.get("_id"))
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def delete_selected_dc_capture():
+    selection = dc_today_listbox.curselection()
+    if not selection:
+        return
+    idx = selection[0]
+    if idx >= len(_dc_today_object_ids):
+        return  # selected the "(nothing captured yet today)" / error placeholder row
+    object_id = _dc_today_object_ids[idx]
+    if not messagebox.askyesno(
+            "Delete capture",
+            f"Delete object {object_id} and its image records from MongoDB?\n\n"
+            f"This does NOT delete the image files from disk, and does NOT change the "
+            f"Inventory 'times seen' count — only the CSV log keeps a record that a "
+            f"capture happened at all."):
+        return
+
+    def worker():
+        try:
+            mongo_client.delete_object(object_id)
+            err = None
+        except Exception as e:
+            err = str(e)
+
+        def apply():
+            if err:
+                messagebox.showerror("Delete failed", err)
+            refresh_dc_today_list()
+            try:
+                refresh_objects_list()
+                refresh_images_list()
+            except NameError:
+                pass
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+dc_manage_btn_row = tk.Frame(dc_manage_frame)
+dc_manage_btn_row.pack(anchor=tk.W, pady=(4, 0))
+tk.Button(dc_manage_btn_row, text="Refresh", command=refresh_dc_today_list,
+          bg="lightblue").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(dc_manage_btn_row, text="Delete Selected", command=delete_selected_dc_capture,
+          bg="salmon").pack(side=tk.LEFT)
+
+refresh_dc_today_list()
 
 # Custom dialog for Z-value and claw state
 
@@ -3119,17 +3969,24 @@ def capture_photo_and_store():
             except Exception as e:
                 cam_errors[cam] = str(e)
 
+        # Routed through capture_pipeline.record_capture() — the SAME
+        # function the automatic pipeline (vision_service ->
+        # logger_service) uses — so a manual GUI capture and an
+        # automatic one are recorded identically: Mongo `objects`/
+        # `images` docs, catalog match/link, CSV append, Excel refresh.
+        # See vision/storage/capture_pipeline.py.
         mongo_ok = False
+        object_id = sample_id  # kept as the local var name used below/upload code
+        pipeline_warnings = []
         if saved_paths:
             try:
-                mongo_client.save_sample(sample_id, str(date.today()),
-                                          {"label": sample_label,
-                                           "predicted_label": sample_label,
-                                           "cameras": list(saved_paths.keys()),
-                                           "num_images": len(saved_paths)})
-                for cam, path in saved_paths.items():
-                    mongo_client.save_image_record(new_sample_id(), sample_id, path, cam, 0)
+                object_id, pipeline_warnings = record_capture(
+                    name=sample_label,
+                    image_paths_by_source=saved_paths,
+                )
                 mongo_ok = True
+                for w in pipeline_warnings:
+                    print(f"[CAPTURE_PIPELINE] {w}")
             except Exception as e:
                 print(f"[MONGO] Could not log capture locally: {e}")
 
@@ -3173,7 +4030,9 @@ def capture_photo_and_store():
             color = "green" if (mongo_ok or uploaded) else "orange"
             capture_status_label.config(text=" | ".join(parts), fg=color)
             try:
-                refresh_recent_samples()
+                refresh_objects_list()
+                refresh_images_list()
+                refresh_inventory_list()
             except NameError:
                 pass  # Database tab not built yet — harmless
         root.after(0, report)
@@ -4037,7 +4896,8 @@ root.bind("<KeyRelease-e>",   handle_jog_release)
 
 
 update_gui_from_feedback()
-refresh_recent_samples()
+refresh_objects_list()
+refresh_images_list()
 
 # Start listening for automatic-capture commands published by 4DAI (see
 # vision/config.py TOPIC_CAPTURE_COMMAND). This is what lets 4DAI's GUI

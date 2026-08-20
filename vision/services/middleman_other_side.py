@@ -40,7 +40,7 @@ from vision.config import (
     MIDDLEMAN_HEARTBEAT_INTERVAL_SECONDS,
     MIDDLEMAN_HEARTBEAT_TIMEOUT_SECONDS,
 )
-from vision.services import photo_transfer
+from vision.services import photo_transfer, rotation_coordinator
 
 
 def _require_paho():
@@ -158,8 +158,27 @@ class OtherSideController:
     def send_laser(self, channel, state: bool) -> bool:
         return self._send(MIDDLEMAN_LASER_TOPIC_TEMPLATE, {"channel": channel, "laser": state})
 
-    def request_capture(self) -> bool:
-        return self._send(MIDDLEMAN_CAPTURE_REQUEST_TOPIC_TEMPLATE, {})
+    def request_capture(self, object_id: str | None = None, view_index: int | None = None) -> bool:
+        """
+        object_id: if given, this capture is one step of a rotation
+        sequence — pass the SAME object_id on every step (see
+        rotation_coordinator.begin_sequence(), called by main.py's
+        rotation loop before the first request_capture()) so the
+        Physical Side echoes it back and this side's Other-Side
+        _handle_photo() routes the resulting bundle into that
+        sequence's queue instead of logging it as its own object.
+        Omit for an ad hoc single "Capture Now" press — that still
+        gets its own fresh object as before.
+        view_index: which step of the sequence this is, for logging/
+        ordering only — not required for correctness (bundles queue in
+        arrival order regardless).
+        """
+        payload = {}
+        if object_id is not None:
+            payload["object_id"] = object_id
+        if view_index is not None:
+            payload["view_index"] = view_index
+        return self._send(MIDDLEMAN_CAPTURE_REQUEST_TOPIC_TEMPLATE, payload)
 
     def _send(self, topic_template: str, payload: dict) -> bool:
         if self._connected_ip is None or not self.is_active_controller():
@@ -219,7 +238,19 @@ class OtherSideController:
 
     def _handle_photo(self, bundle: dict) -> None:
         try:
-            saved_paths = photo_transfer.save_photo_bundle(bundle)
+            if rotation_coordinator.on_bundle_received(bundle):
+                # Part of an active rotation sequence — the coordinator
+                # already wrote the files and queued them for whichever
+                # rotation loop is waiting in wait_for_view(); nothing
+                # gets logged to Mongo here (that happens once, at the
+                # end of the sequence, via record_capture()). Do NOT
+                # also fall through to the ad hoc single-capture path
+                # below, or this view would additionally become its own
+                # standalone object.
+                return
+            object_id, saved_paths, warnings = photo_transfer.save_photo_bundle(bundle)
+            for w in warnings:
+                self.on_log(f"[MIDDLEMAN] {w}")
         except Exception as e:
             self.on_log(f"[MIDDLEMAN] Failed to save received photo bundle: {e}")
             return

@@ -87,17 +87,17 @@ class RelayChannel:
 
 
 # ── THIS RIG'S PIN MAP ──────────────────────────────────────────────────────
-# Confirmed wiring for the 4 smaller (relay-switched) lasers: GPIO18, 19, 25,
-# 26. These are the SAME four GPIOs 3DAI's rig uses (lib_3dai/provision_relays.py)
-# and were bench-verified there as active-HIGH (POL HIGH + SAFE OFF actually
-# de-energizes the relay on this exact relay-module type). If this board uses
-# a different relay module, re-verify polarity before trusting SAFE OFF to
-# mean "off" — but this is the right starting point.
+# Order matches the GUI's Laser Channels rows EXACTLY (Ch1=25, Ch2=26,
+# Ch3=19, Ch4=18) so the channel NUMBER each pin is stored under agrees with
+# what the app sends. A stale/mismatched channel-to-pin mapping (e.g. pin 25
+# stored under a different channel number than the GUI's "Ch1" row expects)
+# is what causes ERR PIN_IN_USE even when the physical pins themselves are
+# correct -- this ordering removes that ambiguity going forward.
 RELAY_CHANNELS: list[RelayChannel] = [
-    RelayChannel(ch=1, pin=18, label="Laser 1 relay (active-HIGH)", active_high=True),
-    RelayChannel(ch=2, pin=19, label="Laser 2 relay (active-HIGH)", active_high=True),
-    RelayChannel(ch=3, pin=25, label="Laser 3 relay (active-HIGH)", active_high=True),
-    RelayChannel(ch=4, pin=26, label="Laser 4 relay (active-HIGH)", active_high=True),
+    RelayChannel(ch=1, pin=25, label="Laser 1 relay (active-HIGH)", active_high=True),
+    RelayChannel(ch=2, pin=26, label="Laser 2 relay (active-HIGH)", active_high=True),
+    RelayChannel(ch=3, pin=19, label="Laser 3 relay (active-HIGH)", active_high=True),
+    RelayChannel(ch=4, pin=18, label="Laser 4 relay (active-HIGH)", active_high=True),
 ]
 
 # The 5th laser: the bigger, PWM-dimmable laser, in addition to the 4
