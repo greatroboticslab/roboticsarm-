@@ -38,8 +38,7 @@ from vision.config import (
     CAMERA_FRAME_WIDTH,
     CAMERA_FRAME_HEIGHT,
 )
-
-IMAGES_ROOT = "images/objects"
+from vision.storage import storage_location
 
 # ---------------------------------------------------------------------------
 # RUNTIME CAMERA ASSIGNMENT
@@ -330,10 +329,41 @@ def new_sample_id() -> str:
 
 
 def ensure_sample_dir(sample_id: str) -> str:
-    """[WIRED] Helper - creates and returns the folder for a sample's images."""
-    path = os.path.join(IMAGES_ROOT, sample_id)
+    """[WIRED] Helper - creates and returns the folder for a sample's
+    images, under the configured permanent storage location (see
+    vision.storage.storage_location) rather than a path relative to
+    wherever the process happened to be launched from."""
+    path = os.path.join(storage_location.images_root(), sample_id)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def is_camera_available(camera_name: str) -> bool:
+    """
+    Best-effort probe: True if `camera_name` (one of
+    list_configured_cameras()'s keys) actually opens and returns a real
+    frame right now, False otherwise (unplugged, wrong index, already
+    held open by another program, etc.) — same underlying check
+    _open_camera() uses for a real capture, just released immediately
+    afterward rather than cached into _capture_handles, so probing
+    doesn't hold a handle open that would then need releasing before
+    the live feed or a real capture could use it.
+
+    Used by main.py's Camera tab to only build/show a live-feed panel
+    for cameras ACTUALLY connected right now, instead of one panel per
+    entry in vision.config.CAMERAS regardless of whether it's
+    physically plugged in — "if one camera's connected, show one
+    panel; if three are connected, show three."
+    """
+    _require_cv2()
+    configured = list_configured_cameras()
+    if camera_name not in configured:
+        return False
+    cap = _open_camera(configured[camera_name])
+    if cap is None:
+        return False
+    cap.release()
+    return True
 
 
 def list_camera_indices(max_index: int = 5):

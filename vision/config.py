@@ -101,14 +101,35 @@ MONGO_OBJECT_CATALOG_COLLECTION = "object_catalog"  # one doc per distinct known
 # vision/storage/attribute_schema.py for the loader/editor functions.
 ATTRIBUTE_SCHEMA_PATH = "vision/storage/attribute_schema.json"
 
-# Everything CSV/Excel writes lives under its own subfolder, separate from
-# the raw per-object image folders (IMAGES_ROOT below), so "give me the
-# spreadsheet(s)" and "give me the photos" are two clearly separate places.
+# DEPRECATED — DATA_LOGS_DIR/CSV_LOG_DIR/EXCEL_EXPORT_DIR/JSON_LOG_DIR/
+# JSON_EXPORT_DIR below are no longer read by anything. Directories are
+# now resolved through vision.storage.storage_location (a configurable
+# root persisted OUTSIDE the repo, in the user's home directory — see
+# that module's docstring for why: a path relative to the repo folder
+# meant deleting/replacing the repo silently orphaned all captured
+# data). Only the *_FILENAME constants below are still actually used
+# (storage_location's helpers supply the directory, these still supply
+# the filename within it). Left defined, unused, rather than deleted,
+# so nothing importing them at module load breaks.
 DATA_LOGS_DIR = "data_logs"
 CSV_LOG_DIR = "data_logs/csv"
 CSV_LOG_FILENAME = "captures_log.csv"          # single, ever-growing append log
 EXCEL_EXPORT_DIR = "data_logs/excel"
 EXCEL_EXPORT_FILENAME = "captures_report.xlsx"  # regenerated report (log + inventory sheets)
+
+# JSON mirrors of the above, written alongside them by
+# vision/storage/json_logger.py — same "always on, both modes" append
+# log as csv_logger, plus an on-demand regenerated full report (mirrors
+# excel_export.build_report), just as native JSON instead of a
+# spreadsheet/CSV row. Useful for anything that wants to read capture
+# metadata programmatically (a script, another service, etc.) without
+# parsing CSV or opening a locked .xlsx file.
+# JSON_LOG_DIR/JSON_EXPORT_DIR: DEPRECATED, same reasoning as above —
+# only JSON_LOG_FILENAME/JSON_EXPORT_FILENAME are still used.
+JSON_LOG_DIR = "data_logs/json"
+JSON_LOG_FILENAME = "captures_log.jsonl"        # append-only, one JSON object per line (JSON Lines)
+JSON_EXPORT_DIR = "data_logs/json"
+JSON_EXPORT_FILENAME = "captures_report.json"   # regenerated full report, one JSON array
 
 # DATA_AUTHORITY_MODE controls whether the Database tab offers "Reconcile
 # from Excel" (hand-edit the .xlsx, pull those edits back into MongoDB):

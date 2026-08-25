@@ -1,24 +1,76 @@
 {
-  "_comment": "Editable object-attribute table. Edit this file directly (or use vision.storage.attribute_schema's add/remove/rename helpers) to change what fixed columns exist in MongoDB documents, the CSV log, and the Excel report — no Python code changes needed anywhere else. 'reserved' columns exist so a new attribute can be assigned later without a schema migration (every existing row already has the field, just null until it's given meaning).",
-
+  "_comment": "Editable object-attribute table. Edit this file directly (or use vision.storage.attribute_schema's add/remove/rename helpers) to change what fixed columns exist in MongoDB documents, the CSV log, and the Excel report \u2014 no Python code changes needed anywhere else. 'reserved' columns exist so a new attribute can be assigned later without a schema migration (every existing row already has the field, just null until it's given meaning).",
   "fixed_columns": [
-    {"key": "name",     "label": "Name",     "type": "string", "default": null},
-    {"key": "category", "label": "Category", "type": "string", "default": null},
-    {"key": "color",    "label": "Color",    "type": "string", "default": null},
-    {"key": "size",     "label": "Size",     "type": "string", "default": null}
+    {
+      "key": "name",
+      "label": "Name",
+      "type": "string",
+      "default": null
+    },
+    {
+      "key": "category",
+      "label": "Category",
+      "type": "string",
+      "default": null
+    },
+    {
+      "key": "color",
+      "label": "Color",
+      "type": "string",
+      "default": null
+    },
+    {
+      "key": "size",
+      "label": "Size",
+      "type": "string",
+      "default": null
+    }
   ],
-
   "position_columns": [
-    {"key": "x", "label": "Position X", "type": "number", "default": null},
-    {"key": "y", "label": "Position Y", "type": "number", "default": null},
-    {"key": "z", "label": "Position Z", "type": "number", "default": null}
+    {
+      "key": "x",
+      "label": "Position X",
+      "type": "number",
+      "default": null
+    },
+    {
+      "key": "y",
+      "label": "Position Y",
+      "type": "number",
+      "default": null
+    },
+    {
+      "key": "z",
+      "label": "Position Z",
+      "type": "number",
+      "default": null
+    },
+    {
+      "key": "r",
+      "label": "Position R (rotation)",
+      "type": "number",
+      "default": null
+    }
   ],
-
   "reserved_columns": [
-    {"key": "reserved_1", "label": "Reserved 1", "type": "string", "default": null},
-    {"key": "reserved_2", "label": "Reserved 2", "type": "string", "default": null},
-    {"key": "reserved_3", "label": "Reserved 3", "type": "string", "default": null}
+    {
+      "key": "reserved_1",
+      "label": "Reserved 1",
+      "type": "string",
+      "default": null
+    },
+    {
+      "key": "reserved_2",
+      "label": "Reserved 2",
+      "type": "string",
+      "default": null
+    },
+    {
+      "key": "reserved_3",
+      "label": "Reserved 3",
+      "type": "string",
+      "default": null
+    }
   ],
-
   "freeform_key": "attributes"
 }

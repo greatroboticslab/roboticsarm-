@@ -3,6 +3,7 @@ import threading
 from time import sleep
 import time
 import os
+import shutil
 import json
 import re
 import uuid
@@ -17,6 +18,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from dobot_util import Dobot
 
 from vision.config import PHOTO_STATION, NUM_VIEWS, VIEW_SETTLE_SECONDS, LIVE_FEED_FPS
+from vision.config import JSON_LOG_DIR, JSON_LOG_FILENAME
 from vision.camera.capture import (
     capture_station_frame,
     capture_wrist_frame,
@@ -28,6 +30,7 @@ from vision.camera.capture import (
     assign_camera,
     remove_camera_assignment,
     list_camera_indices,
+    is_camera_available,
 )
 import requests
 from vision.config import (
@@ -38,7 +41,7 @@ from vision.config import (
 )
 from vision.messaging.publisher import publish_captured, publish_capture_status
 from vision.messaging.subscriber import subscribe
-from vision.storage import mongo_client, object_catalog, excel_export, attribute_schema, session_manager, query_safety, package_export
+from vision.storage import mongo_client, object_catalog, excel_export, json_logger, attribute_schema, session_manager, query_safety, package_export, storage_location
 from vision.storage.capture_pipeline import record_capture
 from vision.services import rotation_coordinator
 from vision.config import DATA_AUTHORITY_MODE
@@ -81,27 +84,56 @@ def resolve_image_path(path: str) -> str:
     Paths written from this session on are already absolute (see
     vision.camera.capture.save_image / vision.services.photo_transfer.
     save_photo_bundle_files), so this is normally a no-op. It exists for
-    two real situations that otherwise show up as a bare "No such file
-    or directory" with no indication of why:
-      1. Older data captured before that fix, where a RELATIVE path got
-         stored — which only ever resolved correctly if the app
-         happened to be launched from the exact same working directory
-         used at capture time. Retry it relative to this repo's own
-         root (where `images/` actually lives) before giving up.
-      2. The images/ folder itself got moved to a different machine or
-         a different location on this one (e.g. after using Export
-         Package + Import Package — see below) — nothing can fully
-         recover from that automatically, but the caller gets back the
-         best-guess path so the resulting error at least shows a path
-         that makes it obvious what to check.
+    situations that otherwise show up as a bare "No such file or
+    directory" with no indication of why:
+
+      1. The absolute path was baked in at capture time by a DIFFERENT
+         copy of this app than the one running right now — e.g. images
+         captured from a previous unzip/clone of this repo, or from
+         before vision.storage.storage_location existed, or the storage
+         location was reconfigured since. The path's images/... suffix
+         is usually still intact even though its prefix no longer
+         exists; re-anchor that suffix under the CURRENT storage
+         location (vision.storage.storage_location.get_storage_root())
+         and check there before giving up. This is the common case in
+         practice — it's what makes photos from an earlier session (or
+         an earlier delivered zip) keep working after re-extracting a
+         fresh copy of the app.
+      2. Genuinely old data with a RELATIVE path stored (pre-dates the
+         absolute-path fix entirely) — retry it relative to this repo's
+         own root as a last resort.
+      3. The images/ folder was moved to a different machine entirely
+         (e.g. after Export Package + Import Package elsewhere) —
+         nothing can fully recover from that automatically, but the
+         caller gets back the best-guess path so the resulting error at
+         least shows a path that makes it obvious what to check.
     """
     if os.path.isabs(path) and os.path.exists(path):
         return path
     if os.path.exists(path):
         return os.path.abspath(path)
+
+    # Case 1: re-anchor "images/..." under the CURRENT storage location.
+    # Handles both Windows (\) and POSIX (/) separators in the stored
+    # path, regardless of which platform captured it. The suffix after
+    # "images/" already starts with "objects"/"middleman"/"imported" —
+    # whichever of the three roots the image actually came from — so
+    # rejoining it under get_storage_root() + "images" handles all three
+    # in one shot rather than needing a separate branch per root.
+    normalized = path.replace("\\", "/")
+    marker = "/images/"
+    idx = normalized.rfind(marker)
+    if idx != -1:
+        suffix_parts = normalized[idx + len(marker):].split("/")
+        candidate = os.path.join(storage_location.get_storage_root(), "images", *suffix_parts)
+        if os.path.exists(candidate):
+            return candidate
+
+    # Case 2: legacy relative path, tried against this repo's own root.
     candidate = os.path.join(_REPO_ROOT, path)
     if os.path.exists(candidate):
         return candidate
+
     return path  # doesn't exist anywhere we know to look — let the caller's
                  # own error handling report exactly what was tried
 
@@ -192,6 +224,39 @@ robot_data = {
     
 }
 is_jogging = False
+
+
+def current_arm_position() -> dict | None:
+    """
+    Best-effort snapshot of the arm's live Cartesian pose, for stamping
+    onto a capture as its "position" attribute (position_x/y/z/r — see
+    vision.storage.attribute_schema and capture_pipeline.
+    build_object_data()). Returns None — which capture_pipeline then
+    stores as null, per column — whenever a real position genuinely
+    isn't available, rather than reporting a stale/meaningless [0,0,0,0]:
+
+      - the robot was never connected this run (ROBOT_CONNECTED False,
+        e.g. DEMO MODE or the Remote Control side of a middleman split,
+        which has no local arm at all), or
+      - feedback_loop() hasn't received its first Port 30004 packet yet
+        (robot_data["cartesian"] still at its untouched startup default).
+
+    Called right at the moment a capture is being recorded (see
+    run_manual_snapshot() and run_data_collection_rotation_local()) so
+    the stored position reflects wherever the arm actually was for that
+    specific photo/sequence, not wherever it ends up afterward.
+    """
+    if not ROBOT_CONNECTED:
+        return None
+    cartesian = robot_data.get("cartesian")
+    if not cartesian or len(cartesian) < 3:
+        return None
+    if cartesian == [0.0, 0.0, 0.0, 0.0]:
+        return None  # indistinguishable from "no packet received yet" — treat as unavailable
+    x, y, z = cartesian[0], cartesian[1], cartesian[2]
+    r = cartesian[3] if len(cartesian) > 3 else None
+    return {"x": x, "y": y, "z": z, "r": r}
+
 
 def feedback_loop(robot_inst):
     """Thread function to constantly read Port 30004."""
@@ -698,13 +763,98 @@ _tab_style.map("TNotebook.Tab",
                background=[("selected", "#4a90d9"), ("!selected", "#d9d9d9")],
                foreground=[("selected", "white"), ("!selected", "black")])
 
-tab_arm = tk.Frame(notebook)
-tab_virtual = tk.Frame(notebook)
-tab_camera = tk.Frame(notebook)
-tab_laser = tk.Frame(notebook)
-tab_server = tk.Frame(notebook)
-tab_database = tk.Frame(notebook)
-tab_data_collection = tk.Frame(notebook)
+def make_scrollable_tab(page: tk.Frame) -> tk.Frame:
+    """
+    Wraps a notebook page in a canvas + BOTH scrollbars (vertical for
+    tabs that have grown taller than the window, horizontal for wide
+    rows — e.g. the Cleanup/Merge forms' side-by-side fields) and
+    returns an inner Frame to actually build tab content in.
+
+    Every `tab_xxx` variable is reassigned to this inner frame (not the
+    raw notebook page — see right after this function's call sites
+    below) so every existing `tk.Whatever(tab_xxx, ...)` call site
+    elsewhere in this file automatically becomes scrollable with zero
+    other changes needed; the notebook page itself (`tab_xxx_page`) is
+    still what gets passed to notebook.add()/notebook.select(), since
+    those need the actual registered tab widget, not its inner content
+    frame.
+
+    The inner frame's width AND height each track whichever is LARGER —
+    the visible canvas dimension, or the content's own natural size —
+    so a tab whose content comfortably fits still looks normal
+    (children packed with fill=tk.BOTH/expand=1 stretch to fill the
+    full visible area, same as before this wrapper existed — this is
+    what keeps e.g. the Camera tab's live-feed panels from getting
+    vertically squashed down to their bare minimum height), while
+    content that's genuinely bigger than the window in either
+    direction becomes scrollable instead of being clipped.
+    """
+    canvas = tk.Canvas(page, highlightthickness=0)
+    vbar = tk.Scrollbar(page, orient=tk.VERTICAL, command=canvas.yview)
+    hbar = tk.Scrollbar(page, orient=tk.HORIZONTAL, command=canvas.xview)
+    inner = tk.Frame(canvas)
+
+    window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+
+    def _sync_scrollregion(_event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _sync_inner_size(event):
+        canvas.itemconfig(
+            window_id,
+            width=max(event.width, inner.winfo_reqwidth()),
+            height=max(event.height, inner.winfo_reqheight()),
+        )
+
+    inner.bind("<Configure>", _sync_scrollregion)
+    canvas.bind("<Configure>", _sync_inner_size)
+
+    canvas.grid(row=0, column=0, sticky="nsew")
+    vbar.grid(row=0, column=1, sticky="ns")
+    hbar.grid(row=1, column=0, sticky="ew")
+    page.grid_rowconfigure(0, weight=1)
+    page.grid_columnconfigure(0, weight=1)
+
+    # Mouse wheel scrolling — vertical by default, Shift+wheel for
+    # horizontal — bound/unbound as the pointer enters/leaves THIS
+    # tab's canvas specifically, so it doesn't fight with whichever tab
+    # is active and doesn't hijack wheel events meant for a nested
+    # Listbox/Text/Canvas (Tk still dispatches to the widget directly
+    # under the cursor first). <Button-4>/<Button-5> cover Linux, which
+    # doesn't send <MouseWheel> at all.
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_shift_mousewheel(event):
+        canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_enter(_event):
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Shift-MouseWheel>", _on_shift_mousewheel)
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+    def _on_leave(_event):
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Shift-MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    canvas.bind("<Enter>", _on_enter)
+    canvas.bind("<Leave>", _on_leave)
+
+    return inner
+
+
+tab_arm_page = tk.Frame(notebook)
+tab_virtual_page = tk.Frame(notebook)
+tab_camera_page = tk.Frame(notebook)
+tab_laser_page = tk.Frame(notebook)
+tab_server_page = tk.Frame(notebook)
+tab_database_page = tk.Frame(notebook)
+tab_data_collection_page = tk.Frame(notebook)
+tab_sync_storage_page = tk.Frame(notebook)
 
 # NOTE: widgets added to a Notebook via notebook.add(...) are already
 # geometry-managed BY the notebook — do not also call .pack()/.grid() on
@@ -712,17 +862,32 @@ tab_data_collection = tk.Frame(notebook)
 # notebook's own show/hide-per-tab logic and made every tab's content
 # render all at once regardless of which tab was selected, which is why
 # clicking between tabs looked like it wasn't doing anything.
-notebook.add(tab_arm, text="Arm")
-notebook.add(tab_virtual, text="Virtual")
-notebook.add(tab_camera, text="Camera")
-notebook.add(tab_laser, text="Laser")
-notebook.add(tab_server, text="Server")
-notebook.add(tab_database, text="Database")
-notebook.add(tab_data_collection, text="Data Collection")
+notebook.add(tab_arm_page, text="Arm")
+notebook.add(tab_virtual_page, text="Virtual")
+notebook.add(tab_camera_page, text="Camera")
+notebook.add(tab_laser_page, text="Laser")
+notebook.add(tab_server_page, text="Server")
+notebook.add(tab_database_page, text="Database")
+notebook.add(tab_data_collection_page, text="Data Collection")
+notebook.add(tab_sync_storage_page, text="Sync & Storage")
 
 # Always boot straight into the Arm tab (demo mode banner and all),
 # regardless of insertion order above.
-notebook.select(tab_arm)
+notebook.select(tab_arm_page)
+
+# Every tab wrapped in a scroll-in-both-directions canvas (see
+# make_scrollable_tab() above) — tab_arm/tab_virtual/etc. below now
+# refer to each page's INNER scrollable frame, not the raw notebook
+# page, so every `tk.Whatever(tab_arm, ...)` call site further down in
+# this file automatically becomes scrollable with no other changes.
+tab_arm = make_scrollable_tab(tab_arm_page)
+tab_virtual = make_scrollable_tab(tab_virtual_page)
+tab_camera = make_scrollable_tab(tab_camera_page)
+tab_laser = make_scrollable_tab(tab_laser_page)
+tab_server = make_scrollable_tab(tab_server_page)
+tab_database = make_scrollable_tab(tab_database_page)
+tab_data_collection = make_scrollable_tab(tab_data_collection_page)
+tab_sync_storage = make_scrollable_tab(tab_sync_storage_page)
 
 # Tab 1: Arm — everything below that packs into main_container/
 # left_container/frame ends up on this tab only. Control Mode/Middleman
@@ -2686,7 +2851,7 @@ tk.Label(tab_objects_log,
          fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT
          ).pack(anchor=tk.W, padx=2)
 
-objects_listbox = tk.Listbox(tab_objects_log, height=12)
+objects_listbox = tk.Listbox(tab_objects_log, height=12, selectmode=tk.EXTENDED)
 objects_listbox.pack(fill=tk.BOTH, expand=1, pady=4)
 
 # Listbox rows are plain text, but we need the actual object _id behind
@@ -2819,14 +2984,15 @@ def clear_object_filters():
 
 def show_object_detail(object_id: str, viewer_title_prefix: str = "Object"):
     """Pop up a window showing one object's fixed + freeform attributes
-    AND every image logged against it, oldest-first — the "click an
-    object, see its images and attributes, even with multiple photos"
-    view. Shared by the Objects (Log), Images, and Inventory tabs'
-    double-click handlers so there's exactly one viewer implementation
-    instead of three near-duplicates."""
+    (EDITABLE — see the Save Changes button below) AND every image
+    logged against it, oldest-first — the "click a recent capture, see
+    and edit its images and attributes" view. Shared by the Objects
+    (Log), Images, Inventory, and Data Collection ("Today's Captures")
+    tabs' double-click handlers so there's exactly one viewer
+    implementation instead of several near-duplicates."""
     viewer = tk.Toplevel(root)
     viewer.title(f"{viewer_title_prefix} {object_id}")
-    viewer.geometry("800x650")
+    viewer.geometry("800x700")
     loading_label = tk.Label(viewer, text="Loading...", padx=20, pady=20)
     loading_label.pack()
 
@@ -2855,16 +3021,17 @@ def show_object_detail(object_id: str, viewer_title_prefix: str = "Object"):
                          fg="red", padx=20, pady=20).pack()
                 return
 
-            # --- Attributes panel (fixed columns + freeform "why") ---
-            attrs_frame = tk.LabelFrame(viewer, text=" Attributes ", padx=8, pady=8)
+            # --- Attributes panel (fixed columns + freeform "why") — EDITABLE ---
+            attrs_frame = tk.LabelFrame(viewer, text=" Attributes (editable) ", padx=8, pady=8)
             attrs_frame.pack(fill=tk.X, padx=10, pady=(10, 4))
             data = (obj or {}).get("data") or {}
 
             # Object ID is deliberately shown (and copy-able via normal
-            # text selection) here even though it's not one of
-            # attribute_schema's fixed columns — it's how you search for
-            # this exact object again later, e.g. Advanced Query
-            # {"_id": "<this>"} on the Objects tab.
+            # text selection) even though it's not one of
+            # attribute_schema's fixed columns, and stays read-only —
+            # it's how you search for this exact object again later
+            # (e.g. Advanced Query {"_id": "<this>"} on the Objects
+            # tab), not something that makes sense to "edit".
             id_row = tk.Frame(attrs_frame)
             id_row.pack(fill=tk.X)
             tk.Label(id_row, text="Object ID:", font=("Arial", 9, "bold"),
@@ -2874,28 +3041,84 @@ def show_object_detail(object_id: str, viewer_title_prefix: str = "Object"):
             id_entry.config(state="readonly")
             id_entry.pack(side=tk.LEFT, fill=tk.X, expand=1)
 
+            # Every fixed column is always shown, even when this object
+            # doesn't have a value for it yet — an empty, editable Entry
+            # (or a Combobox for a boolean-typed column) rather than
+            # silently omitting the row, so filling in a missing value
+            # is just "type into the blank field and Save", right here,
+            # no separate Attribute Review trip required.
             labels = attribute_schema.display_labels()
+            schema_types = {c["key"]: c.get("type", "string")
+                             for c in attribute_schema.load_schema().get("fixed_columns", [])}
+            field_widgets = {}
             for key in attribute_schema.fixed_column_keys():
                 value = data.get(key)
-                if value in (None, ""):
-                    continue  # never attempted / not applicable — omit the row entirely
+                is_missing = value in (None, "")
                 row = tk.Frame(attrs_frame)
-                row.pack(fill=tk.X)
+                row.pack(fill=tk.X, pady=1)
                 tk.Label(row, text=f"{labels.get(key, key)}:", font=("Arial", 9, "bold"),
-                         width=14, anchor="w").pack(side=tk.LEFT)
-                is_unknown = (value == attribute_schema.UNKNOWN)
-                tk.Label(
-                    row, text=str(value), anchor="w",
-                    fg="gray" if is_unknown else "black",
-                    font=("Arial", 9, "italic") if is_unknown else ("Arial", 9),
-                ).pack(side=tk.LEFT)
+                         width=14, anchor="w",
+                         fg="#b35900" if is_missing else "black").pack(side=tk.LEFT)
+                if schema_types.get(key) == "boolean":
+                    widget = ttk.Combobox(row, width=37, state="readonly",
+                                           values=["", "true", "false", attribute_schema.UNKNOWN])
+                    widget.set("" if is_missing else str(value))
+                else:
+                    widget = tk.Entry(row, width=40)
+                    if not is_missing:
+                        widget.insert(0, str(value))
+                widget.pack(side=tk.LEFT, fill=tk.X, expand=1)
+                field_widgets[key] = widget
+
             freeform = data.get(attribute_schema.freeform_key()) or {}
-            if freeform:
-                tk.Label(attrs_frame, text="Freeform (why):", font=("Arial", 9, "bold"),
-                         anchor="w").pack(fill=tk.X, pady=(6, 0))
-                tk.Label(attrs_frame, text=json.dumps(freeform, indent=2),
-                         justify=tk.LEFT, anchor="w", fg="gray",
-                         font=("Courier", 8)).pack(fill=tk.X)
+            tk.Label(attrs_frame, text="Freeform attributes (JSON, editable):",
+                     font=("Arial", 9, "bold"), anchor="w").pack(fill=tk.X, pady=(6, 0))
+            freeform_text = tk.Text(attrs_frame, height=4, font=("Courier", 8))
+            freeform_text.insert("1.0", json.dumps(freeform, indent=2) if freeform else "{}")
+            freeform_text.pack(fill=tk.X)
+
+            save_status_label = tk.Label(attrs_frame, text="", fg="gray")
+            save_status_label.pack(anchor=tk.W, pady=(4, 0))
+
+            def save_attribute_changes():
+                new_data = {}
+                for key, widget in field_widgets.items():
+                    raw_value = widget.get().strip()
+                    if raw_value == "":
+                        new_data[key] = None
+                        continue
+                    if schema_types.get(key) == "number":
+                        try:
+                            new_data[key] = float(raw_value) if "." in raw_value else int(raw_value)
+                        except ValueError:
+                            new_data[key] = raw_value  # keep what was typed rather than losing it
+                    else:
+                        new_data[key] = raw_value
+
+                try:
+                    freeform_value = json.loads(freeform_text.get("1.0", tk.END).strip() or "{}")
+                except json.JSONDecodeError as e:
+                    messagebox.showerror("Invalid JSON", f"Freeform attributes aren't valid JSON: {e}")
+                    return
+                new_data[attribute_schema.freeform_key()] = freeform_value
+
+                try:
+                    mongo_client.update_object_data(object_id, new_data)
+                except Exception as e:
+                    save_status_label.config(text=f"Save failed: {e}", fg="red")
+                    return
+
+                save_status_label.config(text="Saved.", fg="green")
+                try:
+                    refresh_objects_list()
+                    refresh_images_list()
+                    refresh_inventory_list()
+                    refresh_dc_today_list()
+                except NameError:
+                    pass
+
+            tk.Button(attrs_frame, text="Save Changes", command=save_attribute_changes,
+                      bg="lightgreen").pack(anchor=tk.W, pady=(6, 0))
 
             # --- Images panel ---
             if not image_docs:
@@ -2946,7 +3169,6 @@ def show_object_detail(object_id: str, viewer_title_prefix: str = "Object"):
 
     threading.Thread(target=worker, daemon=True).start()
 
-
 def open_object_detail_viewer(event=None):
     """Objects (Log) tab double-click handler."""
     selection = objects_listbox.curselection()
@@ -2959,6 +3181,53 @@ def open_object_detail_viewer(event=None):
 
 
 objects_listbox.bind("<Double-Button-1>", open_object_detail_viewer)
+
+
+def delete_selected_objects():
+    """Objects tab's "Delete Selected" button — multi-select (the
+    listbox is selectmode=EXTENDED, so ctrl/shift-click work) delete of
+    whole captures. Same underlying mongo_client.delete_object() as the
+    single-object delete this replaced on the Data Collection tab's
+    "Today's Captures" list — that list is view-only now; this is
+    where capture deletion actually lives."""
+    selection = objects_listbox.curselection()
+    if not selection:
+        return
+    object_ids = [_recent_object_ids[i] for i in selection if i < len(_recent_object_ids)]
+    if not object_ids:
+        return  # selected only a placeholder row like "(no objects...)" or "Error: ..."
+    if not messagebox.askyesno(
+            "Delete selected",
+            f"Delete {len(object_ids)} object(s) and their image records from MongoDB?\n\n"
+            f"This does NOT delete the image files from disk, and does NOT change the "
+            f"Inventory 'times seen' count — only the CSV/JSON logs keep a record that "
+            f"these captures happened at all."):
+        return
+
+    def worker():
+        errors = []
+        for object_id in object_ids:
+            try:
+                mongo_client.delete_object(object_id)
+            except Exception as e:
+                errors.append(f"{object_id}: {e}")
+
+        def apply():
+            if errors:
+                messagebox.showerror("Some deletes failed", "\n".join(errors))
+            refresh_objects_list()
+            try:
+                refresh_images_list()
+                refresh_inventory_list()
+                refresh_dc_today_list()
+            except NameError:
+                pass
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 obj_buttons_frame = tk.Frame(tab_objects_log)
 obj_buttons_frame.pack(anchor=tk.W, pady=4)
 tk.Button(obj_buttons_frame, text="Apply Filters", command=refresh_objects_list,
@@ -2966,8 +3235,10 @@ tk.Button(obj_buttons_frame, text="Apply Filters", command=refresh_objects_list,
 tk.Button(obj_buttons_frame, text="Clear Filters", command=clear_object_filters
           ).pack(side=tk.LEFT, padx=(0, 4))
 tk.Button(obj_buttons_frame, text="Refresh", command=refresh_objects_list,
-          bg="lightblue").pack(side=tk.LEFT)
-_populate_object_filter_dropdowns()
+          bg="lightblue").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(obj_buttons_frame, text="Delete Selected", command=delete_selected_objects,
+          bg="salmon").pack(side=tk.LEFT)
+root.after(0, _populate_object_filter_dropdowns)
 
 # ---- Images sub-tab ---------------------------------------------------
 tk.Label(tab_images_log,
@@ -3023,7 +3294,7 @@ tk.Label(tab_images_log,
          fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT
          ).pack(anchor=tk.W, padx=2)
 
-images_listbox = tk.Listbox(tab_images_log, height=12)
+images_listbox = tk.Listbox(tab_images_log, height=12, selectmode=tk.EXTENDED)
 images_listbox.pack(fill=tk.BOTH, expand=1, pady=4)
 
 # Same pattern as _recent_object_ids on the Objects tab — the object_id
@@ -3031,6 +3302,8 @@ images_listbox.pack(fill=tk.BOTH, expand=1, pady=4)
 # so double-clicking a photo can jump straight to that object's full
 # detail view (attributes + every one of its images, however many).
 _recent_image_object_ids = []
+_recent_image_ids = []  # the image doc's OWN _id — needed for delete_image(), separate
+                         # from _recent_image_object_ids (which object each row belongs to)
 
 
 def _populate_image_filter_dropdown():
@@ -3076,6 +3349,16 @@ def _build_image_filter() -> dict:
 
 
 def refresh_images_list():
+    """
+    Populates the Images tab grouped by SNAPSHOT (object_id) — a header
+    row per object ("=== object <id> — N image(s) ==="), followed by
+    that object's own images indented beneath it, then the next
+    object's header, and so on — rather than one flat list where every
+    image (regardless of which capture it came from) is interleaved by
+    timestamp and distinguished only by source/view_index. Grouping
+    still respects whatever filter/sort the controls above are set to;
+    it only changes how the matching images are laid out in the list.
+    """
     def worker():
         err = None
         try:
@@ -3091,20 +3374,43 @@ def refresh_images_list():
         def apply():
             images_listbox.delete(0, tk.END)
             _recent_image_object_ids.clear()
+            _recent_image_ids.clear()
             if images is None:
                 images_listbox.insert(tk.END, f"Error: {err}")
                 return
             if not images:
                 images_listbox.insert(tk.END, "(no images match this filter)")
                 return
+
+            # Group while preserving each object's first-appearance order
+            # (which already reflects whatever sort was picked above —
+            # oldest-first or newest-first — since `images` came back
+            # pre-sorted by captured_at).
+            groups: dict = {}
+            group_order: list = []
             for i in images:
-                when = str(i.get("captured_at", ""))
+                object_id = i.get("object_id")
+                if object_id not in groups:
+                    groups[object_id] = []
+                    group_order.append(object_id)
+                groups[object_id].append(i)
+
+            for object_id in group_order:
+                group_images = groups[object_id]
                 images_listbox.insert(
                     tk.END,
-                    f"{when}  |  {i.get('source', '?')}  |  view {i.get('view_index', '?')}"
-                    f"  |  object {i.get('object_id', '?')}"
-                )
-                _recent_image_object_ids.append(i.get("object_id"))
+                    f"=== object {object_id or '(none)'} — {len(group_images)} image(s) ===")
+                _recent_image_object_ids.append(object_id)  # header row still opens this object
+                _recent_image_ids.append(None)              # but isn't itself a deletable image
+
+                for img in group_images:
+                    when = str(img.get("captured_at", ""))
+                    images_listbox.insert(
+                        tk.END,
+                        f"      {when}  |  {img.get('source', '?')}  |  view {img.get('view_index', '?')}"
+                    )
+                    _recent_image_object_ids.append(object_id)
+                    _recent_image_ids.append(img.get("_id"))
 
         root.after(0, apply)
 
@@ -3113,9 +3419,11 @@ def refresh_images_list():
 
 def open_image_object_detail(event=None):
     """Images tab double-click handler — jumps to the SAME detail
-    viewer the Objects tab uses, for whichever object this particular
-    photo belongs to (showing that object's attributes and ALL of its
-    images, not just the one row that was clicked)."""
+    viewer the Objects tab uses, for whichever object this row belongs
+    to (the header row or any image row beneath it both work, since
+    both are stamped with that object's id — see refresh_images_list())
+    — showing that object's attributes and ALL of its images, not just
+    the one row that was clicked."""
     selection = images_listbox.curselection()
     if not selection:
         return
@@ -3132,6 +3440,49 @@ def open_image_object_detail(event=None):
 images_listbox.bind("<Double-Button-1>", open_image_object_detail)
 
 
+def delete_selected_images():
+    """Images tab's "Delete Selected" button — multi-select delete of
+    INDIVIDUAL image docs (mongo_client.delete_image()), not whole
+    objects. Deleting a photo here leaves its object and that object's
+    other images untouched — use the Objects tab's "Delete Selected"
+    instead to remove a whole capture."""
+    selection = images_listbox.curselection()
+    if not selection:
+        return
+    image_ids = [_recent_image_ids[i] for i in selection
+                 if i < len(_recent_image_ids) and _recent_image_ids[i] is not None]
+    if not image_ids:
+        return  # selected only header/placeholder rows — nothing individually deletable there
+    if not messagebox.askyesno(
+            "Delete selected",
+            f"Delete {len(image_ids)} image record(s) from MongoDB?\n\n"
+            f"This only removes the image DOC — the object it belongs to and any other "
+            f"images linked to it are untouched. Does NOT delete the file from disk."):
+        return
+
+    def worker():
+        errors = []
+        for image_id in image_ids:
+            try:
+                mongo_client.delete_image(image_id)
+            except Exception as e:
+                errors.append(f"{image_id}: {e}")
+
+        def apply():
+            if errors:
+                messagebox.showerror("Some deletes failed", "\n".join(errors))
+            refresh_images_list()
+            try:
+                refresh_objects_list()
+            except NameError:
+                pass
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+
 def clear_image_filters():
     img_filter_source.set("(any)")
     img_filter_today_only.set(False)
@@ -3146,8 +3497,10 @@ tk.Button(img_buttons_frame, text="Apply Filters", command=refresh_images_list,
 tk.Button(img_buttons_frame, text="Clear Filters", command=clear_image_filters
           ).pack(side=tk.LEFT, padx=(0, 4))
 tk.Button(img_buttons_frame, text="Refresh", command=refresh_images_list,
-          bg="lightblue").pack(side=tk.LEFT)
-_populate_image_filter_dropdown()
+          bg="lightblue").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(img_buttons_frame, text="Delete Selected", command=delete_selected_images,
+          bg="salmon").pack(side=tk.LEFT)
+root.after(0, _populate_image_filter_dropdown)
 
 # ---- Inventory sub-tab (object_catalog — distinct known objects) -----
 tk.Label(tab_inventory,
@@ -3190,11 +3543,12 @@ def refresh_inventory_list():
 
 def open_catalog_detail_viewer(event=None):
     """Inventory tab double-click handler. A catalog entry can be linked
-    to several captures (times_seen > 1), so this shows the catalog
-    summary plus every linked capture as its own row — double-clicking
-    ONE of those opens the full per-object viewer (attributes + all of
-    THAT capture's images) via the same show_object_detail() the other
-    two tabs use."""
+    to several captures (times_seen > 1) — this shows the catalog
+    summary AND every image from EVERY linked capture together,
+    automatically, in one scrollable window (no extra button/click
+    needed to actually see the photos). The "linked captures" list
+    below the summary is still there if you want to drill into ONE
+    specific capture's full attribute set via show_object_detail()."""
     selection = inventory_listbox.curselection()
     if not selection:
         return
@@ -3205,17 +3559,40 @@ def open_catalog_detail_viewer(event=None):
 
     viewer = tk.Toplevel(root)
     viewer.title(f"Catalog entry {catalog_id}")
-    viewer.geometry("600x450")
+    viewer.geometry("860x760")
     loading_label = tk.Label(viewer, text="Loading...", padx=20, pady=20)
     loading_label.pack()
 
     def worker():
         try:
-            entries = object_catalog.list_inventory(limit=200)
-            entry = next((e for e in entries if e.get("_id") == catalog_id), None)
+            entry = mongo_client.get_catalog_entry(catalog_id)
             err = None
         except Exception as e:
             entry, err = None, str(e)
+
+        all_docs = []
+        per_object_errors = []
+        if err is None and entry is not None:
+            for object_id in (entry.get("linked_object_ids", []) or []):
+                # Each linked capture is fetched INDEPENDENTLY — one bad
+                # object_id (a stale reference, a transient Mongo hiccup,
+                # whatever) must not wipe out images already gathered
+                # successfully from every OTHER linked capture. A single
+                # try/except wrapped around the WHOLE loop used to do
+                # exactly that: any one object's failure discarded
+                # everything, including images already found — which is
+                # why "show all photos at once" (the only place that
+                # loops over more than one object) could fail while
+                # single-object viewing (show_object_detail, never more
+                # than one object) kept working fine.
+                try:
+                    for doc in mongo_client.get_images_for_object(object_id):
+                        doc = dict(doc)
+                        doc["_object_id"] = object_id
+                        all_docs.append(doc)
+                except Exception as e:
+                    per_object_errors.append(f"{object_id}: {e}")
+            all_docs.sort(key=lambda d: d.get("captured_at") or datetime.min)
 
         def build_ui():
             loading_label.destroy()
@@ -3228,7 +3605,40 @@ def open_catalog_detail_viewer(event=None):
                          fg="red", padx=20, pady=20).pack()
                 return
 
-            summary_frame = tk.LabelFrame(viewer, text=" Summary ", padx=8, pady=8)
+            # The whole window scrolls as one unit — summary, linked-capture
+            # list, and every image, all visible without a separate button.
+            outer_canvas = tk.Canvas(viewer)
+            outer_scrollbar = tk.Scrollbar(viewer, orient=tk.VERTICAL, command=outer_canvas.yview)
+            outer_frame = tk.Frame(outer_canvas)
+            window_id = outer_canvas.create_window((0, 0), window=outer_frame, anchor="nw")
+
+            def _sync_scrollregion(_event=None):
+                outer_canvas.configure(scrollregion=outer_canvas.bbox("all"))
+
+            def _sync_outer_width(event):
+                outer_canvas.itemconfig(window_id, width=max(event.width, outer_frame.winfo_reqwidth()))
+
+            outer_frame.bind("<Configure>", _sync_scrollregion)
+            outer_canvas.bind("<Configure>", _sync_outer_width)
+            outer_canvas.configure(yscrollcommand=outer_scrollbar.set)
+            outer_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=1)
+            outer_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            # Mouse wheel support (Windows/Mac deltas differ from Linux's Button-4/5) —
+            # bound/unbound on enter/leave so it doesn't fight with other open windows.
+            def _on_mousewheel(e):
+                outer_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            def _on_enter(_e):
+                outer_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+                outer_canvas.bind_all("<Button-4>", lambda e: outer_canvas.yview_scroll(-1, "units"))
+                outer_canvas.bind_all("<Button-5>", lambda e: outer_canvas.yview_scroll(1, "units"))
+            def _on_leave(_e):
+                outer_canvas.unbind_all("<MouseWheel>")
+                outer_canvas.unbind_all("<Button-4>")
+                outer_canvas.unbind_all("<Button-5>")
+            outer_canvas.bind("<Enter>", _on_enter)
+            outer_canvas.bind("<Leave>", _on_leave)
+
+            summary_frame = tk.LabelFrame(outer_frame, text=" Summary ", padx=8, pady=8)
             summary_frame.pack(fill=tk.X, padx=10, pady=(10, 4))
             for label, value in [
                 ("Name", entry.get("name", "?")),
@@ -3244,11 +3654,11 @@ def open_catalog_detail_viewer(event=None):
                 tk.Label(row, text=str(value), anchor="w").pack(side=tk.LEFT)
 
             linked_ids = entry.get("linked_object_ids", []) or []
-            tk.Label(viewer, text=f"Linked captures ({len(linked_ids)}) — "
-                                   f"double-click one to see its photos + attributes:",
+            tk.Label(outer_frame, text=f"Linked captures ({len(linked_ids)}) — "
+                                        f"double-click one for its full attribute set:",
                      padx=10, pady=(8, 2), anchor="w").pack(fill=tk.X)
-            linked_listbox = tk.Listbox(viewer, height=10)
-            linked_listbox.pack(fill=tk.BOTH, expand=1, padx=10, pady=(0, 10))
+            linked_listbox = tk.Listbox(outer_frame, height=min(6, max(2, len(linked_ids))))
+            linked_listbox.pack(fill=tk.X, padx=10, pady=(0, 10))
             for linked_id in linked_ids:
                 linked_listbox.insert(tk.END, linked_id)
 
@@ -3260,6 +3670,57 @@ def open_catalog_detail_viewer(event=None):
 
             linked_listbox.bind("<Double-Button-1>", on_linked_double_click)
 
+            if per_object_errors:
+                tk.Label(outer_frame,
+                         text=f"{len(per_object_errors)} linked capture(s) failed to load — "
+                              f"the rest are still shown below:\n" + "\n".join(per_object_errors),
+                         fg="red", padx=10, pady=(4, 0), anchor="w", justify=tk.LEFT,
+                         wraplength=680).pack(fill=tk.X)
+
+            # ---- All images, every linked capture, shown right here ----
+            tk.Label(outer_frame, text=f"All Images ({len(all_docs)} across "
+                                        f"{len(linked_ids)} linked capture(s)):",
+                     font=("Arial", 10, "bold"), padx=10, pady=(4, 2), anchor="w").pack(fill=tk.X)
+
+            if not all_docs:
+                if not linked_ids:
+                    tk.Label(outer_frame, text="No linked captures at all for this entry.",
+                             padx=10, pady=10, anchor="w").pack(fill=tk.X)
+                else:
+                    tk.Label(outer_frame,
+                             text=f"{len(linked_ids)} linked capture(s), but none of them "
+                                  f"have any image records left in MongoDB (they may have "
+                                  f"been deleted individually via the Images tab's "
+                                  f"\"Delete Selected\").",
+                             padx=10, pady=10, anchor="w", wraplength=680, justify=tk.LEFT).pack(fill=tk.X)
+            elif not _PIL_AVAILABLE:
+                tk.Label(outer_frame, text="Install Pillow to view images: pip install Pillow",
+                         fg="red", padx=10, pady=10, anchor="w").pack(fill=tk.X)
+            else:
+                viewer._photo_refs = []
+                for doc in all_docs:
+                    raw_path = doc.get("image_path", "")
+                    path = resolve_image_path(raw_path)
+                    source = doc.get("source", "?")
+                    view_index = doc.get("view_index", "?")
+                    when = doc.get("captured_at", "")
+                    img_row = tk.Frame(outer_frame, pady=8)
+                    img_row.pack(fill=tk.X, padx=10)
+                    tk.Label(img_row, text=f"capture {doc.get('_object_id', '?')}  —  "
+                                            f"{source} / view {view_index}  ({when})",
+                             font=("Arial", 9, "bold")).pack(anchor="w")
+                    try:
+                        img = Image.open(path)
+                        img.thumbnail((700, 525))
+                        photo = ImageTk.PhotoImage(img)
+                        viewer._photo_refs.append(photo)
+                        tk.Label(img_row, image=photo).pack(anchor="w")
+                    except Exception as e:
+                        hint = "" if path == raw_path else f"\n(tried: {path})"
+                        tk.Label(img_row, text=f"Could not load '{raw_path}': {e}{hint}",
+                                 fg="red", wraplength=680, justify=tk.LEFT, anchor="w"
+                                 ).pack(fill=tk.X)
+
         root.after(0, build_ui)
 
     threading.Thread(target=worker, daemon=True).start()
@@ -3268,161 +3729,200 @@ def open_catalog_detail_viewer(event=None):
 _recent_catalog_ids = []
 inventory_listbox.bind("<Double-Button-1>", open_catalog_detail_viewer)
 
-tk.Button(tab_inventory, text="Refresh", command=refresh_inventory_list,
-          bg="lightblue").pack(anchor=tk.W, pady=4)
-
-# Populate all three sub-tabs once at startup.
-refresh_objects_list()
-refresh_images_list()
-refresh_inventory_list()
-
-# =====================================================================
-# CSV / EXCEL — regenerated report + (mode-dependent) reconcile.
-# See vision/storage/csv_logger.py and vision/storage/excel_export.py.
-# Every capture always appends to the CSV log and (best-effort) refreshes
-# this report already — these buttons are for an on-demand full/manual
-# refresh, and for pulling hand-edited Excel values back into MongoDB.
-# =====================================================================
-excel_frame = tk.LabelFrame(tab_database, text=" CSV / Excel Report ", padx=10, pady=10)
-excel_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-
-tk.Label(excel_frame, text=f"Mode: {DATA_AUTHORITY_MODE}  "
-         f"({'MongoDB is authoritative; report is generated-only' if DATA_AUTHORITY_MODE == 'mongo' else 'hand-edit the Excel report, then Reconcile to push edits into MongoDB'})",
-         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
-
-excel_status_label = tk.Label(excel_frame, text="", fg="gray")
-excel_status_label.pack(anchor=tk.W, pady=(2, 4))
-
-excel_btn_row = tk.Frame(excel_frame)
-excel_btn_row.pack(fill=tk.X)
-
-
-def export_excel_report(session_only: bool = False):
-    excel_status_label.config(text="Exporting...", fg="gray")
-
-    def worker():
-        try:
-            from vision.storage import session_manager
-            sid = session_manager.today_session_id() if session_only else None
-            path = excel_export.build_report(session_id=sid)
-            msg, color = f"Report written to {path}", "green"
-        except Exception as e:
-            msg, color = f"Export failed: {e}", "red"
-        root.after(0, lambda: excel_status_label.config(text=msg, fg=color))
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def reconcile_from_excel_gui():
-    excel_status_label.config(text="Reconciling...", fg="gray")
-
-    def worker():
-        try:
-            updated, warnings = excel_export.reconcile_from_excel()
-            msg = f"Reconciled {updated} row(s)."
-            if warnings:
-                msg += f" {len(warnings)} warning(s) — see console."
-                for w in warnings:
-                    print(f"[RECONCILE] {w}")
-            color = "green" if not warnings else "orange"
-        except Exception as e:
-            msg, color = f"Reconcile failed: {e}", "red"
-        root.after(0, lambda: excel_status_label.config(text=msg, fg=color))
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-tk.Button(excel_btn_row, text="Export Today's Report", command=lambda: export_excel_report(True),
+inv_btn_row = tk.Frame(tab_inventory)
+inv_btn_row.pack(anchor=tk.W, pady=4)
+tk.Button(inv_btn_row, text="Refresh", command=refresh_inventory_list,
           bg="lightblue").pack(side=tk.LEFT, padx=(0, 4))
-tk.Button(excel_btn_row, text="Export Full History", command=lambda: export_excel_report(False),
-          bg="lightblue").pack(side=tk.LEFT, padx=4)
-if DATA_AUTHORITY_MODE == "excel":
-    tk.Button(excel_btn_row, text="Reconcile from Excel", command=reconcile_from_excel_gui,
-              bg="khaki").pack(side=tk.LEFT, padx=4)
 
-# =====================================================================
-# DATA PACKAGE — export a self-contained folder (images + a portable
-# CSV, relative paths) for handing captured data off to another
-# machine, archiving it, or backing it up; import reads one of these
-# folders back in and replays each row through the same
-# capture_pipeline.record_capture() every other capture path uses, so
-# an imported object gets identical session/catalog/CSV/Excel
-# treatment. See vision/storage/package_export.py's module docstring
-# for why this is a separate thing from the live CSV/Excel report
-# above (that one uses THIS machine's absolute image paths — not
-# portable to a different machine on its own; a package's paths are
-# relative to the package folder and its images are physically copied
-# alongside it).
-# =====================================================================
-package_frame = tk.LabelFrame(tab_database, text=" Data Package (Export / Import) ", padx=10, pady=10)
-package_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-
-tk.Label(package_frame,
-         text="Export copies images + a portable CSV into one folder you can move to another "
-              "machine, back up, or archive. Import reads that folder back in.",
-         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
-
-package_status_label = tk.Label(package_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
-package_status_label.pack(anchor=tk.W, pady=(2, 4))
-
-package_btn_row = tk.Frame(package_frame)
-package_btn_row.pack(fill=tk.X)
+inv_repair_status_label = tk.Label(tab_inventory, text="", fg="gray")
 
 
-def export_package_gui(all_history: bool):
-    parent_dir = filedialog.askdirectory(title="Choose where to create the export folder")
-    if not parent_dir:
-        return  # user cancelled
-    folder_name = f"export_{'all_history' if all_history else session_manager.today_session_id()}_{datetime.now().strftime('%H%M%S')}"
-    dest_dir = os.path.join(parent_dir, folder_name)
-
-    package_status_label.config(text="Exporting package...", fg="gray")
+def repair_inventory_links():
+    """"Repair Inventory Links" button — fixes catalog entries that
+    still point at deleted captures from BEFORE delete_object()/
+    delete_objects_bulk() started keeping linked_object_ids in sync
+    (see mongo_client.repair_catalog_links()'s docstring). Run this
+    once after upgrading if the Inventory tab shows entries with a
+    nonzero "times seen" but zero images when you open them — that's
+    exactly the symptom this fixes."""
+    inv_repair_status_label.config(text="Repairing...", fg="gray")
 
     def worker():
         try:
-            path, count, warnings = package_export.export_package(dest_dir, all_history=all_history)
-            msg = f"Exported {count} object(s) to {path}."
-            if warnings:
-                msg += f" {len(warnings)} warning(s) — see console."
-                for w in warnings:
-                    print(f"[EXPORT PACKAGE] {w}")
-            color = "green" if not warnings else "orange"
+            result = mongo_client.repair_catalog_links()
+            msg = (f"Checked {result['entries_checked']} entries, fixed "
+                   f"{result['entries_fixed']}, removed "
+                   f"{result['dangling_links_removed']} dangling link(s).")
+            color = "green"
         except Exception as e:
-            msg, color = f"Export failed: {e}", "red"
-        root.after(0, lambda: package_status_label.config(text=msg, fg=color))
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def import_package_gui():
-    package_dir = filedialog.askdirectory(title="Choose a package folder to import (must contain captures_log.csv)")
-    if not package_dir:
-        return  # user cancelled
-
-    if not messagebox.askyesno(
-            "Import package",
-            f"Import every capture from:\n{package_dir}\n\n"
-            f"Each row becomes a NEW object in this machine's MongoDB (fresh "
-            f"object_id, images copied into local storage) — this does not "
-            f"overwrite or deduplicate against anything already here. Continue?"):
-        return
-
-    package_status_label.config(text="Importing package...", fg="gray")
-
-    def worker():
-        try:
-            imported, skipped, warnings = package_export.import_package(package_dir)
-            msg = f"Imported {imported} object(s), skipped {skipped}."
-            if warnings:
-                msg += f" {len(warnings)} warning(s) — see console."
-                for w in warnings:
-                    print(f"[IMPORT PACKAGE] {w}")
-            color = "green" if not warnings and skipped == 0 else "orange"
-        except Exception as e:
-            msg, color = f"Import failed: {e}", "red"
+            msg, color = f"Repair failed: {e}", "red"
 
         def apply():
-            package_status_label.config(text=msg, fg=color)
+            inv_repair_status_label.config(text=msg, fg=color)
+            refresh_inventory_list()
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(inv_btn_row, text="Repair Inventory Links", command=repair_inventory_links,
+          bg="khaki").pack(side=tk.LEFT, padx=4)
+inv_repair_status_label.pack(anchor=tk.W)
+
+# Populate all three sub-tabs once at startup.
+root.after(0, refresh_objects_list)
+root.after(0, refresh_images_list)
+root.after(0, refresh_inventory_list)
+
+# =====================================================================
+# CLEANUP — bulk-delete old captures (e.g. everything from a previous
+# experiment/test run) straight out of MongoDB, without deleting one
+# object at a time. Two ways to pick what gets deleted: by session
+# (calendar day) via the dropdown, or by a custom MongoDB filter (same
+# JSON-filter rules/safety as the Objects tab's Advanced Query box —
+# see query_safety.validate_filter()). Deleting the image FILES from
+# disk too is opt-in (checkbox) since that part is irreversible.
+# =====================================================================
+cleanup_frame = tk.LabelFrame(tab_database, text=" Cleanup — Bulk Delete ", padx=10, pady=10)
+cleanup_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(cleanup_frame,
+         text="Remove old captures in bulk — e.g. everything left over from a previous "
+              "experiment — by session (day) or by a custom filter. This only touches the "
+              "objects/images collections; it does NOT rewrite the CSV/JSON audit logs "
+              "(a historical record that a capture happened) or the Inventory catalog's "
+              "'times seen' counts.",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+cleanup_session_row = tk.Frame(cleanup_frame)
+cleanup_session_row.pack(fill=tk.X, pady=(6, 2))
+tk.Label(cleanup_session_row, text="Session (day):").pack(side=tk.LEFT)
+cleanup_session_combo = ttk.Combobox(cleanup_session_row, width=14, state="readonly")
+cleanup_session_combo.pack(side=tk.LEFT, padx=(4, 8))
+
+
+def _populate_cleanup_sessions():
+    def worker():
+        try:
+            session_ids = [s.get("_id") for s in mongo_client.list_sessions(limit=365)]
+        except Exception:
+            session_ids = []
+
+        def apply():
+            cleanup_session_combo["values"] = ["(none — use custom filter below)"] + session_ids
+            cleanup_session_combo.set("(none — use custom filter below)")
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(cleanup_session_row, text="Refresh Sessions", command=_populate_cleanup_sessions
+          ).pack(side=tk.LEFT)
+
+cleanup_filter_frame = tk.Frame(cleanup_frame)
+cleanup_filter_frame.pack(fill=tk.X, pady=(4, 2))
+tk.Label(cleanup_filter_frame, text="Or a custom filter (MongoDB JSON — same syntax as "
+                                     "the Objects tab's Advanced Query):").pack(anchor=tk.W)
+cleanup_filter_entry = tk.Entry(cleanup_filter_frame, width=70)
+cleanup_filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=1)
+
+cleanup_delete_files_var = tk.BooleanVar(value=False)
+tk.Checkbutton(cleanup_frame, text="Also delete the image files from disk (permanent, cannot be undone)",
+               variable=cleanup_delete_files_var).pack(anchor=tk.W, pady=(4, 0))
+
+cleanup_status_label = tk.Label(cleanup_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+cleanup_status_label.pack(anchor=tk.W, pady=(4, 4))
+
+
+def _cleanup_build_filter() -> dict:
+    """Custom filter (if typed) wins outright over the session dropdown
+    — same "one or the other, not merged" behavior kept simple on
+    purpose for a destructive action. Raises ValueError if neither is
+    set, so the caller can't accidentally build an empty {} filter
+    (which would match — and delete — every single object)."""
+    custom_text = cleanup_filter_entry.get().strip()
+    if custom_text:
+        try:
+            custom_filter = json.loads(custom_text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Custom filter isn't valid JSON: {e}")
+        query_safety.validate_filter(custom_filter)
+        if not custom_filter:
+            raise ValueError("Custom filter can't be empty — that would match every object.")
+        return custom_filter
+
+    session = cleanup_session_combo.get().strip()
+    if session and not session.startswith("("):
+        return {"session_id": session}
+
+    raise ValueError("Pick a session from the dropdown, or enter a custom filter, first.")
+
+
+def cleanup_preview_count():
+    try:
+        mongo_filter = _cleanup_build_filter()
+    except ValueError as e:
+        messagebox.showerror("Invalid filter", str(e))
+        return
+    cleanup_status_label.config(text="Counting matches...", fg="gray")
+
+    def worker():
+        try:
+            count = mongo_client.count_objects(mongo_filter)
+            msg, color = f"{count} object(s) match this filter.", "blue"
+        except Exception as e:
+            msg, color = f"Count failed: {e}", "red"
+        root.after(0, lambda: cleanup_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def cleanup_delete_matching():
+    try:
+        mongo_filter = _cleanup_build_filter()
+    except ValueError as e:
+        messagebox.showerror("Invalid filter", str(e))
+        return
+
+    delete_files = cleanup_delete_files_var.get()
+    if not messagebox.askyesno(
+            "Bulk delete",
+            f"Permanently delete every object (and its linked images) matching:\n\n"
+            f"{json.dumps(mongo_filter)}\n\n"
+            + ("Image FILES on disk will also be deleted.\n\n" if delete_files
+               else "Image files on disk will be left alone (Mongo records only).\n\n")
+            + "This cannot be undone. Continue?"):
+        return
+
+    cleanup_status_label.config(text="Deleting...", fg="gray")
+
+    def worker():
+        try:
+            objs_deleted, imgs_deleted, image_paths = mongo_client.delete_objects_bulk(mongo_filter)
+            files_deleted, file_errors = 0, 0
+            if delete_files:
+                for raw_path in image_paths:
+                    try:
+                        resolved = resolve_image_path(raw_path)
+                        if os.path.exists(resolved):
+                            os.remove(resolved)
+                            files_deleted += 1
+                    except Exception:
+                        file_errors += 1
+            msg = f"Deleted {objs_deleted} object(s), {imgs_deleted} image record(s)."
+            if delete_files:
+                msg += f" {files_deleted} image file(s) removed from disk"
+                if file_errors:
+                    msg += f" ({file_errors} could not be removed — see console)"
+                msg += "."
+            color = "green"
+        except Exception as e:
+            msg, color = f"Delete failed: {e}", "red"
+
+        def apply():
+            cleanup_status_label.config(text=msg, fg=color)
             try:
                 refresh_objects_list()
                 refresh_images_list()
@@ -3435,12 +3935,15 @@ def import_package_gui():
     threading.Thread(target=worker, daemon=True).start()
 
 
-tk.Button(package_btn_row, text="Export Today's Package", command=lambda: export_package_gui(False),
-          bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
-tk.Button(package_btn_row, text="Export Full History Package", command=lambda: export_package_gui(True),
-          bg="lightgreen").pack(side=tk.LEFT, padx=4)
-tk.Button(package_btn_row, text="Import Package...", command=import_package_gui,
-          bg="khaki").pack(side=tk.LEFT, padx=4)
+cleanup_btn_row = tk.Frame(cleanup_frame)
+cleanup_btn_row.pack(anchor=tk.W, pady=(2, 0))
+tk.Button(cleanup_btn_row, text="Preview Count", command=cleanup_preview_count,
+          bg="lightblue").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(cleanup_btn_row, text="Delete Matching", command=cleanup_delete_matching,
+          bg="salmon").pack(side=tk.LEFT)
+
+root.after(0, _populate_cleanup_sessions)
+
 
 # =====================================================================
 # ASK (optional secondary NL layer — langchain-mongodb agent via local
@@ -3589,7 +4092,597 @@ nl_query_ask_btn.config(command=run_nl_query_from_gui)
 nl_query_entry.bind("<Return>", lambda event: run_nl_query_from_gui())
 nl_model_selector.bind("<<ComboboxSelected>>", lambda event: _check_nl_query_availability())
 
-_refresh_nl_model_list()
+root.after(0, _refresh_nl_model_list)
+
+# =====================================================================
+# SYNC & STORAGE TAB — everything about getting data OUT of / INTO
+# MongoDB via Excel/JSON/photos, plus managing the folders that data
+# lives in on disk. Split out from the Database tab (which is just
+# browsing/querying/deleting what's live in MongoDB) and from Data
+# Collection (which is about producing new captures), so this tab is
+# purely "move data between Mongo and files, and manage those files."
+# =====================================================================
+tk.Label(tab_sync_storage, text="Import / Export / Sync",
+         font=("Arial", 12, "bold")).pack(pady=(10, 5))
+
+# =====================================================================
+# CSV / EXCEL — regenerated report + (mode-dependent) reconcile.
+# See vision/storage/csv_logger.py and vision/storage/excel_export.py.
+# Every capture always appends to the CSV log and (best-effort) refreshes
+# this report already — these buttons are for an on-demand full/manual
+# refresh, and for pulling hand-edited Excel values back into MongoDB.
+# =====================================================================
+excel_frame = tk.LabelFrame(tab_sync_storage, text=" CSV / Excel / JSON Report ", padx=10, pady=10)
+excel_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(excel_frame, text=f"Mode: {DATA_AUTHORITY_MODE}  "
+         f"({'MongoDB is authoritative; report is generated-only' if DATA_AUTHORITY_MODE == 'mongo' else 'hand-edit the Excel report, then Reconcile to push edits into MongoDB'})",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+excel_status_label = tk.Label(excel_frame, text="", fg="gray")
+excel_status_label.pack(anchor=tk.W, pady=(2, 4))
+
+excel_btn_row = tk.Frame(excel_frame)
+excel_btn_row.pack(fill=tk.X)
+
+
+def export_excel_report(session_only: bool = False):
+    excel_status_label.config(text="Exporting...", fg="gray")
+
+    def worker():
+        try:
+            from vision.storage import session_manager
+            sid = session_manager.today_session_id() if session_only else None
+            path = excel_export.build_report(session_id=sid)
+            msg, color = f"Report written to {path}", "green"
+        except Exception as e:
+            msg, color = f"Export failed: {e}", "red"
+        root.after(0, lambda: excel_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def reconcile_from_excel_gui():
+    excel_status_label.config(text="Reconciling...", fg="gray")
+
+    def worker():
+        try:
+            updated, warnings = excel_export.reconcile_from_excel()
+            msg = f"Reconciled {updated} row(s)."
+            if warnings:
+                msg += f" {len(warnings)} warning(s) — see console."
+                for w in warnings:
+                    print(f"[RECONCILE] {w}")
+            color = "green" if not warnings else "orange"
+        except Exception as e:
+            msg, color = f"Reconcile failed: {e}", "red"
+        root.after(0, lambda: excel_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(excel_btn_row, text="Export Today's Report", command=lambda: export_excel_report(True),
+          bg="lightblue").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(excel_btn_row, text="Export Full History", command=lambda: export_excel_report(False),
+          bg="lightblue").pack(side=tk.LEFT, padx=4)
+if DATA_AUTHORITY_MODE == "excel":
+    tk.Button(excel_btn_row, text="Reconcile from Excel", command=reconcile_from_excel_gui,
+              bg="khaki").pack(side=tk.LEFT, padx=4)
+
+# ---- JSON report — same metadata as the CSV/Excel report above, as a
+# regenerated JSON file (vision.storage.json_logger.build_json_report),
+# for anything that would rather read JSON than parse CSV/xlsx. This is
+# IN ADDITION to the live captures_log.jsonl every capture already
+# appends to automatically (see vision.storage.json_logger's module
+# docstring) — these buttons are the on-demand "everything, right now,
+# as one JSON file" regenerate, same as the Excel buttons above.
+json_status_label = tk.Label(excel_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+json_status_label.pack(anchor=tk.W, pady=(6, 4))
+
+json_btn_row = tk.Frame(excel_frame)
+json_btn_row.pack(fill=tk.X)
+
+
+def export_json_report(session_only: bool = False):
+    json_status_label.config(text="Exporting JSON...", fg="gray")
+
+    def worker():
+        try:
+            sid = session_manager.today_session_id() if session_only else None
+            path = json_logger.build_json_report(session_id=sid)
+            msg, color = f"JSON report written to {path}", "green"
+        except Exception as e:
+            msg, color = f"JSON export failed: {e}", "red"
+        root.after(0, lambda: json_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(json_btn_row, text="Export Today's JSON", command=lambda: export_json_report(True),
+          bg="lightblue").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(json_btn_row, text="Export Full History JSON", command=lambda: export_json_report(False),
+          bg="lightblue").pack(side=tk.LEFT, padx=4)
+tk.Label(excel_frame,
+         text=f"Live append log (every capture, automatically): "
+              f"{os.path.join(JSON_LOG_DIR, JSON_LOG_FILENAME)}",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
+
+# ---- Export by Date Range — same Excel + JSON reports as the buttons
+# above, scoped to a specific "YYYY-MM-DD" .. "YYYY-MM-DD" window
+# instead of just "today" or "everything" (see mongo_client.
+# objects_in_date_range — filters on captured_at, so it's correct even
+# when the range spans more than one session/day).
+excel_range_frame = tk.Frame(excel_frame)
+excel_range_frame.pack(fill=tk.X, pady=(8, 0))
+tk.Label(excel_range_frame, text="Export by Date Range:", font=("Arial", 9, "bold")
+          ).grid(row=0, column=0, columnspan=4, sticky=tk.W)
+tk.Label(excel_range_frame, text="Start (YYYY-MM-DD):").grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
+excel_range_start_entry = tk.Entry(excel_range_frame, width=12)
+excel_range_start_entry.grid(row=1, column=1, sticky=tk.W, padx=(4, 16), pady=(2, 0))
+tk.Label(excel_range_frame, text="End (YYYY-MM-DD):").grid(row=1, column=2, sticky=tk.W, pady=(2, 0))
+excel_range_end_entry = tk.Entry(excel_range_frame, width=12)
+excel_range_end_entry.grid(row=1, column=3, sticky=tk.W, padx=(4, 0), pady=(2, 0))
+
+excel_range_btn_row = tk.Frame(excel_frame)
+excel_range_btn_row.pack(fill=tk.X, pady=(4, 0))
+
+
+def _read_date_range_or_error(start_entry: tk.Entry, end_entry: tk.Entry):
+    """Shared helper — pulls/validates the two date fields, shows a
+    messagebox and returns None if either is blank or malformed (raw
+    format errors are caught here; start-after-end is still caught by
+    mongo_client.objects_in_date_range down in the worker thread)."""
+    start_date = start_entry.get().strip()
+    end_date = end_entry.get().strip()
+    if not start_date or not end_date:
+        messagebox.showerror("Date range required", "Enter both a start and end date (YYYY-MM-DD).")
+        return None
+    for label, value in (("Start", start_date), ("End", end_date)):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("Invalid date", f"{label} date '{value}' isn't in YYYY-MM-DD form.")
+            return None
+    return start_date, end_date
+
+
+def export_excel_and_json_range():
+    parsed = _read_date_range_or_error(excel_range_start_entry, excel_range_end_entry)
+    if parsed is None:
+        return
+    start_date, end_date = parsed
+    excel_status_label.config(text=f"Exporting {start_date}..{end_date} (Excel)...", fg="gray")
+    json_status_label.config(text=f"Exporting {start_date}..{end_date} (JSON)...", fg="gray")
+
+    def worker():
+        try:
+            xlsx_path = excel_export.build_report(start_date=start_date, end_date=end_date)
+            xlsx_msg, xlsx_color = f"Report written to {xlsx_path}", "green"
+        except Exception as e:
+            xlsx_msg, xlsx_color = f"Excel export failed: {e}", "red"
+        try:
+            json_path = json_logger.build_json_report(start_date=start_date, end_date=end_date)
+            json_msg, json_color = f"JSON report written to {json_path}", "green"
+        except Exception as e:
+            json_msg, json_color = f"JSON export failed: {e}", "red"
+
+        def apply():
+            excel_status_label.config(text=xlsx_msg, fg=xlsx_color)
+            json_status_label.config(text=json_msg, fg=json_color)
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(excel_range_btn_row, text="Export Range (Excel + JSON)",
+          command=export_excel_and_json_range, bg="lightblue").pack(side=tk.LEFT)
+
+# =====================================================================
+# DATA PACKAGE — export a self-contained folder (images + a portable
+# CSV, relative paths) for handing captured data off to another
+# machine, archiving it, or backing it up; import reads one of these
+# folders back in and replays each row through the same
+# capture_pipeline.record_capture() every other capture path uses, so
+# an imported object gets identical session/catalog/CSV/Excel
+# treatment. See vision/storage/package_export.py's module docstring
+# for why this is a separate thing from the live CSV/Excel report
+# above (that one uses THIS machine's absolute image paths — not
+# portable to a different machine on its own; a package's paths are
+# relative to the package folder and its images are physically copied
+# alongside it).
+# =====================================================================
+package_frame = tk.LabelFrame(tab_sync_storage, text=" Data Package (Export / Import) ", padx=10, pady=10)
+package_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(package_frame,
+         text="Export copies images + a portable CSV into one folder you can move to another "
+              "machine, back up, or archive. Import reads that folder back in.",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+package_status_label = tk.Label(package_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+package_status_label.pack(anchor=tk.W, pady=(2, 4))
+
+package_btn_row = tk.Frame(package_frame)
+package_btn_row.pack(fill=tk.X)
+
+
+def export_package_gui(all_history: bool):
+    parent_dir = filedialog.askdirectory(title="Choose where to create the export folder")
+    if not parent_dir:
+        return  # user cancelled
+    folder_name = f"export_{'all_history' if all_history else session_manager.today_session_id()}_{datetime.now().strftime('%H%M%S')}"
+    dest_dir = os.path.join(parent_dir, folder_name)
+
+    package_status_label.config(text="Exporting package...", fg="gray")
+
+    def worker():
+        try:
+            path, count, warnings = package_export.export_package(dest_dir, all_history=all_history)
+            msg = f"Exported {count} object(s) to {path}."
+            if warnings:
+                msg += f" {len(warnings)} warning(s) — see console."
+                for w in warnings:
+                    print(f"[EXPORT PACKAGE] {w}")
+            color = "green" if not warnings else "orange"
+        except Exception as e:
+            msg, color = f"Export failed: {e}", "red"
+        root.after(0, lambda: package_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def import_package_gui():
+    package_dir = filedialog.askdirectory(title="Choose a package folder to import (must contain captures_log.csv)")
+    if not package_dir:
+        return  # user cancelled
+
+    if not messagebox.askyesno(
+            "Import package",
+            f"Import every capture from:\n{package_dir}\n\n"
+            f"Each row becomes a NEW object in this machine's MongoDB (fresh "
+            f"object_id, images copied into local storage) — this does not "
+            f"overwrite or deduplicate against anything already here. Continue?"):
+        return
+
+    package_status_label.config(text="Importing package...", fg="gray")
+
+    def worker():
+        try:
+            imported, skipped, warnings = package_export.import_package(package_dir)
+            msg = f"Imported {imported} object(s), skipped {skipped}."
+            if warnings:
+                msg += f" {len(warnings)} warning(s) — see console."
+                for w in warnings:
+                    print(f"[IMPORT PACKAGE] {w}")
+            color = "green" if not warnings and skipped == 0 else "orange"
+        except Exception as e:
+            msg, color = f"Import failed: {e}", "red"
+
+        def apply():
+            package_status_label.config(text=msg, fg=color)
+            try:
+                refresh_objects_list()
+                refresh_images_list()
+                refresh_inventory_list()
+            except NameError:
+                pass
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(package_btn_row, text="Export Today's Package", command=lambda: export_package_gui(False),
+          bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(package_btn_row, text="Export Full History Package", command=lambda: export_package_gui(True),
+          bg="lightgreen").pack(side=tk.LEFT, padx=4)
+tk.Button(package_btn_row, text="Import Package...", command=import_package_gui,
+          bg="khaki").pack(side=tk.LEFT, padx=4)
+
+# ---- Export Package by Date Range — same portable images+CSV+JSON
+# folder as the buttons above, scoped to a "YYYY-MM-DD" .. "YYYY-MM-DD"
+# window instead of just "today" or "everything".
+package_range_frame = tk.Frame(package_frame)
+package_range_frame.pack(fill=tk.X, pady=(8, 0))
+tk.Label(package_range_frame, text="Export Package by Date Range:", font=("Arial", 9, "bold")
+          ).grid(row=0, column=0, columnspan=5, sticky=tk.W)
+tk.Label(package_range_frame, text="Start (YYYY-MM-DD):").grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
+package_range_start_entry = tk.Entry(package_range_frame, width=12)
+package_range_start_entry.grid(row=1, column=1, sticky=tk.W, padx=(4, 16), pady=(2, 0))
+tk.Label(package_range_frame, text="End (YYYY-MM-DD):").grid(row=1, column=2, sticky=tk.W, pady=(2, 0))
+package_range_end_entry = tk.Entry(package_range_frame, width=12)
+package_range_end_entry.grid(row=1, column=3, sticky=tk.W, padx=(4, 8), pady=(2, 0))
+
+
+def export_package_range_gui():
+    parsed = _read_date_range_or_error(package_range_start_entry, package_range_end_entry)
+    if parsed is None:
+        return
+    start_date, end_date = parsed
+
+    parent_dir = filedialog.askdirectory(title="Choose where to create the export folder")
+    if not parent_dir:
+        return  # user cancelled
+    folder_name = f"export_{start_date}_to_{end_date}_{datetime.now().strftime('%H%M%S')}"
+    dest_dir = os.path.join(parent_dir, folder_name)
+
+    package_status_label.config(text=f"Exporting {start_date}..{end_date} package...", fg="gray")
+
+    def worker():
+        try:
+            path, count, warnings = package_export.export_package(
+                dest_dir, start_date=start_date, end_date=end_date)
+            msg = f"Exported {count} object(s) to {path}."
+            if warnings:
+                msg += f" {len(warnings)} warning(s) — see console."
+                for w in warnings:
+                    print(f"[EXPORT PACKAGE] {w}")
+            color = "green" if not warnings else "orange"
+        except Exception as e:
+            msg, color = f"Export failed: {e}", "red"
+        root.after(0, lambda: package_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(package_range_frame, text="Export Range Package...", command=export_package_range_gui,
+          bg="lightgreen").grid(row=1, column=4, sticky=tk.W, padx=(4, 0), pady=(2, 0))
+
+# =====================================================================
+# STORAGE LOCATION (PERMANENT) — where everything above actually lives
+# on disk: images, CSV/JSON logs, the Excel report. See
+# vision.storage.storage_location's module docstring for why this
+# exists — short version: a path relative to the repo folder meant
+# deleting/replacing the repo silently orphaned every photo/report ever
+# captured. The chosen root is persisted OUTSIDE the repo (in the
+# user's home directory), so it — and the data at it — survive that.
+# =====================================================================
+storage_loc_frame = tk.LabelFrame(tab_sync_storage, text=" Storage Location (Permanent) ", padx=10, pady=10)
+storage_loc_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(storage_loc_frame,
+         text="Where images, CSV/JSON logs, and the Excel report are actually written. "
+              "Persisted outside this folder, so it (and the data at it) survive deleting "
+              "or replacing this repo/app folder. Switching does NOT move existing files — "
+              "use \"Manage Storage Folders\" below if you want to consolidate an old "
+              "location into the new one.",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+storage_loc_path_label = tk.Label(storage_loc_frame, text="", font=("Arial", 9, "bold"),
+                                   wraplength=680, justify=tk.LEFT, anchor="w")
+storage_loc_path_label.pack(fill=tk.X, pady=(6, 4))
+
+
+def refresh_storage_location_label():
+    storage_loc_path_label.config(text=f"Current: {storage_location.get_storage_root()}")
+
+
+def choose_storage_location():
+    path = filedialog.askdirectory(title="Choose a folder for permanent storage")
+    if not path:
+        return
+    try:
+        storage_location.set_storage_root(path)
+    except Exception as e:
+        messagebox.showerror("Could not set storage location", str(e))
+        return
+    refresh_storage_location_label()
+    messagebox.showinfo(
+        "Storage location updated",
+        f"New captures/exports will now be written to:\n{path}\n\n"
+        f"Existing files at the previous location were NOT moved.")
+
+
+def reset_storage_location_to_default():
+    if not messagebox.askyesno(
+            "Reset to default",
+            f"Reset the storage location to the default?\n\n{storage_location.DEFAULT_STORAGE_ROOT}\n\n"
+            f"Existing files at the current location will NOT be moved."):
+        return
+    try:
+        storage_location.set_storage_root(storage_location.DEFAULT_STORAGE_ROOT)
+    except Exception as e:
+        messagebox.showerror("Could not reset storage location", str(e))
+        return
+    refresh_storage_location_label()
+
+
+storage_loc_btn_row = tk.Frame(storage_loc_frame)
+storage_loc_btn_row.pack(anchor=tk.W, pady=(2, 0))
+tk.Button(storage_loc_btn_row, text="Choose Folder...", command=choose_storage_location,
+          bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(storage_loc_btn_row, text="Reset to Default", command=reset_storage_location_to_default
+          ).pack(side=tk.LEFT, padx=4)
+tk.Button(storage_loc_btn_row, text="Refresh", command=refresh_storage_location_label,
+          bg="lightblue").pack(side=tk.LEFT, padx=4)
+
+refresh_storage_location_label()
+
+# =====================================================================
+# MANAGE STORAGE FOLDERS — pure file-level tools for the folders the
+# Excel reports and exported package photos actually live in (see
+# vision.storage.package_export's "FOLDER-LEVEL MERGE / SYNC" section).
+# Separate from the Data Package Export/Import above: those talk to
+# MongoDB (export reads Mongo, import writes to it); this section only
+# ever touches folders on disk — merging two exported packages
+# together, two-way syncing them, or deleting one that's just taking
+# up space (e.g. left over from a previous experiment).
+# =====================================================================
+folders_frame = tk.LabelFrame(tab_sync_storage, text=" Manage Storage Folders ", padx=10, pady=10)
+folders_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(folders_frame,
+         text="Merge, sync, or delete exported package folders (each one holding "
+              "captures_log.csv/.json + an images/ folder — see Data Package above). "
+              "Purely file-level: nothing here touches MongoDB.",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+folders_pick_frame = tk.Frame(folders_frame)
+folders_pick_frame.pack(fill=tk.X, pady=(6, 2))
+tk.Label(folders_pick_frame, text="Folder A:").grid(row=0, column=0, sticky=tk.W)
+folder_a_entry = tk.Entry(folders_pick_frame, width=48)
+folder_a_entry.grid(row=0, column=1, sticky=tk.W, padx=(4, 4))
+tk.Button(folders_pick_frame, text="Browse...",
+          command=lambda: _browse_into(folder_a_entry)).grid(row=0, column=2, sticky=tk.W)
+
+tk.Label(folders_pick_frame, text="Folder B:").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+folder_b_entry = tk.Entry(folders_pick_frame, width=48)
+folder_b_entry.grid(row=1, column=1, sticky=tk.W, padx=(4, 4), pady=(4, 0))
+tk.Button(folders_pick_frame, text="Browse...",
+          command=lambda: _browse_into(folder_b_entry)).grid(row=1, column=2, sticky=tk.W, pady=(4, 0))
+
+
+def _browse_into(entry_widget: tk.Entry):
+    path = filedialog.askdirectory(title="Choose a folder")
+    if path:
+        entry_widget.delete(0, tk.END)
+        entry_widget.insert(0, path)
+
+
+folders_status_label = tk.Label(folders_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+folders_status_label.pack(anchor=tk.W, pady=(6, 4))
+
+
+def _both_folders_or_error():
+    a = folder_a_entry.get().strip()
+    b = folder_b_entry.get().strip()
+    if not a or not b:
+        messagebox.showerror("Pick both folders", "Choose both Folder A and Folder B first.")
+        return None
+    if not os.path.isdir(a):
+        messagebox.showerror("Not found", f"Folder A doesn't exist:\n{a}")
+        return None
+    if not os.path.isdir(b):
+        messagebox.showerror("Not found", f"Folder B doesn't exist:\n{b}")
+        return None
+    if os.path.abspath(a) == os.path.abspath(b):
+        messagebox.showerror("Same folder picked twice", "Folder A and Folder B must be different.")
+        return None
+    return a, b
+
+
+def merge_folders_into_new():
+    picked = _both_folders_or_error()
+    if picked is None:
+        return
+    a, b = picked
+    dest = filedialog.askdirectory(title="Choose (or create) a destination folder for the merged result")
+    if not dest:
+        return
+    folders_status_label.config(text="Merging...", fg="gray")
+
+    def worker():
+        try:
+            count, warnings = package_export.merge_packages([a, b], dest)
+            msg = f"Merged {count} object(s) into '{dest}'."
+            if warnings:
+                msg += f" {len(warnings)} warning(s) — see console."
+                for w in warnings:
+                    print(f"[MERGE FOLDERS] {w}")
+            color = "green" if not warnings else "orange"
+        except Exception as e:
+            msg, color = f"Merge failed: {e}", "red"
+        root.after(0, lambda: folders_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def sync_folders_two_way():
+    picked = _both_folders_or_error()
+    if picked is None:
+        return
+    a, b = picked
+    if not messagebox.askyesno(
+            "Two-way sync",
+            f"Sync Folder A and Folder B so both end up holding the union of what either "
+            f"has (images + combined captures_log.csv/.json)?\n\nA: {a}\nB: {b}\n\n"
+            f"Existing files in each folder are kept; nothing is deleted."):
+        return
+    folders_status_label.config(text="Syncing...", fg="gray")
+
+    def worker():
+        try:
+            count_a, warnings_a = package_export.merge_packages([a, b], a)
+            count_b, warnings_b = package_export.merge_packages([a, b], b)
+            warnings = warnings_a + warnings_b
+            msg = f"Synced — both folders now hold {max(count_a, count_b)} object(s)."
+            if warnings:
+                msg += f" {len(warnings)} warning(s) — see console."
+                for w in warnings:
+                    print(f"[SYNC FOLDERS] {w}")
+            color = "green" if not warnings else "orange"
+        except Exception as e:
+            msg, color = f"Sync failed: {e}", "red"
+        root.after(0, lambda: folders_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+folders_btn_row = tk.Frame(folders_frame)
+folders_btn_row.pack(anchor=tk.W, pady=(2, 0))
+tk.Button(folders_btn_row, text="Merge A + B into New Folder...", command=merge_folders_into_new,
+          bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(folders_btn_row, text="Sync A <-> B (two-way)", command=sync_folders_two_way,
+          bg="lightblue").pack(side=tk.LEFT, padx=4)
+
+# ---- Delete a folder — separate row, separate confirmation, since this
+# one is destructive and irreversible (unlike merge/sync above, which
+# only ever ADD files).
+tk.Label(folders_frame, text="Delete a folder (e.g. an old export left over from a "
+                              "previous experiment) — permanent, cannot be undone:",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 2))
+
+delete_folder_row = tk.Frame(folders_frame)
+delete_folder_row.pack(fill=tk.X, pady=(0, 2))
+delete_folder_entry = tk.Entry(delete_folder_row, width=48)
+delete_folder_entry.grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
+tk.Button(delete_folder_row, text="Browse...",
+          command=lambda: _browse_into(delete_folder_entry)).grid(row=0, column=1, sticky=tk.W)
+
+
+def delete_storage_folder():
+    folder = delete_folder_entry.get().strip()
+    if not folder:
+        messagebox.showerror("Pick a folder", "Choose a folder to delete first.")
+        return
+    if not os.path.isdir(folder):
+        messagebox.showerror("Not found", f"Folder doesn't exist:\n{folder}")
+        return
+    if not package_export.looks_like_package_folder(folder):
+        if not messagebox.askyesno(
+                "Doesn't look like a package folder",
+                f"'{folder}' doesn't contain a captures_log.csv or an images/ folder — "
+                f"are you sure this is the right folder to delete?"):
+            return
+    if not messagebox.askyesno(
+            "Delete folder",
+            f"Permanently delete this folder and everything in it?\n\n{folder}\n\n"
+            f"This cannot be undone."):
+        return
+    # Second, explicit confirmation for a destructive, irreversible disk
+    # operation — matches the Cleanup tab's bulk-Mongo-delete pattern
+    # (preview/confirm before anything irreversible happens), just via
+    # a second dialog instead of a preview-count step since there's no
+    # meaningful "count" to preview for a folder delete.
+    if not messagebox.askyesno("Are you sure?", "Really delete this folder? Last chance to cancel."):
+        return
+
+    folders_status_label.config(text="Deleting...", fg="gray")
+
+    def worker():
+        try:
+            shutil.rmtree(folder)
+            msg, color = f"Deleted '{folder}'.", "green"
+        except Exception as e:
+            msg, color = f"Delete failed: {e}", "red"
+        root.after(0, lambda: folders_status_label.config(text=msg, fg=color))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(folders_frame, text="Delete Folder...", command=delete_storage_folder,
+          bg="salmon").pack(anchor=tk.W, pady=(2, 0))
+
 
 # =====================================================================
 # DATA COLLECTION TAB — "pick up an object, rotate it via J4, take N
@@ -3668,6 +4761,45 @@ tk.Label(dc_sweep_frame, text="Settle time (s):").grid(row=1, column=0, sticky=t
 dc_interval_entry = tk.Entry(dc_sweep_frame, width=6)
 dc_interval_entry.insert(0, str(VIEW_SETTLE_SECONDS))
 dc_interval_entry.grid(row=1, column=1, sticky=tk.W, padx=(4, 20))
+
+# ---- Manual Snapshot — the Camera tab's one-click, no-arm-movement,
+# multi-camera "Capture Photo" flow, available here too so a labeled
+# reference/one-off shot can be taken without leaving the Data
+# Collection tab. Uses the SAME run_manual_snapshot() helper as the
+# Camera tab (defined further down, alongside that tab's UI) — one
+# implementation, two entry points — and lands in the "Today's
+# Captures" list below just like a rotation sequence would.
+dc_manual_frame = tk.LabelFrame(tab_data_collection, text=" Manual Snapshot ", padx=10, pady=10)
+dc_manual_frame.pack(fill=tk.X, padx=10, pady=4)
+
+tk.Label(dc_manual_frame,
+         text="One-click snapshot from every configured camera (no arm movement, no "
+              "rotation) — for a labeled reference photo or one-off shot, separate "
+              "from a full rotation sweep above.",
+         fg="gray", font=("Arial", 8), wraplength=640, justify=tk.LEFT
+         ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 4))
+
+tk.Label(dc_manual_frame, text="Label:").grid(row=1, column=0, sticky=tk.W, pady=2)
+dc_manual_label_var = tk.StringVar(value="")
+dc_manual_label_combo = ttk.Combobox(
+    dc_manual_frame, textvariable=dc_manual_label_var, width=26,
+    values=["uncategorized", "test_object", "calibration_shot",
+            "reference_photo", "manual_snapshot"])
+dc_manual_label_combo.grid(row=1, column=1, sticky=tk.W, padx=(4, 20))
+
+dc_manual_snapshot_btn = tk.Button(dc_manual_frame, text="Capture Snapshot", bg="lightgreen")
+dc_manual_snapshot_btn.grid(row=1, column=2, sticky=tk.W, padx=4)
+
+dc_manual_status_label = tk.Label(dc_manual_frame, text="", fg="gray", wraplength=640, justify=tk.LEFT)
+dc_manual_status_label.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(4, 0))
+
+
+def start_manual_snapshot_dc():
+    label = dc_manual_label_var.get().strip() or _default_manual_snapshot_label()
+    run_manual_snapshot(label, dc_manual_status_label, on_done=refresh_dc_today_list)
+
+
+dc_manual_snapshot_btn.config(command=start_manual_snapshot_dc)
 
 dc_status_label = tk.Label(tab_data_collection, text="", fg="gray", wraplength=680, justify=tk.LEFT)
 dc_status_label.pack(anchor=tk.W, padx=10, pady=(4, 0))
@@ -3770,6 +4902,8 @@ def run_data_collection_rotation_local(name, category, color, size,
         object_id, warnings = record_capture(
             name=name, image_paths_by_source=all_pairs,
             category=category or None, color=color or None, size=size or None,
+            position=current_arm_position(),  # snapshot at sequence end — None (-> null) if
+                                                # the robot isn't connected/no feedback yet
         )
         for w in warnings:
             print(f"[DATA COLLECTION] {w}")
@@ -3981,54 +5115,758 @@ def refresh_dc_today_list():
     threading.Thread(target=worker, daemon=True).start()
 
 
-def delete_selected_dc_capture():
+def open_dc_today_detail(event=None):
+    """Today's Captures list is view-only — deleting a capture happens
+    on the Objects tab (Database -> Objects, multi-select "Delete
+    Selected") instead, so there's exactly one place that does it.
+    Double-click here just jumps to the same detail viewer everywhere
+    else uses."""
     selection = dc_today_listbox.curselection()
     if not selection:
         return
     idx = selection[0]
     if idx >= len(_dc_today_object_ids):
-        return  # selected the "(nothing captured yet today)" / error placeholder row
-    object_id = _dc_today_object_ids[idx]
-    if not messagebox.askyesno(
-            "Delete capture",
-            f"Delete object {object_id} and its image records from MongoDB?\n\n"
-            f"This does NOT delete the image files from disk, and does NOT change the "
-            f"Inventory 'times seen' count — only the CSV log keeps a record that a "
-            f"capture happened at all."):
+        return  # clicked a placeholder row like "(nothing captured...)" or "Error: ..."
+    show_object_detail(_dc_today_object_ids[idx])
+
+
+dc_today_listbox.bind("<Double-Button-1>", open_dc_today_detail)
+
+dc_manage_btn_row = tk.Frame(dc_manage_frame)
+dc_manage_btn_row.pack(anchor=tk.W, pady=(4, 0))
+tk.Button(dc_manage_btn_row, text="Refresh", command=refresh_dc_today_list,
+          bg="lightblue").pack(side=tk.LEFT)
+
+root.after(0, refresh_dc_today_list)
+
+# =====================================================================
+# ATTRIBUTE COLUMNS — add/remove fixed columns on the fly (e.g. "Is
+# Metal", "Diffusion"), backed by vision.storage.attribute_schema
+# (attribute_schema.json). A newly added column immediately shows up
+# everywhere that reads the schema live: the object detail viewer
+# (shows "null" until a value is set), the next Excel/JSON report
+# export, and the Attribute Review viewer below. Existing MongoDB
+# documents don't retroactively gain the field — see attribute_schema.
+# add_fixed_column()'s docstring — they just read back as missing/null
+# until edited (e.g. via Attribute Review).
+# =====================================================================
+dc_attrs_frame = tk.LabelFrame(tab_data_collection, text=" Attribute Columns ", padx=10, pady=10)
+dc_attrs_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(dc_attrs_frame,
+         text="Add or remove the fixed attribute columns every capture gets tracked "
+              "against (beyond Name/Category/Color/Size) — e.g. \"Is Metal\", "
+              "\"Diffusion\". Changes apply immediately to new Excel/JSON exports and "
+              "the object detail viewer; existing captures show \"null\" for a new "
+              "column until given a value (see Attribute Review below).",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+dc_attrs_list_frame = tk.Frame(dc_attrs_frame)
+dc_attrs_list_frame.pack(fill=tk.X, pady=(6, 4))
+dc_attrs_listbox = tk.Listbox(dc_attrs_list_frame, height=6)
+dc_attrs_listbox.pack(side=tk.LEFT, fill=tk.X, expand=1)
+dc_attrs_scrollbar = tk.Scrollbar(dc_attrs_list_frame, orient=tk.VERTICAL, command=dc_attrs_listbox.yview)
+dc_attrs_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+dc_attrs_listbox.config(yscrollcommand=dc_attrs_scrollbar.set)
+
+_dc_attr_keys = []  # parallel to dc_attrs_listbox rows — the "removable" ones (fixed_columns only)
+
+
+def refresh_dc_attrs_list():
+    dc_attrs_listbox.delete(0, tk.END)
+    _dc_attr_keys.clear()
+    schema = attribute_schema.load_schema()
+    for c in schema.get("fixed_columns", []):
+        dc_attrs_listbox.insert(
+            tk.END, f"{c['label']}  (key: {c['key']}, type: {c.get('type', 'string')})")
+        _dc_attr_keys.append(c["key"])
+    for c in schema.get("position_columns", []):
+        dc_attrs_listbox.insert(tk.END, f"{c['label']}  (position column — fixed, not removable here)")
+        _dc_attr_keys.append(None)
+    for c in schema.get("reserved_columns", []):
+        dc_attrs_listbox.insert(
+            tk.END, f"{c['label']}  (reserved slot: {c['key']} — rename instead of removing)")
+        _dc_attr_keys.append(None)
+
+
+dc_attrs_add_row = tk.Frame(dc_attrs_frame)
+dc_attrs_add_row.pack(fill=tk.X, pady=(2, 0))
+tk.Label(dc_attrs_add_row, text="New attribute label (e.g. \"Is Metal\"):").grid(
+    row=0, column=0, sticky=tk.W)
+dc_attrs_new_label_entry = tk.Entry(dc_attrs_add_row, width=22)
+dc_attrs_new_label_entry.grid(row=0, column=1, sticky=tk.W, padx=(4, 16))
+tk.Label(dc_attrs_add_row, text="Type:").grid(row=0, column=2, sticky=tk.W)
+dc_attrs_new_type_combo = ttk.Combobox(dc_attrs_add_row, width=10, state="readonly",
+                                        values=["string", "number", "boolean"])
+dc_attrs_new_type_combo.set("string")
+dc_attrs_new_type_combo.grid(row=0, column=3, sticky=tk.W, padx=(4, 0))
+
+dc_attrs_status_label = tk.Label(dc_attrs_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+dc_attrs_status_label.pack(anchor=tk.W, pady=(4, 2))
+
+
+def _slugify_attr_key(label: str) -> str:
+    """'Is Metal' -> 'is_metal' — a safe, stable Mongo/CSV/JSON field
+    key derived from whatever label the user typed."""
+    slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in label.strip())
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug.strip("_") or "attr"
+
+
+def add_dc_attribute():
+    label = dc_attrs_new_label_entry.get().strip()
+    if not label:
+        messagebox.showerror("Label required", "Enter a label for the new attribute first.")
         return
+    key = _slugify_attr_key(label)
+    col_type = dc_attrs_new_type_combo.get() or "string"
+    try:
+        attribute_schema.add_fixed_column(key, label, col_type=col_type)
+        dc_attrs_status_label.config(text=f"Added '{label}' (key: {key}).", fg="green")
+        dc_attrs_new_label_entry.delete(0, tk.END)
+        refresh_dc_attrs_list()
+    except ValueError as e:
+        dc_attrs_status_label.config(text=str(e), fg="red")
+
+
+def remove_dc_attribute():
+    selection = dc_attrs_listbox.curselection()
+    if not selection:
+        return
+    idx = selection[0]
+    key = _dc_attr_keys[idx] if idx < len(_dc_attr_keys) else None
+    if key is None:
+        messagebox.showinfo("Not removable here",
+                             "Position and reserved columns aren't removable from this list — "
+                             "edit attribute_schema.json directly if you really need to.")
+        return
+    if not messagebox.askyesno(
+            "Remove attribute",
+            f"Remove the '{key}' column from the schema going forward?\n\n"
+            f"This does NOT delete the field from existing MongoDB documents/CSV rows — "
+            f"it just stops appearing in newly generated Excel/JSON reports and the "
+            f"object detail viewer."):
+        return
+    attribute_schema.remove_fixed_column(key)
+    dc_attrs_status_label.config(text=f"Removed '{key}'.", fg="green")
+    refresh_dc_attrs_list()
+
+
+dc_attrs_btn_row = tk.Frame(dc_attrs_frame)
+dc_attrs_btn_row.pack(anchor=tk.W, pady=(4, 0))
+tk.Button(dc_attrs_btn_row, text="Add Attribute", command=add_dc_attribute,
+          bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(dc_attrs_btn_row, text="Remove Selected", command=remove_dc_attribute,
+          bg="salmon").pack(side=tk.LEFT, padx=4)
+tk.Button(dc_attrs_btn_row, text="Refresh List", command=refresh_dc_attrs_list,
+          bg="lightblue").pack(side=tk.LEFT, padx=4)
+
+refresh_dc_attrs_list()
+
+# =====================================================================
+# ATTRIBUTE REVIEW — upload an exported .xlsx (the "Attribute Data
+# Collection" sheet) and step through its rows one object at a time:
+# every image for that object, plus editable fields for every current
+# fixed column (including anything added above), saved straight back to
+# MongoDB per-object as you go (mongo_client.update_object_data — the
+# same write reconcile_from_excel does, just interactively and one row
+# at a time with the photo right there instead of hand-editing cells
+# blind). See vision.storage.excel_export.read_log_rows().
+# =====================================================================
+dc_review_frame = tk.LabelFrame(tab_data_collection, text=" Attribute Review ", padx=10, pady=10)
+dc_review_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(dc_review_frame,
+         text="Review the current Excel report (or upload any other exported one) and step "
+              "through its captures one at a time — see every image for that object and edit "
+              "its attributes (including any you've added above), saved to MongoDB as you go.",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+dc_review_missing_only_var = tk.BooleanVar(value=False)
+tk.Checkbutton(dc_review_frame,
+               text="Only show captures missing attribute data (any fixed column left blank)",
+               variable=dc_review_missing_only_var).pack(anchor=tk.W, pady=(4, 0))
+
+dc_review_status_label = tk.Label(dc_review_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+dc_review_status_label.pack(anchor=tk.W, pady=(4, 4))
+
+
+def _row_is_missing_data(row: dict) -> bool:
+    """True if this row's `data` dict is missing (null/blank/"unknown")
+    a value for any fixed column other than 'name' — used by the
+    "only show captures missing attribute data" filter, both here and
+    for the Inventory Attribute Review below."""
+    for key in attribute_schema.fixed_column_keys():
+        if key == "name":
+            continue
+        value = row["data"].get(key)
+        if value in (None, "", attribute_schema.UNKNOWN):
+            return True
+    return False
+
+
+def _apply_missing_filter(rows: list) -> list:
+    if not dc_review_missing_only_var.get():
+        return rows
+    return [r for r in rows if _row_is_missing_data(r)]
+
+
+def review_current_report():
+    """Regenerates the full-history Excel report fresh, then opens the
+    Attribute Review viewer against it directly — no file picker
+    needed, this is always "whatever's actually in Mongo right now"."""
+    dc_review_status_label.config(text="Regenerating current report...", fg="gray")
 
     def worker():
         try:
-            mongo_client.delete_object(object_id)
+            path = excel_export.build_report()
+            rows = excel_export.read_log_rows(path)
             err = None
         except Exception as e:
-            err = str(e)
+            rows, path, err = None, None, str(e)
 
         def apply():
-            if err:
-                messagebox.showerror("Delete failed", err)
-            refresh_dc_today_list()
-            try:
-                refresh_objects_list()
-                refresh_images_list()
-            except NameError:
-                pass
+            if err is not None:
+                dc_review_status_label.config(text=f"Could not build/read report: {err}", fg="red")
+                return
+            filtered = _apply_missing_filter(rows)
+            if not filtered:
+                msg = ("No captures found." if not rows
+                       else "No captures are missing attribute data — nothing to review!")
+                dc_review_status_label.config(text=msg, fg="green" if rows else "orange")
+                return
+            dc_review_status_label.config(
+                text=f"Reviewing {len(filtered)} of {len(rows)} capture(s) from the current report.",
+                fg="green")
+            open_attribute_review_viewer(filtered)
 
         root.after(0, apply)
 
     threading.Thread(target=worker, daemon=True).start()
 
 
-dc_manage_btn_row = tk.Frame(dc_manage_frame)
-dc_manage_btn_row.pack(anchor=tk.W, pady=(4, 0))
-tk.Button(dc_manage_btn_row, text="Refresh", command=refresh_dc_today_list,
+def start_attribute_review():
+    path = filedialog.askopenfilename(
+        title="Choose an exported Excel report to review",
+        filetypes=[("Excel files", "*.xlsx")])
+    if not path:
+        return  # user cancelled
+
+    dc_review_status_label.config(text="Reading sheet...", fg="gray")
+
+    def worker():
+        try:
+            rows = excel_export.read_log_rows(path)
+            err = None
+        except Exception as e:
+            rows, err = None, str(e)
+
+        def apply():
+            if err is not None:
+                dc_review_status_label.config(text=f"Could not read '{path}': {err}", fg="red")
+                return
+            if not rows:
+                dc_review_status_label.config(text=f"No rows found in '{path}'.", fg="orange")
+                return
+            filtered = _apply_missing_filter(rows)
+            if not filtered:
+                dc_review_status_label.config(
+                    text="No captures in this sheet are missing attribute data — nothing to review!",
+                    fg="orange")
+                return
+            dc_review_status_label.config(
+                text=f"Reviewing {len(filtered)} of {len(rows)} row(s) from {path}.", fg="green")
+            open_attribute_review_viewer(filtered)
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+dc_review_btn_row = tk.Frame(dc_review_frame)
+dc_review_btn_row.pack(anchor=tk.W, pady=(2, 0))
+tk.Button(dc_review_btn_row, text="Review Current Report", command=review_current_report,
+          bg="lightgreen").pack(side=tk.LEFT, padx=(0, 4))
+tk.Button(dc_review_btn_row, text="Load & Review Excel Sheet...", command=start_attribute_review,
+          bg="lightblue").pack(side=tk.LEFT, padx=4)
+
+
+def open_attribute_review_viewer(rows: list):
+    """
+    One row/object at a time: every linked image, plus editable fields
+    for every current fixed column and a raw-JSON box for the freeform
+    "why" attributes. "Save & Next" writes straight to MongoDB
+    (mongo_client.update_object_data) then advances — nothing is queued
+    or held back to the end, matching how every other write in this
+    app behaves (immediate, one object at a time).
+    """
+    viewer = tk.Toplevel(root)
+    viewer.title(f"Attribute Review — {len(rows)} object(s)")
+    viewer.geometry("820x720")
+
+    state = {"index": 0}
+
+    top_frame = tk.Frame(viewer, padx=10, pady=8)
+    top_frame.pack(fill=tk.X)
+    progress_label = tk.Label(top_frame, text="", font=("Arial", 10, "bold"))
+    progress_label.pack(side=tk.LEFT)
+    review_status_label = tk.Label(top_frame, text="", fg="gray")
+    review_status_label.pack(side=tk.RIGHT)
+
+    body_frame = tk.Frame(viewer)
+    body_frame.pack(fill=tk.BOTH, expand=1)
+
+    def render():
+        for child in body_frame.winfo_children():
+            child.destroy()
+        idx = state["index"]
+        row = rows[idx]
+        object_id = row["object_id"]
+        progress_label.config(text=f"Object {idx + 1} of {len(rows)}  —  {object_id}")
+        review_status_label.config(text="")
+
+        # --- Attributes panel (editable) ---
+        attrs_frame = tk.LabelFrame(body_frame, text=" Attributes ", padx=8, pady=8)
+        attrs_frame.pack(fill=tk.X, padx=10, pady=(6, 4))
+
+        labels = attribute_schema.display_labels()
+        field_widgets = {}  # key -> Entry/Combobox
+        current_data = mongo_client.get_object(object_id) or {}
+        live_data = current_data.get("data") or {}
+        for key in attribute_schema.fixed_column_keys():
+            schema_type = next(
+                (c.get("type", "string") for c in attribute_schema.load_schema().get("fixed_columns", [])
+                 if c["key"] == key), "string")
+            # Prefer the value from the uploaded sheet's row; fall back to
+            # whatever's currently live in Mongo if the sheet's cell was
+            # blank (e.g. the column was added after that sheet was
+            # exported).
+            value = row["data"].get(key)
+            if value in (None, ""):
+                value = live_data.get(key)
+            field_row = tk.Frame(attrs_frame)
+            field_row.pack(fill=tk.X, pady=1)
+            is_missing = value in (None, "")
+            tk.Label(field_row, text=f"{labels.get(key, key)}:", font=("Arial", 9, "bold"),
+                     width=16, anchor="w",
+                     fg="#b35900" if is_missing else "black").pack(side=tk.LEFT)
+            if schema_type == "boolean":
+                widget = ttk.Combobox(field_row, width=20, state="readonly",
+                                       values=["", "true", "false", attribute_schema.UNKNOWN])
+                widget.set("" if value in (None, "") else str(value))
+            else:
+                widget = tk.Entry(field_row, width=40)
+                if value not in (None, ""):
+                    widget.insert(0, str(value))
+            widget.pack(side=tk.LEFT, fill=tk.X, expand=1)
+            field_widgets[key] = widget
+
+        tk.Label(attrs_frame, text="Freeform attributes (JSON):", font=("Arial", 9, "bold"),
+                 anchor="w").pack(fill=tk.X, pady=(6, 0))
+        freeform_text = tk.Text(attrs_frame, height=4, font=("Courier", 8))
+        freeform_text.insert("1.0", json.dumps(row.get("freeform") or {}, indent=2))
+        freeform_text.pack(fill=tk.X)
+
+        # --- Images panel (read-only, same viewer style as show_object_detail) ---
+        images_outer = tk.LabelFrame(body_frame, text=" Images ", padx=8, pady=8)
+        images_outer.pack(fill=tk.BOTH, expand=1, padx=10, pady=(4, 6))
+
+        image_docs = mongo_client.get_images_for_object(object_id)
+        image_docs.sort(key=lambda d: d.get("captured_at") or datetime.min)
+
+        if not image_docs:
+            tk.Label(images_outer, text="No images found for this object.").pack(pady=10)
+        elif not _PIL_AVAILABLE:
+            tk.Label(images_outer, text="Install Pillow to view images: pip install Pillow",
+                     fg="red").pack(pady=10)
+        else:
+            canvas_frame = tk.Frame(images_outer)
+            canvas_frame.pack(fill=tk.BOTH, expand=1)
+            scroll_canvas = tk.Canvas(canvas_frame)
+            scrollbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=scroll_canvas.yview)
+            inner_frame = tk.Frame(scroll_canvas)
+            inner_frame.bind("<Configure>", lambda e: scroll_canvas.configure(
+                scrollregion=scroll_canvas.bbox("all")))
+            scroll_canvas.create_window((0, 0), window=inner_frame, anchor="nw")
+            scroll_canvas.configure(yscrollcommand=scrollbar.set)
+            scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=1)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+            viewer._photo_refs = []
+            for doc in image_docs:
+                raw_path = doc.get("image_path", "")
+                path = resolve_image_path(raw_path)
+                src = doc.get("source", "?")
+                view_index = doc.get("view_index", "?")
+                img_row = tk.Frame(inner_frame, pady=6)
+                img_row.pack(fill=tk.X)
+                tk.Label(img_row, text=f"{src} — view {view_index}", font=("Arial", 9, "bold")).pack()
+                try:
+                    img = Image.open(path)
+                    img.thumbnail((520, 390))
+                    photo = ImageTk.PhotoImage(img)
+                    viewer._photo_refs.append(photo)
+                    tk.Label(img_row, image=photo).pack()
+                except Exception as e:
+                    hint = "" if path == raw_path else f"\n(tried: {path})"
+                    tk.Label(img_row, text=f"Could not load '{raw_path}': {e}{hint}",
+                             fg="red", wraplength=520).pack()
+
+        # --- Nav / save row ---
+        nav_frame = tk.Frame(viewer, padx=10, pady=8)
+        nav_frame.pack(fill=tk.X)
+
+        def save_current(advance: int):
+            new_data = {}
+            for key, widget in field_widgets.items():
+                raw_value = widget.get().strip()
+                if raw_value == "":
+                    new_data[key] = None
+                    continue
+                schema_type = next(
+                    (c.get("type", "string") for c in attribute_schema.load_schema().get("fixed_columns", [])
+                     if c["key"] == key), "string")
+                if schema_type == "number":
+                    try:
+                        new_data[key] = float(raw_value) if "." in raw_value else int(raw_value)
+                    except ValueError:
+                        new_data[key] = raw_value  # keep as typed rather than losing the edit
+                else:
+                    new_data[key] = raw_value
+
+            try:
+                freeform_value = json.loads(freeform_text.get("1.0", tk.END).strip() or "{}")
+            except json.JSONDecodeError as e:
+                messagebox.showerror("Invalid JSON", f"Freeform attributes aren't valid JSON: {e}")
+                return
+            new_data[attribute_schema.freeform_key()] = freeform_value
+
+            try:
+                mongo_client.update_object_data(object_id, new_data)
+            except Exception as e:
+                messagebox.showerror("Save failed", str(e))
+                return
+
+            try:
+                refresh_objects_list()
+                refresh_images_list()
+                refresh_inventory_list()
+            except NameError:
+                pass
+
+            state["index"] = max(0, min(len(rows) - 1, state["index"] + advance))
+            if advance != 0 and 0 <= state["index"] < len(rows):
+                render()
+            elif advance == 0:
+                review_status_label.config(text="Saved.", fg="green")
+
+        tk.Button(nav_frame, text="< Previous", command=lambda: (
+            state.update(index=max(0, state["index"] - 1)), render())
+        ).pack(side=tk.LEFT)
+        tk.Button(nav_frame, text="Save", command=lambda: save_current(0),
+                  bg="lightblue").pack(side=tk.LEFT, padx=8)
+        tk.Button(nav_frame, text="Save & Next >", command=lambda: save_current(1),
+                  bg="lightgreen").pack(side=tk.LEFT)
+        tk.Button(nav_frame, text="Skip >", command=lambda: (
+            state.update(index=min(len(rows) - 1, state["index"] + 1)), render())
+        ).pack(side=tk.LEFT, padx=8)
+
+    render()
+
+
+# =====================================================================
+# INVENTORY ATTRIBUTE REVIEW — same idea as the capture-level Attribute
+# Review above, but for the object_catalog ("Inventory") entries
+# themselves: step through catalog entries missing category/color/size,
+# fill them in, saved via mongo_client.update_catalog_entry(). Separate
+# from the capture-level review because a catalog entry's shape is
+# different (name/category/color/size only — no freeform attributes,
+# no fixed attribute columns, no single "captured_at").
+# =====================================================================
+dc_inv_review_frame = tk.LabelFrame(tab_data_collection, text=" Inventory Attribute Review ", padx=10, pady=10)
+dc_inv_review_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(dc_inv_review_frame,
+         text="Step through Inventory (catalog) entries missing Category/Color/Size and fill "
+              "them in directly — separate from the per-capture review above, which edits "
+              "individual log rows rather than the catalog entry itself.",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+dc_inv_review_status_label = tk.Label(dc_inv_review_frame, text="", fg="gray",
+                                       wraplength=680, justify=tk.LEFT)
+dc_inv_review_status_label.pack(anchor=tk.W, pady=(4, 4))
+
+
+def review_inventory_missing_data():
+    dc_inv_review_status_label.config(text="Loading inventory...", fg="gray")
+
+    def worker():
+        try:
+            entries = object_catalog.list_inventory(limit=2000)
+            missing = [e for e in entries
+                       if not e.get("category") or not e.get("color") or not e.get("size")]
+            err = None
+        except Exception as e:
+            entries, missing, err = None, None, str(e)
+
+        def apply():
+            if err is not None:
+                dc_inv_review_status_label.config(text=f"Could not load inventory: {err}", fg="red")
+                return
+            if not missing:
+                msg = ("No inventory entries found." if not entries
+                       else "Every inventory entry already has Category/Color/Size — nothing to review!")
+                dc_inv_review_status_label.config(text=msg, fg="green" if entries else "orange")
+                return
+            dc_inv_review_status_label.config(
+                text=f"Reviewing {len(missing)} of {len(entries)} inventory entries missing data.",
+                fg="green")
+            open_inventory_review_viewer(missing)
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+tk.Button(dc_inv_review_frame, text="Review Inventory Entries Missing Data",
+          command=review_inventory_missing_data, bg="lightgreen").pack(anchor=tk.W, pady=(2, 0))
+
+
+def open_inventory_review_viewer(entries: list):
+    """One catalog entry at a time: name (read-only) + editable
+    Category/Color/Size, plus every image across every linked capture
+    (same aggregation as the Inventory tab's detail viewer) so you can
+    actually look at the object while filling in what it's missing.
+    "Save & Next" writes via mongo_client.update_catalog_entry()."""
+    viewer = tk.Toplevel(root)
+    viewer.title(f"Inventory Attribute Review — {len(entries)} entr{'y' if len(entries)==1 else 'ies'}")
+    viewer.geometry("820x720")
+
+    state = {"index": 0}
+    top_frame = tk.Frame(viewer, padx=10, pady=8)
+    top_frame.pack(fill=tk.X)
+    progress_label = tk.Label(top_frame, text="", font=("Arial", 10, "bold"))
+    progress_label.pack(side=tk.LEFT)
+
+    body_frame = tk.Frame(viewer)
+    body_frame.pack(fill=tk.BOTH, expand=1)
+
+    def render():
+        for child in body_frame.winfo_children():
+            child.destroy()
+        idx = state["index"]
+        entry = entries[idx]
+        catalog_id = entry["_id"]
+        progress_label.config(text=f"Entry {idx + 1} of {len(entries)}  —  {entry.get('name', '?')}")
+
+        fields_frame = tk.LabelFrame(body_frame, text=" Fields ", padx=8, pady=8)
+        fields_frame.pack(fill=tk.X, padx=10, pady=(6, 4))
+
+        tk.Label(fields_frame, text=f"Name: {entry.get('name', '?')}   "
+                                     f"(times seen: {entry.get('times_seen', 0)})",
+                 font=("Arial", 9, "bold")).pack(anchor=tk.W, pady=(0, 4))
+
+        field_widgets = {}
+        for key, label in (("category", "Category"), ("color", "Color"), ("size", "Size")):
+            value = entry.get(key)
+            is_missing = value in (None, "")
+            row = tk.Frame(fields_frame)
+            row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=f"{label}:", font=("Arial", 9, "bold"), width=12, anchor="w",
+                     fg="#b35900" if is_missing else "black").pack(side=tk.LEFT)
+            widget = tk.Entry(row, width=30)
+            if not is_missing:
+                widget.insert(0, str(value))
+            widget.pack(side=tk.LEFT)
+            field_widgets[key] = widget
+
+        images_outer = tk.LabelFrame(body_frame, text=" Images (all linked captures) ", padx=8, pady=8)
+        images_outer.pack(fill=tk.BOTH, expand=1, padx=10, pady=(4, 6))
+
+        linked_ids = entry.get("linked_object_ids", []) or []
+        all_docs = []
+        for object_id in linked_ids:
+            for doc in mongo_client.get_images_for_object(object_id):
+                all_docs.append(doc)
+        all_docs.sort(key=lambda d: d.get("captured_at") or datetime.min)
+
+        if not all_docs:
+            tk.Label(images_outer, text="No images found across any linked capture.").pack(pady=10)
+        elif not _PIL_AVAILABLE:
+            tk.Label(images_outer, text="Install Pillow to view images: pip install Pillow",
+                     fg="red").pack(pady=10)
+        else:
+            canvas_frame = tk.Frame(images_outer)
+            canvas_frame.pack(fill=tk.BOTH, expand=1)
+            scroll_canvas = tk.Canvas(canvas_frame)
+            scrollbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=scroll_canvas.yview)
+            inner_frame = tk.Frame(scroll_canvas)
+            inner_frame.bind("<Configure>", lambda e: scroll_canvas.configure(
+                scrollregion=scroll_canvas.bbox("all")))
+            scroll_canvas.create_window((0, 0), window=inner_frame, anchor="nw")
+            scroll_canvas.configure(yscrollcommand=scrollbar.set)
+            scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=1)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+            viewer._photo_refs = []
+            for doc in all_docs:
+                raw_path = doc.get("image_path", "")
+                path = resolve_image_path(raw_path)
+                img_row = tk.Frame(inner_frame, pady=6)
+                img_row.pack(fill=tk.X)
+                tk.Label(img_row, text=f"{doc.get('source', '?')} — view {doc.get('view_index', '?')}",
+                         font=("Arial", 9, "bold")).pack()
+                try:
+                    img = Image.open(path)
+                    img.thumbnail((520, 390))
+                    photo = ImageTk.PhotoImage(img)
+                    viewer._photo_refs.append(photo)
+                    tk.Label(img_row, image=photo).pack()
+                except Exception as e:
+                    tk.Label(img_row, text=f"Could not load '{raw_path}': {e}",
+                             fg="red", wraplength=520).pack()
+
+        nav_frame = tk.Frame(viewer, padx=10, pady=8)
+        nav_frame.pack(fill=tk.X)
+
+        def save_current(advance: int):
+            fields = {}
+            for key, widget in field_widgets.items():
+                raw_value = widget.get().strip()
+                fields[key] = raw_value if raw_value else None
+            try:
+                mongo_client.update_catalog_entry(catalog_id, fields)
+            except Exception as e:
+                messagebox.showerror("Save failed", str(e))
+                return
+            try:
+                refresh_inventory_list()
+            except NameError:
+                pass
+            state["index"] = max(0, min(len(entries) - 1, state["index"] + advance))
+            if advance != 0:
+                render()
+
+        tk.Button(nav_frame, text="< Previous", command=lambda: (
+            state.update(index=max(0, state["index"] - 1)), render())
+        ).pack(side=tk.LEFT)
+        tk.Button(nav_frame, text="Save", command=lambda: save_current(0),
+                  bg="lightblue").pack(side=tk.LEFT, padx=8)
+        tk.Button(nav_frame, text="Save & Next >", command=lambda: save_current(1),
+                  bg="lightgreen").pack(side=tk.LEFT)
+        tk.Button(nav_frame, text="Skip >", command=lambda: (
+            state.update(index=min(len(entries) - 1, state["index"] + 1)), render())
+        ).pack(side=tk.LEFT, padx=8)
+
+    render()
+
+
+# =====================================================================
+# MERGE INVENTORY ENTRIES — manual fix for when object_catalog.
+# match_or_create()'s exact-name auto-matching splits one real object
+# into two (or more) catalog entries (a typo, a rephrasing, category
+# on vs off — see object_catalog.py's docstring). Folds one entry's
+# linked captures into another so "multiple objects/captures under one
+# inventory entry" holds even when the automatic matching misses.
+# =====================================================================
+dc_merge_frame = tk.LabelFrame(tab_data_collection, text=" Merge Inventory Entries ", padx=10, pady=10)
+dc_merge_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+tk.Label(dc_merge_frame,
+         text="If two Inventory entries are really the same physical object (auto-matching "
+              "only compares exact name/category — see the Inventory tab), merge them here: "
+              "every capture linked to 'Merge away' gets folded into 'Keep', and the "
+              "'Merge away' entry is deleted.",
+         fg="gray", font=("Arial", 8), wraplength=680, justify=tk.LEFT).pack(anchor=tk.W)
+
+dc_merge_row = tk.Frame(dc_merge_frame)
+dc_merge_row.pack(fill=tk.X, pady=(6, 2))
+tk.Label(dc_merge_row, text="Keep:").grid(row=0, column=0, sticky=tk.W)
+dc_merge_keep_combo = ttk.Combobox(dc_merge_row, width=40, state="readonly")
+dc_merge_keep_combo.grid(row=0, column=1, sticky=tk.W, padx=(4, 16))
+tk.Label(dc_merge_row, text="Merge away:").grid(row=0, column=2, sticky=tk.W)
+dc_merge_away_combo = ttk.Combobox(dc_merge_row, width=40, state="readonly")
+dc_merge_away_combo.grid(row=0, column=3, sticky=tk.W, padx=(4, 0))
+
+dc_merge_status_label = tk.Label(dc_merge_frame, text="", fg="gray", wraplength=680, justify=tk.LEFT)
+dc_merge_status_label.pack(anchor=tk.W, pady=(4, 4))
+
+_dc_merge_catalog_ids = []  # parallel to both combos' values
+
+
+def refresh_dc_merge_options():
+    def worker():
+        try:
+            entries = object_catalog.list_inventory(limit=500)
+        except Exception:
+            entries = []
+
+        def apply():
+            _dc_merge_catalog_ids.clear()
+            display_values = []
+            for e in entries:
+                _dc_merge_catalog_ids.append(e["_id"])
+                display_values.append(
+                    f"{e.get('name', '?')}  (times seen: {e.get('times_seen', 0)}, id: {e['_id'][:8]}...)")
+            dc_merge_keep_combo["values"] = display_values
+            dc_merge_away_combo["values"] = display_values
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def merge_dc_inventory_entries():
+    keep_idx = dc_merge_keep_combo.current()
+    away_idx = dc_merge_away_combo.current()
+    if keep_idx < 0 or away_idx < 0:
+        messagebox.showerror("Pick both entries", "Choose both a 'Keep' and a 'Merge away' entry first.")
+        return
+    keep_id = _dc_merge_catalog_ids[keep_idx]
+    away_id = _dc_merge_catalog_ids[away_idx]
+    if keep_id == away_id:
+        messagebox.showerror("Same entry picked twice", "'Keep' and 'Merge away' must be different entries.")
+        return
+    if not messagebox.askyesno(
+            "Merge inventory entries",
+            f"Merge '{dc_merge_away_combo.get()}' into '{dc_merge_keep_combo.get()}'?\n\n"
+            f"Every capture linked to the 'Merge away' entry will be re-pointed to 'Keep', "
+            f"and the 'Merge away' entry will be deleted. This cannot be undone."):
+        return
+
+    dc_merge_status_label.config(text="Merging...", fg="gray")
+
+    def worker():
+        try:
+            moved = mongo_client.merge_catalog_entries(keep_id, away_id)
+            msg, color = f"Merged — {moved} capture(s) re-pointed to the kept entry.", "green"
+        except Exception as e:
+            msg, color = f"Merge failed: {e}", "red"
+
+        def apply():
+            dc_merge_status_label.config(text=msg, fg=color)
+            try:
+                refresh_inventory_list()
+            except NameError:
+                pass
+            refresh_dc_merge_options()
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+dc_merge_btn_row = tk.Frame(dc_merge_frame)
+dc_merge_btn_row.pack(anchor=tk.W, pady=(2, 0))
+tk.Button(dc_merge_btn_row, text="Refresh List", command=refresh_dc_merge_options,
           bg="lightblue").pack(side=tk.LEFT, padx=(0, 4))
-tk.Button(dc_manage_btn_row, text="Delete Selected", command=delete_selected_dc_capture,
-          bg="salmon").pack(side=tk.LEFT)
+tk.Button(dc_merge_btn_row, text="Merge", command=merge_dc_inventory_entries,
+          bg="salmon").pack(side=tk.LEFT, padx=4)
 
-refresh_dc_today_list()
+root.after(0, refresh_dc_merge_options)
 
-# Custom dialog for Z-value and claw state
+
 
 def get_point_settings(px, py):
     # Create the popup window
@@ -4310,10 +6148,15 @@ tk.Label(gallery_frame, text="Grabs one frame from every configured camera (no a
 # --- Sample name/label — a preliminary tag you can attach before capturing,
 # stored alongside the sample in MongoDB (both as the "label" field and as
 # the upload category) so you can find this capture again later on the
-# "Database" tab or via the natural-language query box there, instead of
-# every capture being lumped under one generic "manual_snapshot" label.
-# The dropdown offers a few common preliminary names, but the box is fully
-# editable — type any name you want.
+# "Database" tab or via the natural-language query box there. "manual_snapshot"
+# is offered here purely as ONE selectable option, same as the others — it is
+# NOT the silent default anymore (see _default_manual_snapshot_label() below):
+# leaving the box blank now gets a unique, timestamp-suffixed name instead, so
+# a run of un-labeled captures don't all collide under one identical
+# "manual_snapshot" name in the Inventory/catalog view (object_catalog.py
+# matches captures into the same catalog entry by exact name). The dropdown
+# offers a few common preliminary names, but the box is fully editable — type
+# any name you want.
 capture_label_row = tk.Frame(gallery_frame, bg="#f0f0f0")
 capture_label_row.pack(pady=(0, 6))
 tk.Label(capture_label_row, text="Sample name (optional, for querying later):",
@@ -4330,7 +6173,18 @@ capture_status_label = tk.Label(gallery_frame, text="", bg="#f0f0f0", fg="gray",
 capture_status_label.pack(pady=(0, 4))
 
 
-def capture_photo_and_store():
+def _default_manual_snapshot_label() -> str:
+    """Fallback name used when a manual snapshot's label box is left
+    blank. Timestamp-suffixed (not a single shared "manual_snapshot"
+    string) so a run of un-labeled captures don't all get treated as
+    repeat sightings of "the same object" by object_catalog.py's
+    exact-name matching — "manual_snapshot" is still available any time
+    you explicitly want it, as one of the dropdown's options."""
+    return f"manual_capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+
+def run_manual_snapshot(sample_label: str, status_label_widget: tk.Label,
+                         on_done=None) -> None:
     """
     One-click multi-camera snapshot (no arm movement, no rotation): grab
     one frame from EVERY USB camera configured in vision/config.py
@@ -4341,16 +6195,22 @@ def capture_photo_and_store():
     automatic capture sequence uses, against whatever SERVER_URL is
     currently configured on the "Server" tab.
 
-    The "Sample name" box above (capture_label_var) is stored as both
-    the "label" field and the upload category, so a capture can be
-    found again later by that name — on the "Database" tab (recent
-    samples list / natural-language query) or via mongo_client.
-    find_samples() directly — instead of every capture being lumped
-    under one generic "manual_snapshot" bucket.
+    Shared by the Camera tab's "Capture Photo" button and the Data
+    Collection tab's "Manual Snapshot" section (see dc_manual_frame
+    below) so there is exactly one implementation of "what a manual
+    snapshot does" instead of two near-duplicates.
+
+    sample_label: required, non-blank — becomes both the object's
+        "name"/catalog-match label and the upload category. Callers
+        supply their own default (see _default_manual_snapshot_label())
+        if their label field was left blank.
+    status_label_widget: a tk.Label updated with progress/result text.
+    on_done: optional no-arg callback, invoked on the GUI thread after
+        the standard Database-tab list refreshes — e.g. the Data
+        Collection tab's "Today's Captures" list.
     """
     camera_names = list(live_feed_panels.keys()) or list(list_configured_cameras().keys())
-    sample_label = capture_label_var.get().strip() or "manual_snapshot"
-    capture_status_label.config(
+    status_label_widget.config(
         text=f"Capturing '{sample_label}' from {len(camera_names)} camera(s): "
              f"{', '.join(camera_names)}...",
         fg="gray")
@@ -4371,8 +6231,11 @@ def capture_photo_and_store():
         # function the automatic pipeline (vision_service ->
         # logger_service) uses — so a manual GUI capture and an
         # automatic one are recorded identically: Mongo `objects`/
-        # `images` docs, catalog match/link, CSV append, Excel refresh.
-        # See vision/storage/capture_pipeline.py.
+        # `images` docs, catalog match/link, CSV + JSON append, Excel
+        # refresh. See vision/storage/capture_pipeline.py.
+        arm_position = current_arm_position()  # snapshot NOW — right as the photos were taken,
+                                                # not wherever the arm ends up later. None (-> null)
+                                                # if the robot isn't connected/no feedback yet.
         mongo_ok = False
         object_id = sample_id  # kept as the local var name used below/upload code
         pipeline_warnings = []
@@ -4381,6 +6244,7 @@ def capture_photo_and_store():
                 object_id, pipeline_warnings = record_capture(
                     name=sample_label,
                     image_paths_by_source=saved_paths,
+                    position=arm_position,
                 )
                 mongo_ok = True
                 for w in pipeline_warnings:
@@ -4426,16 +6290,28 @@ def capture_photo_and_store():
             parts.append(f"Upload: {uploaded}/{len(saved_paths)}" if saved_paths
                          else "Upload: skipped")
             color = "green" if (mongo_ok or uploaded) else "orange"
-            capture_status_label.config(text=" | ".join(parts), fg=color)
+            status_label_widget.config(text=" | ".join(parts), fg=color)
             try:
                 refresh_objects_list()
                 refresh_images_list()
                 refresh_inventory_list()
             except NameError:
                 pass  # Database tab not built yet — harmless
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception as e:
+                    print(f"[MANUAL SNAPSHOT] on_done callback failed: {e}")
         root.after(0, report)
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def capture_photo_and_store():
+    """Camera tab's "Capture Photo" button — see run_manual_snapshot()
+    for what this actually does."""
+    sample_label = capture_label_var.get().strip() or _default_manual_snapshot_label()
+    run_manual_snapshot(sample_label, capture_status_label)
 
 
 tk.Button(gallery_frame, text="Capture Photo — All Cameras (Save + Upload)", bg="khaki",
@@ -4466,35 +6342,68 @@ tk.Label(gallery_frame, text="Live Camera Feed (USB, all cameras at once)",
 # its own panel here and they all stream simultaneously, each on its own
 # background thread/tick loop, so e.g. "station" and "wrist" (or any
 # additional USB cameras you add to CAMERAS) are all live at once.
-_camera_names = list(list_configured_cameras().keys()) or ["station"]
-
+#
+# Only cameras that actually respond to is_camera_available() get a
+# panel — a camera merely listed in vision.config.CAMERAS but not
+# physically plugged in no longer gets an always-erroring placeholder
+# panel. If ONE camera is connected, one panel shows; if three are
+# connected, three show. "Refresh Cameras" (below) re-probes without
+# restarting the app, for a camera plugged in after launch.
 live_feed_panels = {}  # camera name -> {"image_label", "status_label", "busy"}
-
 live_feeds_container = tk.Frame(gallery_frame, bg="#f0f0f0")
 live_feeds_container.pack(fill=tk.BOTH, expand=1, padx=4, pady=4)
+_camera_names = []
 
-_feed_cols = 2 if len(_camera_names) > 1 else 1
-for _feed_i, _cam_name in enumerate(_camera_names):
-    _row, _col = divmod(_feed_i, _feed_cols)
-    live_feeds_container.grid_columnconfigure(_col, weight=1)
-    live_feeds_container.grid_rowconfigure(_row, weight=1)
 
-    cam_panel = tk.Frame(live_feeds_container, bg="#f0f0f0", bd=1, relief=tk.GROOVE)
-    cam_panel.grid(row=_row, column=_col, padx=4, pady=4, sticky="nsew")
+def _build_camera_panels():
+    """(Re)builds one panel per camera that currently passes
+    is_camera_available() — see the block comment above. Safe to call
+    again later (e.g. from the "Refresh Cameras" button): clears
+    whatever panels already exist first. Mutates live_feed_panels IN
+    PLACE (.clear() + repopulate, not reassigned to a new dict) so
+    other code that captured a reference to this exact dict object
+    (e.g. run_manual_snapshot()'s live_feed_panels.keys() lookup)
+    keeps working without needing to be told about a rebuild."""
+    global _camera_names
+    for child in live_feeds_container.winfo_children():
+        child.destroy()
+    live_feed_panels.clear()
 
-    tk.Label(cam_panel, text=_cam_name.title(), font=("Arial", 10, "bold"),
-             bg="#f0f0f0").pack()
-    _status_lbl = tk.Label(cam_panel, text="Stopped", font=("Arial", 8),
-                            bg="#f0f0f0", fg="gray")
-    _status_lbl.pack()
-    _img_lbl = tk.Label(cam_panel, bg="#222222", width=40, height=15,
-                         text="Live feed will appear here", fg="white",
-                         justify=tk.CENTER)
-    _img_lbl.pack(padx=4, pady=4, fill=tk.BOTH, expand=1)
+    configured = list(list_configured_cameras().keys())
+    _camera_names = [name for name in configured if is_camera_available(name)]
+    if not _camera_names:
+        # Nothing responded — DEMO MODE, no cv2/hardware, or genuinely
+        # nothing plugged in yet. Fall back to showing every configured
+        # camera anyway (as an error-panel, same as before this fix)
+        # rather than an empty, seemingly-broken tab with zero panels
+        # and no indication why.
+        _camera_names = configured or ["station"]
 
-    live_feed_panels[_cam_name] = {
-        "image_label": _img_lbl, "status_label": _status_lbl, "busy": False,
-    }
+    feed_cols = 2 if len(_camera_names) > 1 else 1
+    for feed_i, cam_name in enumerate(_camera_names):
+        row, col = divmod(feed_i, feed_cols)
+        live_feeds_container.grid_columnconfigure(col, weight=1)
+        live_feeds_container.grid_rowconfigure(row, weight=1)
+
+        cam_panel = tk.Frame(live_feeds_container, bg="#f0f0f0", bd=1, relief=tk.GROOVE)
+        cam_panel.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
+
+        tk.Label(cam_panel, text=cam_name.title(), font=("Arial", 10, "bold"),
+                 bg="#f0f0f0").pack()
+        status_lbl = tk.Label(cam_panel, text="Stopped", font=("Arial", 8),
+                               bg="#f0f0f0", fg="gray")
+        status_lbl.pack()
+        img_lbl = tk.Label(cam_panel, bg="#222222", width=40, height=15,
+                            text="Live feed will appear here", fg="white",
+                            justify=tk.CENTER)
+        img_lbl.pack(padx=4, pady=4, fill=tk.BOTH, expand=1)
+
+        live_feed_panels[cam_name] = {
+            "image_label": img_lbl, "status_label": status_lbl, "busy": False,
+        }
+
+
+_build_camera_panels()
 
 live_feed_button_row = tk.Frame(gallery_frame, bg="#f0f0f0")
 live_feed_button_row.pack(pady=4)
@@ -4530,6 +6439,14 @@ def _live_feed_tick(camera_name):
             def on_error():
                 panel["busy"] = False
                 panel["status_label"].config(text=f"Error: {msg}", fg="red")
+                # Clear whatever frame was last successfully shown —
+                # otherwise a camera that drops mid-session (unplugged,
+                # a USB hiccup, grabbed by another program) leaves its
+                # LAST good frame frozen on screen forever, with only
+                # the status label changing to "Error", making it look
+                # like that camera is still live when it isn't.
+                panel["image_label"].config(image="", text="No signal", fg="white")
+                panel["image_label"].image = None
                 # A problem with ONE camera (unplugged, busy, etc.) should
                 # not stop the others — keep retrying this one on its own
                 # (slower) cadence instead of killing every feed.
@@ -4579,10 +6496,26 @@ def stop_live_feed():
         panel["status_label"].config(text="Stopped", fg="gray")
 
 
+def rebuild_camera_panels():
+    """"Refresh Cameras" button — re-probes and rebuilds the live-feed
+    panels (see _build_camera_panels()) without restarting the app, for
+    a camera plugged in (or unplugged) after launch. Stops any active
+    feed first so a tick loop never ends up pointed at a panel that no
+    longer exists, then restarts it afterward if it was running."""
+    was_active = live_feed_active
+    if was_active:
+        stop_live_feed()
+    _build_camera_panels()
+    if was_active:
+        start_live_feed()
+
+
 tk.Button(live_feed_button_row, text="Start All Feeds", bg="lightgreen",
           command=start_live_feed).pack(side=tk.LEFT, padx=4)
 tk.Button(live_feed_button_row, text="Stop All Feeds",
           command=stop_live_feed).pack(side=tk.LEFT, padx=4)
+tk.Button(live_feed_button_row, text="Refresh Cameras", bg="lightblue",
+          command=rebuild_camera_panels).pack(side=tk.LEFT, padx=4)
 
 # =============================================================================
 # CAMERA ASSIGNMENT — reassign which physical USB device index a named
@@ -4939,7 +6872,7 @@ def _rebuild_laser_channel_rows():
         off_btn.config(command=make_toggle(state=False))
 
 
-_rebuild_laser_channel_rows()
+root.after(0, _rebuild_laser_channel_rows)
 
 
 
@@ -5294,24 +7227,24 @@ root.bind("<KeyRelease-e>",   handle_jog_release)
 
 
 update_gui_from_feedback()
-refresh_objects_list()
-refresh_images_list()
+root.after(0, refresh_objects_list)
+root.after(0, refresh_images_list)
 
 # Start listening for automatic-capture commands published by 4DAI (see
 # vision/config.py TOPIC_CAPTURE_COMMAND). This is what lets 4DAI's GUI
 # trigger a full "rotate + photograph" sequence with no manual
 # button-clicking on the arm side, per the transcript's requirement.
-start_capture_command_listener()
+root.after(0, start_capture_command_listener)
 
 # Also start the server-dependent (continuous-sweep) capture listener, on
 # its own topic (TOPIC_CAPTURE_COMMAND_SERVER_DEPENDENT) so it doesn't
 # collide with the listener above.
-start_capture_command_listener_server_dependent()
+root.after(0, start_capture_command_listener_server_dependent)
 
 # Generic remote control - lets 4DAI's own Arm Control page, an external
 # AI model, or any other MQTT publisher move the arm without touching
 # this machine (see TOPIC_ARM_MOVE_COMMAND in vision/config.py).
-start_move_command_listener()
+root.after(0, start_move_command_listener)
 
 
 def on_app_close():

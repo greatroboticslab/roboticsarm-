@@ -42,6 +42,7 @@ from vision.config import (
     MIDDLEMAN_PHOTO_TRANSFER_MAX_DIMENSION,
     MIDDLEMAN_PHOTO_TRANSFER_JPEG_QUALITY,
 )
+from vision.storage import storage_location
 from vision.storage.capture_pipeline import record_capture
 
 
@@ -98,10 +99,16 @@ def build_photo_bundle(sample_id: str, frames: list, physical_side_ip: str,
     }
 
 
-def save_photo_bundle_files(bundle: dict, save_root: str = "images/middleman") -> dict:
+def save_photo_bundle_files(bundle: dict, save_root: str = None) -> dict:
     """
     Decode a received bundle and write each image to disk under
     `save_root`/<sample_id>/ — nothing else. No Mongo/CSV/Excel write.
+
+    save_root defaults to vision.storage.storage_location.
+    middleman_images_root() (the configured permanent storage
+    location's images/middleman/ subfolder) when not given explicitly
+    — resolved fresh on every call, not cached, so changing the storage
+    location mid-run takes effect immediately.
 
     Returns {source_name: local_path}. If a bundle somehow has more
     than one image for the same source (shouldn't happen — one physical
@@ -119,6 +126,7 @@ def save_photo_bundle_files(bundle: dict, save_root: str = "images/middleman") -
     and silently overwrite each other.
     """
     _require_cv2()
+    save_root = save_root or storage_location.middleman_images_root()
     sample_id = bundle["sample_id"]
     sample_dir = os.path.join(save_root, sample_id)
     os.makedirs(sample_dir, exist_ok=True)
@@ -142,7 +150,7 @@ def save_photo_bundle_files(bundle: dict, save_root: str = "images/middleman") -
     return paths_by_source
 
 
-def save_photo_bundle(bundle: dict, save_root: str = "images/middleman") -> tuple:
+def save_photo_bundle(bundle: dict, save_root: str = None) -> tuple:
     """
     Full ad hoc single-shot handling: decode + write to disk (via
     save_photo_bundle_files) AND log it as a brand-new one-object
@@ -151,6 +159,10 @@ def save_photo_bundle(bundle: dict, save_root: str = "images/middleman") -> tupl
     manual capture — this machine's Mongo/CSV/Excel is the single
     source of truth regardless of which machine's camera the photo
     came from.
+
+    save_root defaults to vision.storage.storage_location.
+    middleman_images_root() (see save_photo_bundle_files() above) when
+    not given explicitly.
 
     Use this for a standalone "Capture Now" press. For a multi-view
     rotation sequence, use save_photo_bundle_files() per view instead

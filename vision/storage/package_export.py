@@ -20,9 +20,13 @@ EXPORT
 -------
 export_package(dest_dir, session_id=None, all_history=False) copies
 every matching object's images into dest_dir/images/<object_id>/ and
-writes dest_dir/captures_log.csv describing them, using the same fixed
-+ freeform columns as the live CSV log (see csv_logger._header()) so
-the format is familiar.
+writes BOTH dest_dir/captures_log.csv (using the same fixed + freeform
+columns as the live CSV log — see csv_logger._header() — so the format
+is familiar) AND dest_dir/captures_log.json, the same metadata as
+native nested JSON (freeform attributes as a real object, not a
+JSON-encoded string in one cell) for anything that would rather read
+JSON than parse CSV. Both describe the exact same objects/images; the
+CSV remains what import_package() reads back in.
 
 IMPORT
 -------
@@ -54,17 +58,27 @@ import uuid
 from datetime import datetime
 from typing import List, Tuple
 
-from vision.storage import attribute_schema, mongo_client, session_manager
+from vision.storage import attribute_schema, mongo_client, session_manager, storage_location
 from vision.storage.capture_pipeline import record_capture
 
-IMPORTED_IMAGES_ROOT = os.path.join("images", "imported")
-
-_CSV_HEADER = (
-    ["object_id", "session_id", "catalog_id", "captured_at"]
-    + attribute_schema.fixed_column_keys()
-    + [attribute_schema.freeform_key()]
-    + ["primary_image", "all_images", "num_images"]
-)
+def _csv_header() -> list:
+    """
+    Computed FRESH on every call, not cached — attribute_schema.json
+    can change at runtime (the Data Collection tab's "Attribute
+    Columns" section lets you add a new fixed column, like a boolean
+    "Is Metal", at any time). A module-level constant computed once at
+    import would go stale the moment a column got added after that,
+    and csv.DictWriter raises "dict contains fields not in fieldnames"
+    the next time a row with the new column's key got written against
+    the old, now-incomplete header — exactly the failure this function
+    replacing a stale `_CSV_HEADER` constant fixes.
+    """
+    return (
+        ["object_id", "session_id", "catalog_id", "captured_at"]
+        + attribute_schema.fixed_column_keys()
+        + [attribute_schema.freeform_key()]
+        + ["primary_image", "all_images", "num_images"]
+    )
 
 
 class PackageExportError(Exception):
@@ -72,20 +86,31 @@ class PackageExportError(Exception):
     error message rather than crashing the GUI."""
 
 
-def export_package(dest_dir: str, session_id: str = None, all_history: bool = False) -> Tuple[str, int, List[str]]:
+def export_package(dest_dir: str, session_id: str = None, all_history: bool = False,
+                    start_date: str = None, end_date: str = None) -> Tuple[str, int, List[str]]:
     """
     Writes dest_dir/images/<object_id>/<file>.jpg for every matching
-    object's photos, plus dest_dir/captures_log.csv describing them all
-    (relative image paths, so the folder is portable as a unit).
+    object's photos, plus dest_dir/captures_log.csv AND
+    dest_dir/captures_log.json describing them all (relative image
+    paths, so the folder is portable as a unit).
 
-    Scope: session_id (defaults to TODAY if all_history is False and no
-    session_id given) or all_history=True for everything ever captured.
+    Scope — checked in this order:
+      1. start_date AND end_date given ("YYYY-MM-DD" each, inclusive) —
+         every object captured in that range, regardless of session
+         boundaries. Takes priority over session_id/all_history if
+         given.
+      2. all_history=True — everything ever captured.
+      3. otherwise — session_id (defaults to TODAY if not given).
 
     Returns (dest_dir, objects_exported, warnings) — warnings covers
     individual missing image files (skipped, not fatal to the whole
-    export) so one bad record doesn't block everything else.
+    export) so one bad record doesn't block everything else. Raises
+    ValueError if start_date/end_date are malformed or start_date is
+    after end_date (see mongo_client.objects_in_date_range).
     """
-    if all_history:
+    if start_date and end_date:
+        objects = mongo_client.objects_in_date_range(start_date, end_date)
+    elif all_history:
         objects = mongo_client.list_recent_objects(limit=100000, sort_ascending=True)
     else:
         session_id = session_id or session_manager.today_session_id()
@@ -95,11 +120,13 @@ def export_package(dest_dir: str, session_id: str = None, all_history: bool = Fa
     images_root = os.path.join(dest_dir, "images")
     os.makedirs(images_root, exist_ok=True)
     csv_path = os.path.join(dest_dir, "captures_log.csv")
+    json_path = os.path.join(dest_dir, "captures_log.json")
     warnings: List[str] = []
     freeform_col = attribute_schema.freeform_key()
+    json_entries: List[dict] = []  # mirrors each CSV row, but with real nested types
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=_CSV_HEADER)
+        writer = csv.DictWriter(f, fieldnames=_csv_header())
         writer.writeheader()
 
         for obj in objects:
@@ -136,6 +163,28 @@ def export_package(dest_dir: str, session_id: str = None, all_history: bool = Fa
                 row[key] = data.get(key, "")
             row[freeform_col] = json.dumps(data.get(freeform_col, {}), ensure_ascii=False)
             writer.writerow(row)
+
+            json_entries.append({
+                "object_id": object_id,
+                "session_id": obj.get("session_id", ""),
+                "catalog_id": obj.get("catalog_id", ""),
+                "captured_at": captured_at.isoformat(timespec="seconds") if captured_at else None,
+                "data": data,  # includes the freeform attributes dict as a real nested object
+                "primary_image": copied_rel_paths[0] if copied_rel_paths else None,
+                "all_images": copied_rel_paths,
+                "num_images": len(copied_rel_paths),
+            })
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "count": len(json_entries),
+                "objects": json_entries,
+            },
+            f, ensure_ascii=False, indent=2,
+        )
+        f.write("\n")
 
     return dest_dir, len(objects), warnings
 
@@ -175,7 +224,7 @@ def import_package(package_dir: str) -> Tuple[int, int, List[str]]:
                 continue
 
             new_object_id = str(uuid.uuid4())
-            dest_dir = os.path.join(IMPORTED_IMAGES_ROOT, new_object_id)
+            dest_dir = os.path.join(storage_location.imported_images_root(), new_object_id)
             os.makedirs(dest_dir, exist_ok=True)
 
             copied_pairs = []  # (source_field_name, local_path) for record_capture
@@ -234,3 +283,115 @@ def import_package(package_dir: str) -> Tuple[int, int, List[str]]:
             imported += 1
 
     return imported, skipped, warnings
+
+
+# ===========================================================================
+# FOLDER-LEVEL MERGE / SYNC — the Sync & Storage tab's "manage the
+# folders the Excel/photos live in" tools. Pure file operations, never
+# touch MongoDB — a separate, on-disk-only concern from export/import
+# above (which DO touch Mongo, via record_capture()). Merging/syncing
+# two package folders on disk is for consolidating what two machines
+# (or two export runs) collected before doing a SINGLE import_package()
+# on the result, not a substitute for import.
+# ===========================================================================
+
+def looks_like_package_folder(folder: str) -> bool:
+    """Heuristic safety check before an irreversible delete — True if
+    `folder` actually looks like an exported package (has a
+    captures_log.csv or an images/ subdirectory). Used by the Sync &
+    Storage tab's "Delete Folder" button so a typo'd path doesn't
+    rm -rf something unrelated. Not a guarantee, just a sanity check —
+    the GUI still confirms with the user regardless."""
+    return (os.path.exists(os.path.join(folder, "captures_log.csv"))
+            or os.path.isdir(os.path.join(folder, "images")))
+
+
+def merge_packages(source_dirs: List[str], dest_dir: str) -> Tuple[int, List[str]]:
+    """
+    Folder-level merge of two (or more) exported packages — each
+    shaped like export_package()'s output (images/<object_id>/...,
+    captures_log.csv, captures_log.json) — into dest_dir: every
+    source's images/<object_id>/ subfolder gets copied across (skipped
+    if already present at the destination — object_ids are random
+    UUIDs, so a real collision only happens if the same object was
+    genuinely exported into more than one of the source folders), and
+    their captures_log.csv/.json files are combined into one,
+    de-duplicated by object_id (first occurrence wins if the same
+    object_id somehow appears in more than one source).
+
+    dest_dir may be a brand-new empty folder ("merge A and B into a
+    new folder C") or one of the source_dirs itself — calling this
+    twice, once with dest_dir=A and once with dest_dir=B (each time
+    passing source_dirs=[A, B]), is how the "two-way sync" button
+    works: both folders end up holding the union of what either had.
+
+    Returns (object_count, warnings) — a source folder with no
+    captures_log.csv, or a row whose image folder is missing, is a
+    warning, not fatal to the rest of the merge.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_images_dir = os.path.join(dest_dir, "images")
+    os.makedirs(dest_images_dir, exist_ok=True)
+
+    warnings: List[str] = []
+    combined_rows: dict = {}          # object_id -> csv row dict, insertion order = first-seen
+    combined_json_entries: dict = {}  # object_id -> json entry dict
+
+    for source_dir in source_dirs:
+        source_dir = os.path.abspath(source_dir)
+        csv_path = os.path.join(source_dir, "captures_log.csv")
+        if not os.path.exists(csv_path):
+            warnings.append(f"No captures_log.csv found in '{source_dir}', skipped.")
+            continue
+
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                object_id = row.get("object_id")
+                if not object_id:
+                    continue
+
+                src_img_dir = os.path.join(source_dir, "images", object_id)
+                dest_img_dir = os.path.join(dest_images_dir, object_id)
+                if os.path.abspath(src_img_dir) != os.path.abspath(dest_img_dir):
+                    if os.path.isdir(src_img_dir) and not os.path.isdir(dest_img_dir):
+                        shutil.copytree(src_img_dir, dest_img_dir)
+                    elif not os.path.isdir(src_img_dir) and object_id not in combined_rows:
+                        warnings.append(f"'{object_id}': image folder missing in '{source_dir}', row kept anyway.")
+
+                combined_rows.setdefault(object_id, row)
+
+        json_path = os.path.join(source_dir, "captures_log.json")
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, encoding="utf-8") as f:
+                    payload = json.load(f)
+                for entry in payload.get("objects", []):
+                    object_id = entry.get("object_id")
+                    if object_id:
+                        combined_json_entries.setdefault(object_id, entry)
+            except (json.JSONDecodeError, OSError) as e:
+                warnings.append(f"Could not read '{json_path}': {e}")
+
+    if combined_rows:
+        csv_out_path = os.path.join(dest_dir, "captures_log.csv")
+        with open(csv_out_path, "w", newline="", encoding="utf-8") as f:
+            header = _csv_header()
+            writer = csv.DictWriter(f, fieldnames=header)
+            writer.writeheader()
+            for row in combined_rows.values():
+                writer.writerow({key: row.get(key, "") for key in header})
+
+    json_out_path = os.path.join(dest_dir, "captures_log.json")
+    with open(json_out_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "count": len(combined_rows),
+                "objects": list(combined_json_entries.values()),
+            },
+            f, ensure_ascii=False, indent=2,
+        )
+        f.write("\n")
+
+    return len(combined_rows), warnings

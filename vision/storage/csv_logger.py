@@ -12,10 +12,12 @@ handles separately with its own file-locking precautions) — this file
 is deliberately the "can't fail" audit trail, kept dead simple on
 purpose (stdlib csv module only, no pandas/openpyxl dependency).
 
-Lives in its own subfolder (vision.config.CSV_LOG_DIR) separate from
-the Excel report folder and the raw per-object image folders, so the
-three kinds of output ("audit log", "human report", "photos") are each
-easy to find on their own.
+Lives in its own subfolder (vision.storage.storage_location.csv_log_dir())
+separate from the Excel report folder and the raw per-object image
+folders, so the three kinds of output ("audit log", "human report",
+"photos") are each easy to find on their own — all three now resolved
+through the configured permanent storage location rather than a
+hardcoded path relative to the repo.
 """
 
 from __future__ import annotations
@@ -25,16 +27,17 @@ import json
 import os
 from datetime import datetime
 
-from vision.config import CSV_LOG_DIR, CSV_LOG_FILENAME
-from vision.storage import attribute_schema
+from vision.config import CSV_LOG_FILENAME
+from vision.storage import attribute_schema, storage_location
 
 _HEADER_EXTRA = ["object_id", "session_id", "catalog_id", "captured_at",
                   "primary_image", "all_images", "num_images"]
 
 
 def _log_path() -> str:
-    os.makedirs(CSV_LOG_DIR, exist_ok=True)
-    return os.path.join(CSV_LOG_DIR, CSV_LOG_FILENAME)
+    directory = storage_location.csv_log_dir()
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, CSV_LOG_FILENAME)
 
 
 def _header() -> list:

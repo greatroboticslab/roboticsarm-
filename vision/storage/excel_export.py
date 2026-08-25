@@ -6,7 +6,7 @@ WHY THIS FILE EXISTS
 MongoDB is the only thing written to live/concurrently (see
 capture_pipeline.py). This module turns what's in Mongo into a
 `.xlsx` someone can actually open and browse: one row per capture
-(the "Log" sheet, default view) and one row per distinct known object
+(the "Attribute Data Collection" sheet, default view) and one row per distinct known object
 (the "Inventory" sheet, from vision.storage.object_catalog) — same
 underlying data, two presentations, matching the plan.
 
@@ -32,7 +32,7 @@ crash.
 
 RECONCILE FROM EXCEL (DATA_AUTHORITY_MODE == "excel")
 --------------------------------------------------------
-reconcile_from_excel() reads the "Log" sheet back in, matches rows to
+reconcile_from_excel() reads the "Attribute Data Collection" sheet back in, matches rows to
 MongoDB documents by `object_id`, and upserts any hand-edited fixed-
 column values back into Mongo. This is the explicit, safe stand-in for
 "keep Excel and Mongo in sync" — see the module docstring discussion in
@@ -58,14 +58,14 @@ try:
 except ImportError:
     _OPENPYXL_AVAILABLE = False
 
-from vision.config import EXCEL_EXPORT_DIR, EXCEL_EXPORT_FILENAME
-from vision.storage import attribute_schema, mongo_client, object_catalog
+from vision.config import EXCEL_EXPORT_FILENAME
+from vision.storage import attribute_schema, mongo_client, object_catalog, storage_location
 
 # Off by default — see module docstring. Flip to True if you specifically
 # want a small thumbnail embedded per object (first/primary image only).
 EMBED_THUMBNAILS = False
 
-LOG_SHEET_NAME = "Log"
+LOG_SHEET_NAME = "Attribute Data Collection"
 INVENTORY_SHEET_NAME = "Inventory"
 
 
@@ -80,8 +80,9 @@ def _require_openpyxl():
 
 
 def _export_path() -> str:
-    os.makedirs(EXCEL_EXPORT_DIR, exist_ok=True)
-    return os.path.join(EXCEL_EXPORT_DIR, EXCEL_EXPORT_FILENAME)
+    directory = storage_location.excel_export_dir()
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, EXCEL_EXPORT_FILENAME)
 
 
 def _log_headers() -> List[str]:
@@ -134,21 +135,30 @@ def _autosize_and_freeze(ws, header_row_len: int) -> None:
         ws.column_dimensions[letter].width = min(max(max_len + 2, 10), 60)
 
 
-def build_report(session_id: str | None = None) -> str:
+def build_report(session_id: str | None = None,
+                  start_date: str | None = None, end_date: str | None = None) -> str:
     """
-    Regenerates the .xlsx from MongoDB. If `session_id` is given, the
-    Log sheet is limited to that session (e.g. "today only") to keep the
-    export fast/manageable — pass session_id=None for full history.
+    Regenerates the .xlsx from MongoDB. Scope is one of:
+      - start_date AND end_date given ("YYYY-MM-DD" each, inclusive) —
+        every object captured in that range, regardless of session
+        boundaries. Takes priority over session_id if both are passed.
+      - session_id given — limited to that one session (e.g. "today
+        only").
+      - neither given — full history.
     Returns the path written to. Raises ExcelExportError on failure
     (missing openpyxl, or the file genuinely couldn't be swapped in
-    because it's open elsewhere).
+    because it's open elsewhere). Raises ValueError if start_date/
+    end_date are malformed or start_date is after end_date (see
+    mongo_client.objects_in_date_range).
     """
     _require_openpyxl()
 
-    objects = (
-        mongo_client.objects_for_session(session_id)
-        if session_id else mongo_client.all_objects_for_export()
-    )
+    if start_date and end_date:
+        objects = mongo_client.objects_in_date_range(start_date, end_date)
+    elif session_id:
+        objects = mongo_client.objects_for_session(session_id)
+    else:
+        objects = mongo_client.all_objects_for_export()
     inventory = object_catalog.list_inventory(limit=10000)
 
     wb = openpyxl.Workbook()
@@ -196,6 +206,68 @@ def build_report(session_id: str | None = None) -> str:
             f"Excel. Close the file and try again. ({e})"
         )
     return final_path
+
+
+def read_log_rows(path: str = None) -> List[dict]:
+    """
+    Reads the '{LOG_SHEET_NAME}' sheet from an .xlsx — the live report
+    path by default, or any other .xlsx of the same shape (e.g. one
+    hand-picked via a file dialog) — and returns one dict per row, in
+    on-disk order:
+
+        {"object_id": str, "data": {fixed_key: value, ...},
+         "freeform": {...}, "raw": {header: cell_value, ...}}
+
+    Falls back to the pre-rename sheet name "Log" if the exact current
+    LOG_SHEET_NAME isn't present (so an older exported file still
+    works), then to the first sheet in the workbook as a last resort.
+    A row with unparseable freeform JSON gets an empty freeform dict
+    rather than being skipped outright — this is a read-only helper for
+    driving a review UI one row at a time, not the bulk reconcile path,
+    so it's fine to just show that row with no "why" instead of
+    dropping it entirely.
+
+    Used by main.py's Attribute Review viewer (upload an .xlsx, step
+    through its rows/images one at a time, edit and save each back to
+    MongoDB) and, in principle, anything else that wants "give me back
+    what's in this report" without hand-rolling the openpyxl read.
+    """
+    _require_openpyxl()
+    path = path or _export_path()
+    if not os.path.exists(path):
+        raise ExcelExportError(f"No report found at '{path}'.")
+
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = None
+    for name in (LOG_SHEET_NAME, "Log"):  # "Log" = legacy pre-rename sheet name
+        if name in wb.sheetnames:
+            ws = wb[name]
+            break
+    if ws is None:
+        ws = wb.worksheets[0]  # unlabeled fallback — still usable
+
+    headers = [c.value for c in ws[1]]
+    fixed_keys = attribute_schema.fixed_column_keys()
+    labels = attribute_schema.display_labels()
+    freeform_col_name = "Attributes (why)"
+
+    rows: List[dict] = []
+    for row in ws.iter_rows(min_row=2, values_only=False):
+        values = {headers[i]: cell.value for i, cell in enumerate(row) if i < len(headers)}
+        object_id = values.get("Object ID")
+        if not object_id:
+            continue
+
+        raw_freeform = values.get(freeform_col_name) or "{}"
+        try:
+            freeform = json.loads(raw_freeform) if isinstance(raw_freeform, str) else (raw_freeform or {})
+        except (json.JSONDecodeError, TypeError):
+            freeform = {}
+
+        data = {key: values.get(labels.get(key, key)) for key in fixed_keys}
+        rows.append({"object_id": object_id, "data": data, "freeform": freeform, "raw": values})
+
+    return rows
 
 
 def reconcile_from_excel() -> Tuple[int, List[str]]:

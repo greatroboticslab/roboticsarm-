@@ -17,6 +17,10 @@ definition of "what happens when a capture is saved":
        save_image_record).
     4. Match/link into the object_catalog ("inventory" view).
     5. Append one row to the CSV audit log (always, both modes).
+    5b. Append one row to the JSON audit log too (vision.storage.
+        json_logger — same metadata as the CSV row, native JSON,
+        including the freeform attributes as a real nested object
+        instead of a JSON-encoded string).
     6. Refresh the Excel report for today's session (best-effort — a
        failure here is logged and returned as a warning, NOT raised,
        since Mongo/CSV already succeeded by this point and the whole
@@ -33,7 +37,7 @@ import uuid
 from datetime import datetime
 from typing import Dict, List, Tuple
 
-from vision.storage import attribute_schema, csv_logger, excel_export, mongo_client, object_catalog, session_manager
+from vision.storage import attribute_schema, csv_logger, excel_export, json_logger, mongo_client, object_catalog, session_manager
 
 
 def build_object_data(name: str, category: str = None, color: str = None,
@@ -56,7 +60,7 @@ def build_object_data(name: str, category: str = None, color: str = None,
     if size is not None:
         data["size"] = size
     position = position or {}
-    for axis in ("x", "y", "z"):
+    for axis in ("x", "y", "z", "r"):
         if axis in position:
             data[f"position_{axis}"] = position[axis]
     for key, value in reserved_overrides.items():
@@ -141,6 +145,12 @@ def record_capture(name: str, image_paths_by_source, category: str = None,
                                        data, image_paths)
     except Exception as e:
         warnings.append(f"CSV log append failed: {e}")
+
+    try:
+        json_logger.append_capture_row(object_id, session_id, catalog_id, captured_at,
+                                        data, image_paths)
+    except Exception as e:
+        warnings.append(f"JSON log append failed: {e}")
 
     if export_excel:
         try:
