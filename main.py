@@ -497,20 +497,46 @@ def sync_manual_position_from_feedback(reason: str = "") -> None:
 # without adding load to Mongo or the network on every single move.
 # =====================================================================
 
-def capture_movement_snapshot(sample_id: str) -> None:
-    """Grabs one frame from every currently configured camera and saves
-    it to disk under images/<sample_id>/ (via the same capture_frame()/
-    save_image() every other capture path uses) — nothing else. Runs in
-    its own background thread so a slow/unavailable camera never blocks
-    the move that triggered it. Best-effort per camera: one camera
-    failing (unplugged, busy, etc.) doesn't stop the others."""
+def capture_movement_snapshot(sample_id: str, label: str) -> None:
+    """Grabs one frame from every currently configured camera, saves it
+    to disk (via the same capture_frame()/save_image() primitives every
+    other capture path uses), AND records it into Mongo/CSV/JSON via
+    capture_pipeline.record_capture() — same as a manual snapshot, minus
+    the server upload step (record_capture() itself never touches the
+    network; upload is a separate step run_manual_snapshot() does after
+    it, which this intentionally skips). That keeps this fast enough to
+    fire once a second while jogging, while still making these captures
+    show up (named/labeled `label`, newest-first sortable) on the
+    Database tab like any other capture — a disk-only save with no DB
+    record wasn't visible anywhere in the app, which looked like "auto-
+    capture isn't doing anything" even though files existed on disk.
+    Runs in its own background thread so a slow/unavailable camera never
+    blocks the move that triggered it. Best-effort per camera: one
+    camera failing (unplugged, busy, etc.) doesn't stop the others."""
     def worker():
+        pairs = []
         for cam in list(list_configured_cameras().keys()):
             try:
                 frame = capture_frame(cam)
-                save_image(frame, sample_id, cam, 0)
+                path = save_image(frame, sample_id, cam, 0)
+                pairs.append((cam, path))
             except Exception as e:
                 print(f"[AUTO CAPTURE] '{cam}' unavailable for {sample_id}: {e}")
+        if not pairs:
+            return
+        try:
+            record_capture(
+                name=label,
+                image_paths_by_source=pairs,
+                category="auto_capture",
+                position=current_arm_position(),
+                export_excel=False,  # this can fire every second while
+                                      # jogging — refresh the Excel report
+                                      # on a normal manual/pipeline capture
+                                      # instead of on every single one of these
+            )
+        except Exception as e:
+            print(f"[AUTO CAPTURE] record_capture failed for {sample_id}: {e}")
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -529,8 +555,8 @@ def trigger_arm_move_autocapture(reason: str = "") -> None:
         return  # Camera tab not built yet — nothing to toggle against
     sample_id = f"robot_arm_moving_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     print(f"[AUTO CAPTURE] arm move started ({reason}) — capturing '{sample_id}'")
-    capture_movement_snapshot(sample_id)
-    root.after(1000, lambda: capture_movement_snapshot(sample_id))
+    capture_movement_snapshot(sample_id, "robot_arm_moving")
+    root.after(1000, lambda: capture_movement_snapshot(sample_id, "robot_arm_moving"))
 
 
 def _dispatch_joint_move(joints: list, reason: str = "arm move"):
@@ -615,7 +641,7 @@ def _jog_autocapture_tick(sample_id: str) -> None:
     if not is_jogging or not auto_capture_on_jog_var.get():
         _jog_autocapture_after_id = None
         return
-    capture_movement_snapshot(sample_id)
+    capture_movement_snapshot(sample_id, "manual_jog_moving")
     _jog_autocapture_after_id = root.after(1000, lambda: _jog_autocapture_tick(sample_id))
 
 
@@ -633,7 +659,7 @@ def _start_jog_autocapture() -> None:
         return  # Camera tab not built yet
     _jog_autocapture_sample_id = f"manual_jog_moving_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     print(f"[AUTO CAPTURE] jog started — capturing '{_jog_autocapture_sample_id}'")
-    capture_movement_snapshot(_jog_autocapture_sample_id)
+    capture_movement_snapshot(_jog_autocapture_sample_id, "manual_jog_moving")
     _jog_autocapture_after_id = root.after(1000, lambda: _jog_autocapture_tick(_jog_autocapture_sample_id))
 
 
@@ -652,7 +678,7 @@ def _stop_jog_autocapture() -> None:
     if _jog_autocapture_sample_id is not None:
         try:
             if auto_capture_on_jog_var.get():
-                capture_movement_snapshot(_jog_autocapture_sample_id)
+                capture_movement_snapshot(_jog_autocapture_sample_id, "manual_jog_moving")
         except NameError:
             pass
         _jog_autocapture_sample_id = None
@@ -2449,7 +2475,7 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
 
     # 3. Rotate J4 through NUM_VIEWS steps, asking 4DAI to snap a photo at
     #    each step instead of grabbing a frame from a local camera.
-    sample_id = str(uuid.uuid4())
+    sample_id = new_sample_id()
     step_deg = 360.0 / NUM_VIEWS
     triggered = 0
 
@@ -2544,7 +2570,7 @@ def run_continuous_sweep(category="default", target_j1=0.0, target_j2=0.0, targe
     global robot
     print(f"[SWEEP START] Category: '{category}' | Target: ({target_j1}, {target_j2}, {target_j3}, {target_j4})")
 
-    sample_id = f"sweep_{int(time.time())}"
+    sample_id = f"sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     if ROBOT_CONNECTED and robot:
         robot.movement.sync()
@@ -5135,7 +5161,7 @@ def run_data_collection_rotation_remote(name, category, color, size,
         _dc_finish_ui(refresh=False)
         return None
 
-    object_id = str(uuid.uuid4())
+    object_id = new_sample_id()
     rotation_coordinator.begin_sequence(object_id)
     all_pairs = []
     try:
