@@ -31,6 +31,8 @@ from vision.camera.capture import (
     remove_camera_assignment,
     list_camera_indices,
     is_camera_available,
+    list_camera_device_names,
+    set_flush_stale_frames,
 )
 import requests
 from vision.config import (
@@ -224,6 +226,11 @@ robot_data = {
     
 }
 is_jogging = False
+_jog_autocapture_after_id = None   # pending root.after() id for the repeating
+                                    # 1s-while-held jog capture tick, or None
+_jog_autocapture_sample_id = None  # images/<this>/ folder shared by every
+                                    # frame captured during one press-to-release
+                                    # jog gesture, or None while not jogging
 
 
 def current_arm_position() -> dict | None:
@@ -456,6 +463,90 @@ def sync_manual_position_from_feedback(reason: str = "") -> None:
 
 
 
+# =====================================================================
+# AUTO-CAPTURE ON ARM MOVEMENT
+# =====================================================================
+# Two independent toggles (checkboxes live on the Camera tab, built
+# further down):
+#   - auto_capture_on_move_var:  every PROGRAMMATIC move (rotation
+#     sequences, the pickup+photograph pipeline, remote MQTT move
+#     commands, the manual "Move Joints" button — i.e. every direct
+#     robot.movement.joint_to_joint_move() call site, all routed through
+#     _dispatch_joint_move() below) fires one capture right as the move
+#     is issued and a second one 1 second later.
+#   - auto_capture_on_jog_var: continuous keyboard/button jogging (see
+#     handle_jog_press/handle_jog_release) fires one capture on first
+#     press, one on release, and one every 1 second for as long as the
+#     key/button stays held.
+# Both are deliberately declared as tk.BooleanVar()s further down (after
+# `root = tk.Tk()` exists — a Tk Variable needs a live root) but are
+# referenced here by name only inside function bodies, which Python
+# resolves at CALL time, not at def time, so the forward reference is
+# safe: by the time a move/jog actually happens the GUI (and these
+# vars) already exist.
+#
+# Captures taken here are deliberately NOT run through
+# run_manual_snapshot()/record_capture() (Mongo write + server upload
+# per image): jogging can fire this every second for as long as a key
+# is held, and a network round trip per frame would fall further and
+# further behind. Instead this is a lightweight, local-disk-only save
+# (capture_frame + save_image, same primitives everything else in this
+# file uses) — good enough to have a visual record of "what did the
+# scene/arm look like around this move", filterable/deletable later by
+# its "robot_arm_moving_..."/"manual_jog_moving_..." sample-id prefix,
+# without adding load to Mongo or the network on every single move.
+# =====================================================================
+
+def capture_movement_snapshot(sample_id: str) -> None:
+    """Grabs one frame from every currently configured camera and saves
+    it to disk under images/<sample_id>/ (via the same capture_frame()/
+    save_image() every other capture path uses) — nothing else. Runs in
+    its own background thread so a slow/unavailable camera never blocks
+    the move that triggered it. Best-effort per camera: one camera
+    failing (unplugged, busy, etc.) doesn't stop the others."""
+    def worker():
+        for cam in list(list_configured_cameras().keys()):
+            try:
+                frame = capture_frame(cam)
+                save_image(frame, sample_id, cam, 0)
+            except Exception as e:
+                print(f"[AUTO CAPTURE] '{cam}' unavailable for {sample_id}: {e}")
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def trigger_arm_move_autocapture(reason: str = "") -> None:
+    """Call this right when a programmatic move is ISSUED (not after it
+    completes — see _dispatch_joint_move below). Fires one capture now
+    and, if the toggle is still on a second from now, one more — both
+    saved under the SAME sample_id (images/robot_arm_moving_<ts>/) so
+    the two frames from one move event stay grouped together. No-op if
+    the "Auto-capture on arm movement" checkbox (Camera tab) is off, or
+    before that checkbox has been built yet (startup/demo-mode moves)."""
+    try:
+        if not auto_capture_on_move_var.get():
+            return
+    except NameError:
+        return  # Camera tab not built yet — nothing to toggle against
+    sample_id = f"robot_arm_moving_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    print(f"[AUTO CAPTURE] arm move started ({reason}) — capturing '{sample_id}'")
+    capture_movement_snapshot(sample_id)
+    root.after(1000, lambda: capture_movement_snapshot(sample_id))
+
+
+def _dispatch_joint_move(joints: list, reason: str = "arm move"):
+    """Single choke point for every DIRECT robot.movement.joint_to_joint_move()
+    call in this file (the rotation sequences, the pickup+photograph
+    pipeline, remote MQTT moves, and the manual "Move Joints" button —
+    see sync_manual_position_from_feedback()'s docstring for the full
+    list of call sites, all updated to go through this). Fires the
+    "arm moving" auto-capture (see trigger_arm_move_autocapture above)
+    right as the move is sent, then issues the move itself — so adding
+    any other future cross-cutting move behavior only needs to change
+    this one function instead of every call site individually."""
+    trigger_arm_move_autocapture(reason)
+    return robot.movement.joint_to_joint_move(joints)
+
+
 def safe_move_to_point(x, y, z=200, r=0):
     """Non-blocking wrapper around move_to_point.
     Runs the move in a background thread so ensure_robot_enabled()'s
@@ -497,7 +588,7 @@ def move_to_point(x, y, z=200, r=0):
             # On normal operation this is a fast no-op (mode is already 5).
 
             print(f"Moving to ({x},{y}) | J1={j1:.1f}° J2={j2:.1f}° Z={z_target:.1f}")
-            move_error = robot.movement.joint_to_joint_move([j1, j2, z_target, r_target])
+            move_error = _dispatch_joint_move([j1, j2, z_target, r_target], reason="move_to_point")
             if move_error is not None:
                 print(f"[MOVE ERROR]: {move_error}")
                 return str(move_error)   # do not sync position — robot did not move
@@ -517,6 +608,56 @@ def move_to_point(x, y, z=200, r=0):
 # --- NEW: Jogging Handlers ---
 # --- NEW AREA B: CONTINUOUS JOG HANDLERS ---
 # --- REFINED AREA B ---
+def _jog_autocapture_tick(sample_id: str) -> None:
+    """Reschedules itself every 1s for as long as jogging is still active
+    AND the toggle is still on - see _start_jog_autocapture below."""
+    global _jog_autocapture_after_id
+    if not is_jogging or not auto_capture_on_jog_var.get():
+        _jog_autocapture_after_id = None
+        return
+    capture_movement_snapshot(sample_id)
+    _jog_autocapture_after_id = root.after(1000, lambda: _jog_autocapture_tick(sample_id))
+
+
+def _start_jog_autocapture() -> None:
+    """Call right when a jog actually starts (is_jogging just became
+    True). Captures one frame immediately, then kicks off the repeating
+    1s tick above for as long as the key/button stays held. No-op if the
+    "Auto-capture while jogging" checkbox (Camera tab) is off, or before
+    it's been built yet (startup)."""
+    global _jog_autocapture_after_id, _jog_autocapture_sample_id
+    try:
+        if not auto_capture_on_jog_var.get():
+            return
+    except NameError:
+        return  # Camera tab not built yet
+    _jog_autocapture_sample_id = f"manual_jog_moving_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    print(f"[AUTO CAPTURE] jog started — capturing '{_jog_autocapture_sample_id}'")
+    capture_movement_snapshot(_jog_autocapture_sample_id)
+    _jog_autocapture_after_id = root.after(1000, lambda: _jog_autocapture_tick(_jog_autocapture_sample_id))
+
+
+def _stop_jog_autocapture() -> None:
+    """Call right when a jog ends (release, or any early-return path that
+    stops it). Cancels the pending repeating tick and takes one final
+    capture under the same sample_id the press/hold captures used, so a
+    press-hold-release gesture's photos all land in one folder."""
+    global _jog_autocapture_after_id, _jog_autocapture_sample_id
+    if _jog_autocapture_after_id is not None:
+        try:
+            root.after_cancel(_jog_autocapture_after_id)
+        except Exception:
+            pass
+        _jog_autocapture_after_id = None
+    if _jog_autocapture_sample_id is not None:
+        try:
+            if auto_capture_on_jog_var.get():
+                capture_movement_snapshot(_jog_autocapture_sample_id)
+        except NameError:
+            pass
+        _jog_autocapture_sample_id = None
+
+
 def handle_jog_press(axis_cmd, _via_remote=False):
     global is_jogging
 
@@ -536,7 +677,15 @@ def handle_jog_press(axis_cmd, _via_remote=False):
 
     # Check 1: Is robot actually connected?
     # Check 2: Are we already jogging? (Prevents Windows key-repeat spam)
-    if not ROBOT_CONNECTED or is_jogging or not manual_active.get():
+    # Check 3: Is an automated sequence (rotation capture, pickup+photograph,
+    # point queue, ...) currently driving the arm? arm_operation_lock is held
+    # for the duration of those, so a stray jog key during one doesn't
+    # collide with the sequence's own moves. (The socket-level lock in
+    # dobot_util/util.py already stops any concurrent access from corrupting
+    # command/response parsing, but jogging mid-sequence would still send the
+    # arm somewhere the sequence doesn't expect - so it's blocked here too.)
+    if not ROBOT_CONNECTED or is_jogging or not manual_active.get() \
+            or arm_operation_lock.locked():
         return
         
     # Get current joints from the background thread's latest data
@@ -547,6 +696,7 @@ def handle_jog_press(axis_cmd, _via_remote=False):
     
     if not error:
         is_jogging = True
+        _start_jog_autocapture()
 
 def handle_jog_release(event, _via_remote=False):
     global is_jogging, m_x, m_y, m_z, m_j4
@@ -565,6 +715,7 @@ def handle_jog_release(event, _via_remote=False):
     if ROBOT_CONNECTED:
         robot.movement.safe_move_jog("stop", [])
         is_jogging = False
+        _stop_jog_autocapture()
 
         # --- SYNC FIX ---
         # m_x/m_y/m_z ("manual control state") previously only got updated
@@ -995,6 +1146,50 @@ def _effective_hard_deck_z():
     if _being_remote_controlled() and remote is not None:
         return remote
     return base
+
+
+J4_SAFE_LIMITS = (-358.0, 358.0)  # matches dobot_util's Movement.SAFE_LIMITS["J4"]
+
+
+def _normalize_j4_target(j4_target: float) -> float:
+    """
+    BUGFIX (root cause of rotation-capture moves "returning a -1"):
+    every rotation loop (run_automatic_capture_sequence,
+    run_data_collection_rotation_local, and the server-dependent pickup
+    pipeline) computes each step as `base_j4 + i * degrees_per_step` with
+    no bounds check at all, unlike the manual "Move Joints" row (which
+    validates against J4_SAFE_LIMITS and shows a clear "Out of Range"
+    dialog *before* ever contacting the robot - see manual_joint_move()).
+    A rotation sweep of more than a few steps, or one that starts from a
+    J4 already partway toward a limit, very quickly commands a J4 target
+    outside +/-358 degrees. The robot firmware rejects that JointMovJ
+    with its own error code, but that code isn't one of the ones
+    dobot_util/types.py's DobotError enum knows about, so
+    _parse_response()'s fallback (see dobot_util/util.py) reports it as
+    the generic DobotError.FAIL_TO_GET - which prints/displays as a bare
+    "-1" with no indication the real problem was simply an out-of-range
+    wrist angle.
+
+    Fix: since a wrist rotation of exactly 360 degrees returns the joint
+    to the same physical orientation, any target outside the safe range
+    has an equivalent, in-range target reached by adding/subtracting
+    whole 360-degree turns - so wrap it back into range here instead of
+    sending an invalid command and finding out only via a cryptic -1.
+    """
+    lo, hi = J4_SAFE_LIMITS
+    span = hi - lo  # 716 degrees - the joint's full mechanical travel
+    if span <= 0:
+        return j4_target
+    while j4_target > hi:
+        j4_target -= 360.0
+    while j4_target < lo:
+        j4_target += 360.0
+    # Should be unreachable given the joint's >360-degree travel (any
+    # angle has an equivalent within one 360-degree turn of center), but
+    # guard anyway rather than silently sending something still invalid.
+    if not (lo <= j4_target <= hi):
+        j4_target = max(lo, min(hi, j4_target))
+    return j4_target
 
 
 def _hard_deck_violation(z_value, context: str):
@@ -1992,11 +2187,12 @@ def run_automatic_capture_sequence(category: str, num_images: int,
         failed_cameras = set()
 
         for i in range(num_images):
-            j4_target = base_j4 + (i * degrees_per_step)
+            j4_target = _normalize_j4_target(base_j4 + (i * degrees_per_step))
 
             if ROBOT_CONNECTED and robot:
-                move_error = robot.movement.joint_to_joint_move(
-                    [base_j1, base_j2, base_z, j4_target])
+                move_error = _dispatch_joint_move(
+                    [base_j1, base_j2, base_z, j4_target],
+                    reason=f"automatic capture rotation step {i + 1}/{num_images}")
                 if move_error is not None:
                     raise RuntimeError(f"Move failed at image {i + 1}: {move_error}")
                 robot.movement.sync()
@@ -2154,7 +2350,7 @@ def _handle_move_command(payload: dict):
         return "Robot is busy with another operation"
     try:
         if ROBOT_CONNECTED and robot:
-            move_error = robot.movement.joint_to_joint_move([j1, j2, j3, j4])
+            move_error = _dispatch_joint_move([j1, j2, j3, j4], reason="remote MQTT move command")
             if move_error is not None:
                 print(f"[REMOTE MOVE ERROR]: {move_error}")
                 return str(move_error)
@@ -2224,7 +2420,7 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
         print(f"[PICKUP ABORTED]: {hard_deck_error}")
         return
     if ROBOT_CONNECTED and robot:
-        move_error = robot.movement.joint_to_joint_move([j1, j2, z_target, r_target])
+        move_error = _dispatch_joint_move([j1, j2, z_target, r_target], reason="pipeline pickup move")
         if move_error is not None:
             print(f"[PICKUP ERROR]: {move_error}")
             return
@@ -2242,7 +2438,7 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
         print(f"[STATION MOVE ABORTED]: {hard_deck_error}")
         return
     if ROBOT_CONNECTED and robot:
-        move_error = robot.movement.joint_to_joint_move([base_j1, base_j2, base_z, base_j4])
+        move_error = _dispatch_joint_move([base_j1, base_j2, base_z, base_j4], reason="pipeline photo-station move")
         if move_error is not None:
             print(f"[STATION MOVE ERROR]: {move_error}")
             return
@@ -2258,9 +2454,10 @@ def pickup_photograph_and_identify_server_dependent(pickup_x, pickup_y, pickup_z
     triggered = 0
 
     for i in range(NUM_VIEWS):
-        j4_target = base_j4 + (i * step_deg)
+        j4_target = _normalize_j4_target(base_j4 + (i * step_deg))
         if ROBOT_CONNECTED and robot:
-            robot.movement.joint_to_joint_move([base_j1, base_j2, base_z, j4_target])
+            _dispatch_joint_move([base_j1, base_j2, base_z, j4_target],
+                                  reason=f"pipeline view {i+1}/{NUM_VIEWS} rotation")
             robot.movement.sync()
             sync_manual_position_from_feedback(f"pipeline view {i+1}/{NUM_VIEWS} rotation")
         else:
@@ -4865,9 +5062,11 @@ def run_data_collection_rotation_local(name, category, color, size,
             if dc_cancel_event.is_set():
                 raise RuntimeError("Cancelled by user.")
 
-            j4_target = base_j4 + (i * degrees_per_step)
+            j4_target = _normalize_j4_target(base_j4 + (i * degrees_per_step))
             if ROBOT_CONNECTED and robot:
-                move_error = robot.movement.joint_to_joint_move([base_j1, base_j2, base_z, j4_target])
+                move_error = _dispatch_joint_move(
+                    [base_j1, base_j2, base_z, j4_target],
+                    reason=f"data collection rotation step {i + 1}/{num_views}")
                 if move_error is not None:
                     raise RuntimeError(f"Move failed at view {i + 1}: {move_error}")
                 robot.movement.sync()
@@ -4944,9 +5143,12 @@ def run_data_collection_rotation_remote(name, category, color, size,
             if dc_cancel_event.is_set():
                 raise RuntimeError("Cancelled by user.")
 
-            j4_target = i * degrees_per_step  # absolute targets built up from 0 — Remote
-                                               # Control mode has no reliable "current J4"
-                                               # to add a delta to the way local mode does
+            # absolute targets built up from 0 — Remote Control mode has
+            # no reliable "current J4" to add a delta to the way local
+            # mode does. Normalized the same way as the local rotation
+            # loops (see _normalize_j4_target) so a longer sweep here
+            # can't send the Physical Side an out-of-range J4 either.
+            j4_target = _normalize_j4_target(i * degrees_per_step)
             if not other_side_controller.send_move({"j4": j4_target}):
                 raise RuntimeError(f"Move command for view {i + 1} was refused/blocked "
                                     f"(not active controller, or Robot Side rejected it).")
@@ -6029,7 +6231,7 @@ def manual_joint_move():
         def execute():
             if ROBOT_CONNECTED and robot:
                 print(f"Moving to J1:{j1}° J2:{j2}° Z:{z}mm J4:{j4}°")
-                move_error = robot.movement.joint_to_joint_move([j1, j2, z, j4])
+                move_error = _dispatch_joint_move([j1, j2, z, j4], reason="manual Move Joints button")
                 if move_error is not None:
                     print(f"[JOINT MOVE ERROR]: {move_error}")
                     return
@@ -6129,6 +6331,51 @@ instructions.pack(pady=10)
 # =============================================================================
 gallery_frame = tk.Frame(tab_camera, bg="#f0f0f0")
 gallery_frame.pack(fill=tk.BOTH, expand=1, padx=10, pady=10)
+
+# =============================================================================
+# AUTO-CAPTURE / CAMERA BEHAVIOR TOGGLES
+#   - Auto-capture on arm movement: every programmatic move (rotation
+#     sequences, pickup+photograph pipeline, remote MQTT moves, the
+#     manual "Move Joints" button) fires a photo when the move starts
+#     and another 1s later, saved under a "robot_arm_moving_..." folder.
+#     See trigger_arm_move_autocapture()/_dispatch_joint_move() above.
+#   - Auto-capture while jogging: keyboard/button jogging fires a photo
+#     on press, one every 1s while held, and one on release, saved under
+#     a "manual_jog_moving_..." folder. See _start_jog_autocapture()/
+#     _stop_jog_autocapture() above.
+#   - Fix laggy/delayed photos: flushes a couple of buffered frames
+#     before every capture so a photo can't come out showing the scene
+#     from a moment before it was actually taken (see
+#     vision/camera/capture.py's _capture_from_index). OFF by default -
+#     it costs a little time per capture - turn on only if photos are
+#     actually coming out visibly behind reality.
+# Both auto-capture vars default ON per how this is meant to be used;
+# the lag-fix defaults OFF since it's a fix for an intermittent issue,
+# not something everyone needs paying the cost of on every capture.
+# =============================================================================
+auto_capture_settings_frame = tk.LabelFrame(gallery_frame, text=" Auto-Capture Settings ",
+                                             padx=8, pady=6)
+auto_capture_settings_frame.pack(fill=tk.X, padx=4, pady=(0, 10))
+
+auto_capture_on_move_var = tk.BooleanVar(value=True)
+auto_capture_on_jog_var = tk.BooleanVar(value=True)
+fix_laggy_photos_var = tk.BooleanVar(value=False)
+
+
+def _on_toggle_flush_stale_frames():
+    set_flush_stale_frames(fix_laggy_photos_var.get())
+
+
+tk.Checkbutton(auto_capture_settings_frame,
+               text="Auto-capture photos when the robot arm moves (on move start + 1s later)",
+               variable=auto_capture_on_move_var).pack(anchor=tk.W)
+tk.Checkbutton(auto_capture_settings_frame,
+               text="Auto-capture photos while manually jogging (on press, every 1s held, on release)",
+               variable=auto_capture_on_jog_var).pack(anchor=tk.W)
+tk.Checkbutton(auto_capture_settings_frame,
+               text="Fix laggy/delayed photos (flushes buffered frames before each capture — slightly slower)",
+               variable=fix_laggy_photos_var,
+               command=_on_toggle_flush_stale_frames).pack(anchor=tk.W)
 
 # =============================================================================
 # CAPTURE PHOTO — pinned to the TOP of the Camera tab (this is the flow
@@ -6544,11 +6791,13 @@ _camera_assign_index_vars = {}  # camera name -> tk.StringVar holding the index 
 
 def _rebuild_camera_assign_rows():
     """(Re)draws one row per currently-configured camera name, each with
-    an editable device-index box and an Assign button."""
+    an editable device-index box, a best-effort detected device-name
+    hint (see list_camera_device_names()), and an Assign button."""
     for child in camera_assign_rows_frame.winfo_children():
         child.destroy()
     _camera_assign_index_vars.clear()
 
+    device_names = list_camera_device_names()
     current = list_configured_cameras()
     for cam_name, cam_index in sorted(current.items()):
         row = tk.Frame(camera_assign_rows_frame)
@@ -6562,6 +6811,10 @@ def _rebuild_camera_assign_rows():
                   command=lambda n=cam_name: _do_assign_camera(n)).pack(side=tk.LEFT)
         tk.Button(row, text="Remove Override", fg="darkred",
                   command=lambda n=cam_name: _do_remove_camera_override(n)).pack(side=tk.LEFT, padx=(6, 0))
+        detected_name = device_names.get(cam_index)
+        if detected_name:
+            tk.Label(row, text=f"(detected: {detected_name})", fg="gray",
+                     font=("Arial", 8)).pack(side=tk.LEFT, padx=(8, 0))
 
 
 def _do_remove_camera_override(cam_name):
@@ -6615,33 +6868,57 @@ def _do_add_camera():
         camera_assign_status.config(
             text=f"Added camera '{name}' at device index {idx}. It's usable now by "
                  f"'Capture Photo — All Cameras' and automatic capture right away; "
-                 f"restart the app to also give it its own Live Feed preview panel above.",
+                 f"click 'Refresh Cameras' above to also give it its own Live Feed "
+                 f"preview panel (no restart needed).",
             fg="green")
     except Exception as e:
         camera_assign_status.config(text=f"Could not add '{name}': {e}", fg="red")
 
 
+_CAMERA_DETECT_MAX_INDEX = 20  # probe 0..19 - widened from 0-9 so cameras
+                               # landing at a higher index (extra USB hub
+                               # ports, virtual/IP-camera drivers registering
+                               # their own index first, etc.) still get found,
+                               # and setups with several cameras plugged in
+                               # at once have enough headroom to find them all.
+
+
 def _do_detect_cameras():
-    camera_assign_status.config(text="Detecting cameras (probing indices 0-4)...", fg="gray")
+    camera_assign_status.config(
+        text=f"Detecting cameras (probing indices 0-{_CAMERA_DETECT_MAX_INDEX - 1})...",
+        fg="gray")
 
     def worker():
         try:
-            found = list_camera_indices()
+            found = list_camera_indices(max_index=_CAMERA_DETECT_MAX_INDEX)
+            # Best-effort Device-Manager-style names (Windows only, see
+            # list_camera_device_names()'s docstring for the positional-
+            # match caveat) so cameras are identifiable by name, not just
+            # a bare number, once there are more than one or two.
+            device_names = list_camera_device_names()
         except Exception as e:
             found = None
+            device_names = {}
             err = str(e)
         def report():
             if found is None:
                 camera_assign_status.config(text=f"Detection failed: {err}", fg="red")
             elif found:
+                labeled = [f"{i} ({device_names[i]})" if i in device_names else str(i)
+                           for i in found]
                 camera_assign_status.config(
-                    text=f"Working device indices found: {found}. Enter one of these "
-                         f"above and click Assign for the camera you want it on.",
+                    text=f"Working device indices found: {', '.join(labeled)}. Enter "
+                         f"one of these above and click Assign for the camera you want "
+                         f"it on. If a camera you expect isn't listed, it may be at an "
+                         f"even higher index — type it directly into the index box and "
+                         f"Assign anyway, or use 'Add new camera' below.",
                     fg="green")
             else:
                 camera_assign_status.config(
-                    text="No working camera devices found on indices 0-4. Check "
-                         "connections and that no other program has them open.",
+                    text=f"No working camera devices found on indices "
+                         f"0-{_CAMERA_DETECT_MAX_INDEX - 1}. Check connections, that "
+                         f"no other program (Zoom/Teams/OBS/another Python process) "
+                         f"has them open, and try unplugging/replugging.",
                     fg="orange")
         root.after(0, report)
 

@@ -53,6 +53,7 @@ from vision.storage import storage_location
 # capture_frame(), so a runtime assignment always wins.
 # ---------------------------------------------------------------------------
 import json
+import subprocess
 
 _ASSIGNMENTS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "camera_assignments.json")
@@ -167,6 +168,15 @@ def _open_camera(index: int):
     for backend in _candidate_backends():
         cap = cv2.VideoCapture(index, backend)
         if cap.isOpened():
+            # Ask the backend to keep as small a frame queue as possible.
+            # Most UVC backends (DSHOW, V4L2) honor this; some (MSMF)
+            # silently ignore it - that's fine, it's just a hint, the
+            # explicit flush in _capture_from_index() below is what
+            # actually guarantees a fresh frame regardless of backend.
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
             ok, _ = cap.read()
             if ok:
                 return cap
@@ -195,20 +205,115 @@ def _get_handle(index: int):
     return _capture_handles[index]
 
 
+def list_camera_device_names() -> dict:
+    """
+    Best-effort index -> human-readable device name (e.g. "Logitech BRIO"),
+    Windows only. OpenCV/cv2.VideoCapture only ever deals in bare numeric
+    indices - it has no idea what Device Manager calls a camera - which
+    makes it hard to tell cameras apart by index alone once more than one
+    or two are plugged in. This shells out to PowerShell to pull the same
+    "Cameras / Imaging devices" list Device Manager shows, so the Camera
+    tab can display e.g. "index 2 - Logitech BRIO" instead of just "2".
+
+    IMPORTANT CAVEAT: Windows' PnP device enumeration order and OpenCV's
+    backend enumeration order are NOT contractually guaranteed to match -
+    in practice they usually line up (both generally follow USB
+    enumeration order), but this is a best-effort positional pairing for
+    display purposes, not a verified index<->name mapping. Good enough to
+    visually distinguish "is index 2 the BRIO or the cheap webcam" at a
+    glance; don't treat it as authoritative for anything safety-critical.
+
+    Returns {} (never raises) on non-Windows, if PowerShell isn't
+    reachable, or on any enumeration failure - callers must handle a
+    missing/empty mapping gracefully and just fall back to showing the
+    bare index, same as before this existed.
+    """
+    if os.name != "nt":
+        return {}
+    try:
+        ps_cmd = (
+            "Get-CimInstance Win32_PnPEntity | "
+            "Where-Object { $_.PNPClass -eq 'Camera' -or $_.PNPClass -eq 'Image' } | "
+            "Select-Object -ExpandProperty Name"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=5,
+        )
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return {i: name for i, name in enumerate(names)}
+    except Exception as e:
+        print(f"[CAMERA CONFIG] Could not enumerate device names: {e}")
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# STALE-FRAME FLUSH ("photos come out one behind what they should be")
+# ---------------------------------------------------------------------------
+# Discarding a couple of already-queued frames with cap.grab() right before
+# the "real" read guarantees a fresh frame (see _capture_from_index below)
+# but costs a little time on every single capture - noticeable when firing
+# captures rapidly (e.g. jog auto-capture once a second, or a full rotation
+# sequence). Since the underlying driver-level buffering this works around
+# doesn't affect every camera/backend equally, this is OFF by default and
+# toggled from a checkbox on the Camera tab ("Fix laggy/delayed photos") -
+# turn it on only if photos are actually showing up a beat behind reality.
+# ---------------------------------------------------------------------------
+_flush_stale_frames_enabled = False
+
+
+def set_flush_stale_frames(enabled: bool) -> None:
+    """Camera tab checkbox calls this. See module note above."""
+    global _flush_stale_frames_enabled
+    _flush_stale_frames_enabled = bool(enabled)
+
+
+# Number of buffered/stale frames to discard immediately before the
+# "real" read in _capture_from_index() when the flush toggle is on - see
+# the BUGFIX note there ("camera captures one photo behind"). 2 is enough
+# headroom for every backend we've seen queue frames (DSHOW/V4L2
+# typically hold 1-3), while staying fast (a few ms per grab() on a live
+# camera).
+_STALE_FRAME_FLUSH_COUNT = 2
+
+
 def _capture_from_index(index: int, _retry: bool = True):
     """
-    BUGFIX: previously, once a camera's handle was cached in
-    _capture_handles, it was never re-validated - if the camera got
-    unplugged/replugged, hit a brief USB hiccup, or was grabbed and
+    BUGFIX (stale/cached handle): previously, once a camera's handle was
+    cached in _capture_handles, it was never re-validated - if the camera
+    got unplugged/replugged, hit a brief USB hiccup, or was grabbed and
     released by another program mid-session, the stale handle would keep
     returning ok=False forever, and every future capture would fail with
     "did not return a frame" until the whole app was restarted. Now, a
     failed read releases the stale handle and retries once with a fresh
     _open_camera() call before actually giving up.
+
+    BUGFIX (photo "one behind" what it should be): a cv2.VideoCapture
+    handle that's left open between captures (as ours are - see the
+    module docstring on caching handles) keeps an internal driver-level
+    frame queue filling in the background even when nothing calls
+    .read(). The very next .read() after any gap returns whatever frame
+    was ALREADY sitting at the front of that queue - i.e. a frame grabbed
+    before the thing you actually wanted to photograph happened (the
+    object/arm as it looked a moment ago), not a fresh one grabbed right
+    now. This is why a capture consistently shows the scene from just
+    before the triggering event ("one photo behind"). Setting
+    CAP_PROP_BUFFERSIZE=1 in _open_camera() reduces this on backends that
+    honor it, but not all do - so on every real capture we now also
+    explicitly discard _STALE_FRAME_FLUSH_COUNT already-queued frames
+    with the cheap cap.grab() (decode-free) before the one .read() whose
+    frame actually gets kept, guaranteeing what's returned was grabbed
+    right now regardless of backend/buffering behavior. OFF by default
+    (see _flush_stale_frames_enabled above) since it costs a little time
+    on every capture - flip on the "Fix laggy/delayed photos" checkbox
+    (Camera tab) if photos are actually coming out a beat behind reality.
     """
     lock = _get_lock(index)
     with lock:
         cap = _get_handle(index)
+        if _flush_stale_frames_enabled:
+            for _ in range(_STALE_FRAME_FLUSH_COUNT):
+                cap.grab()
         ok, frame = cap.read()
 
         if not (ok and frame is not None) and _retry:
@@ -324,8 +429,19 @@ def release_all():
 
 
 def new_sample_id() -> str:
-    """[WIRED] Helper - no hardware dependency."""
-    return str(uuid.uuid4())
+    """[WIRED] Helper - no hardware dependency.
+    Structured as sample_<YYYYMMDD>_<HHMMSS>_<4-char-suffix> (e.g.
+    sample_20260826_143210_a91f) rather than a bare UUID, so folder
+    names under images/ are sortable and readable at a glance in a file
+    browser (you can tell WHEN a sample was captured just by its
+    folder name) instead of opaque random hex. The short suffix (still
+    drawn from uuid4, just truncated) exists only to keep two samples
+    created within the same second from colliding - it isn't meant to
+    be meaningful on its own.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:4]
+    return f"sample_{timestamp}_{suffix}"
 
 
 def ensure_sample_dir(sample_id: str) -> str:

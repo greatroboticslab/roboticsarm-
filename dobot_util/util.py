@@ -1,4 +1,5 @@
 import socket
+import threading
 import logging as log
 from typing import Optional, Tuple
 from .types import DobotError, URDF
@@ -45,6 +46,28 @@ class DobotSocketConnection:
         self.socket.settimeout(10.0)
         self.socket.connect((ip, port))
 
+        # BUGFIX (root cause of intermittent "-1"/FAIL_TO_GET errors,
+        # esp. during rotation-capture sequences): a single Dobot TCP
+        # connection is shared by every caller that talks to this port -
+        # e.g. Movement (30003) is used by BOTH the rotation loop's
+        # joint_to_joint_move() (running in its own background thread)
+        # AND the keyboard/mouse jog handlers (running on the Tkinter
+        # main thread) AND the point-queue sender AND the claw thread.
+        # If two threads call send_command() at the same moment, their
+        # writes/reads on the same socket can interleave - e.g. thread A
+        # is mid-recv() for its own reply when thread B's send lands,
+        # and A ends up parsing a response that's actually a fragment of
+        # B's. _parse_response() has no way to tell that happened and
+        # falls back to DobotError.FAIL_TO_GET (-1), which is exactly
+        # the symptom of a move "just returning -1" for no visible
+        # reason - it's not the robot rejecting the move, it's two
+        # threads' bytes getting scrambled together on the wire.
+        # A lock around the whole send+receive round trip serializes
+        # every caller so each command's request and reply are always
+        # matched, regardless of how many background threads are
+        # sending commands concurrently.
+        self._send_lock = threading.Lock()
+
         if consume_greeting:
             # Drain the entire greeting message.
             # Older firmware sends ~512 bytes; newer firmware can send several
@@ -70,11 +93,18 @@ class DobotSocketConnection:
         No newline is appended — the Dobot TCP/IP protocol specification does
         not define a command terminator, and adding one causes some firmware
         versions to return -1 for every command.
+
+        The whole send + await-reply round trip is serialized with
+        self._send_lock so concurrent callers (rotation sequences, jog
+        handlers, the point queue, etc. — see the comment on
+        self._send_lock in __init__) can never interleave their bytes on
+        this shared connection.
         """
-        raw_cmd = cmd.encode("utf-8")
-        self.socket.sendall(raw_cmd)
-        log.debug('Sent command: "%s"', cmd)
-        return self._await_reply()
+        with self._send_lock:
+            raw_cmd = cmd.encode("utf-8")
+            self.socket.sendall(raw_cmd)
+            log.debug('Sent command: "%s"', cmd)
+            return self._await_reply()
 
     def _await_reply(self) -> Tuple[Optional[DobotError], str]:
         """
