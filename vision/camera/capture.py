@@ -114,6 +114,127 @@ def remove_camera_assignment(name: str) -> None:
     _camera_overrides.pop(str(name).strip(), None)
     _save_camera_overrides()
 
+
+# ---------------------------------------------------------------------------
+# PER-CAMERA SETTINGS — resolution + color/mono output mode
+# ---------------------------------------------------------------------------
+# Some cameras (depth/industrial UVC sensors in particular — the ones
+# that sometimes trigger the harmless "obsensor" probing noise mentioned
+# in _candidate_backends() above) can output either a converted color/
+# "overlay" frame or a raw grayscale/mono one, switched via OpenCV's
+# standard CAP_PROP_CONVERT_RGB (nonzero = color/overlay, 0 = raw/mono).
+# Persisted the same way camera index assignments are (camera_settings.
+# json next to camera_assignments.json), so a chosen resolution/mode
+# survives a restart without editing vision/config.py.
+# ---------------------------------------------------------------------------
+_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "camera_settings.json")
+
+_camera_settings: dict = {}  # name -> {"width": int, "height": int, "mono": bool}
+
+
+def _load_camera_settings() -> None:
+    global _camera_settings
+    try:
+        if os.path.exists(_SETTINGS_FILE):
+            with open(_SETTINGS_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _camera_settings = data
+    except Exception as e:
+        print(f"[CAMERA CONFIG] Could not load {_SETTINGS_FILE}: {e}")
+        _camera_settings = {}
+
+
+def _save_camera_settings() -> None:
+    try:
+        with open(_SETTINGS_FILE, "w") as f:
+            json.dump(_camera_settings, f, indent=2)
+    except Exception as e:
+        print(f"[CAMERA CONFIG] Could not save {_SETTINGS_FILE}: {e}")
+
+
+_load_camera_settings()
+
+
+def get_camera_settings(name: str) -> dict:
+    """Returns the resolved settings dict for `name` — defaults
+    (vision.config's CAMERA_FRAME_WIDTH/HEIGHT, color mode, dual-capture
+    off) filled in for anything not explicitly set yet:
+      width/height/mono   - the camera's normal/primary output.
+      dual_capture         - if True, every capture_frames_multi() call
+                              for this camera rapid-fires a SECOND shot
+                              at width_b/height_b/mono_b right after the
+                              primary one (see capture_frames_multi()).
+      width_b/height_b/mono_b - the second profile. mono_b defaults to
+                              the OPPOSITE of mono (e.g. primary=color,
+                              secondary=mono) since "the other output the
+                              camera offers" is the common case; width_b/
+                              height_b default to the same as primary if
+                              not set separately.
+    """
+    saved = _camera_settings.get(str(name).strip(), {})
+    width = saved.get("width") or CAMERA_FRAME_WIDTH
+    height = saved.get("height") or CAMERA_FRAME_HEIGHT
+    mono = bool(saved.get("mono", False))
+    return {
+        "width": width,
+        "height": height,
+        "mono": mono,
+        "dual_capture": bool(saved.get("dual_capture", False)),
+        "width_b": saved.get("width_b") or width,
+        "height_b": saved.get("height_b") or height,
+        "mono_b": bool(saved.get("mono_b", not mono)),
+    }
+
+
+def set_camera_settings(name: str, width: int = None, height: int = None,
+                         mono: bool = None, dual_capture: bool = None,
+                         width_b: int = None, height_b: int = None,
+                         mono_b: bool = None) -> None:
+    """Persists resolution/mono-vs-color (and optional second dual-capture
+    profile) settings for camera `name` and applies the PRIMARY profile
+    immediately to its handle if one's already open/cached (cap.set() on
+    a live handle - no reopen needed), so a change takes effect on the
+    very next frame rather than needing a reconnect."""
+    name = str(name).strip()
+    if not name:
+        raise ValueError("Camera name cannot be empty.")
+    entry = _camera_settings.setdefault(name, {})
+    if width is not None:
+        entry["width"] = int(width)
+    if height is not None:
+        entry["height"] = int(height)
+    if mono is not None:
+        entry["mono"] = bool(mono)
+    if dual_capture is not None:
+        entry["dual_capture"] = bool(dual_capture)
+    if width_b is not None:
+        entry["width_b"] = int(width_b)
+    if height_b is not None:
+        entry["height_b"] = int(height_b)
+    if mono_b is not None:
+        entry["mono_b"] = bool(mono_b)
+    _save_camera_settings()
+
+    index = list_configured_cameras().get(name)
+    if index is not None and index in _capture_handles:
+        _apply_camera_settings(_capture_handles[index], get_camera_settings(name))
+
+
+def _apply_camera_settings(cap, settings: dict) -> None:
+    """Applies a resolved settings dict (see get_camera_settings) to an
+    already-open cv2.VideoCapture handle. Best-effort: not every backend
+    honors CAP_PROP_CONVERT_RGB or an arbitrary resolution - cv2 silently
+    ignores what it can't do, same as it already does elsewhere in this
+    file (see e.g. CAP_PROP_BUFFERSIZE above)."""
+    try:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings["width"])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings["height"])
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0 if settings["mono"] else 1)
+    except Exception:
+        pass
+
 # Lazily-opened, cached VideoCapture handles - opened once, reused across
 # calls rather than reopening the device every capture (slow + some UVC
 # cameras don't like being reopened rapidly).
@@ -184,7 +305,7 @@ def _open_camera(index: int):
     return None
 
 
-def _get_handle(index: int):
+def _get_handle(index: int, camera_name: str = None):
     _require_cv2()
     if index not in _capture_handles:
         cap = _open_camera(index)
@@ -199,8 +320,14 @@ def _get_handle(index: int):
                 f"that no other program (Zoom, Teams, another Python "
                 f"process, etc.) already has it open."
             )
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_FRAME_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_FRAME_HEIGHT)
+        # Resolution + color/mono mode: per-camera-name settings if this
+        # index has a configured name (see get_camera_settings/
+        # set_camera_settings above), else the vision.config global
+        # defaults (index-only callers - is_camera_available(),
+        # list_camera_indices() - have no name to look a setting up by).
+        settings = (get_camera_settings(camera_name) if camera_name
+                    else {"width": CAMERA_FRAME_WIDTH, "height": CAMERA_FRAME_HEIGHT, "mono": False})
+        _apply_camera_settings(cap, settings)
         _capture_handles[index] = cap
     return _capture_handles[index]
 
@@ -277,7 +404,7 @@ def set_flush_stale_frames(enabled: bool) -> None:
 _STALE_FRAME_FLUSH_COUNT = 2
 
 
-def _capture_from_index(index: int, _retry: bool = True):
+def _capture_from_index(index: int, _retry: bool = True, camera_name: str = None):
     """
     BUGFIX (stale/cached handle): previously, once a camera's handle was
     cached in _capture_handles, it was never re-validated - if the camera
@@ -310,7 +437,7 @@ def _capture_from_index(index: int, _retry: bool = True):
     """
     lock = _get_lock(index)
     with lock:
-        cap = _get_handle(index)
+        cap = _get_handle(index, camera_name=camera_name)
         if _flush_stale_frames_enabled:
             for _ in range(_STALE_FRAME_FLUSH_COUNT):
                 cap.grab()
@@ -321,8 +448,9 @@ def _capture_from_index(index: int, _retry: bool = True):
             _capture_handles.pop(index, None)
             fresh_cap = _open_camera(index)
             if fresh_cap is not None:
-                fresh_cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_FRAME_WIDTH)
-                fresh_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_FRAME_HEIGHT)
+                settings = (get_camera_settings(camera_name) if camera_name
+                            else {"width": CAMERA_FRAME_WIDTH, "height": CAMERA_FRAME_HEIGHT, "mono": False})
+                _apply_camera_settings(fresh_cap, settings)
                 _capture_handles[index] = fresh_cap
                 ok, frame = fresh_cap.read()
 
@@ -333,6 +461,107 @@ def _capture_from_index(index: int, _retry: bool = True):
             f"program has it open."
         )
     return frame
+
+
+def probe_camera_output_modes(camera_name: str) -> dict:
+    """
+    Best-effort: actually tries both CAP_PROP_CONVERT_RGB=1 (color/
+    overlay) and =0 (raw/mono) on the live camera and reports whether
+    the two reads came back genuinely different — so the Camera tab can
+    tell you whether THIS camera's mono/overlay toggle actually does
+    anything on the actual connected hardware, "based on the option the
+    camera provides", instead of just always showing the checkbox
+    regardless of whether it's honored. Restores whatever settings were
+    configured before probing once done.
+
+    Returns {"color_supported": bool, "mono_supported": bool,
+    "modes_differ": bool} — all best-effort; False here means "couldn't
+    confirm", not necessarily "definitely unsupported" (some backends
+    report success on a property set but silently no-op it).
+    """
+    configured = list_configured_cameras()
+    if camera_name not in configured:
+        return {"color_supported": False, "mono_supported": False, "modes_differ": False}
+    index = configured[camera_name]
+    lock = _get_lock(index)
+    with lock:
+        try:
+            cap = _get_handle(index, camera_name=camera_name)
+        except Exception:
+            return {"color_supported": False, "mono_supported": False, "modes_differ": False}
+        original = get_camera_settings(camera_name)
+
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+        ok_color, frame_color = cap.read()
+
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+        ok_mono, frame_mono = cap.read()
+
+        _apply_camera_settings(cap, original)  # restore whatever was configured before probing
+
+    modes_differ = False
+    if ok_color and ok_mono and frame_color is not None and frame_mono is not None:
+        modes_differ = (frame_color.shape != frame_mono.shape) or \
+                        (abs(float(frame_color.mean()) - float(frame_mono.mean())) > 1.0)
+
+    return {
+        "color_supported": bool(ok_color and frame_color is not None),
+        "mono_supported": bool(ok_mono and frame_mono is not None),
+        "modes_differ": modes_differ,
+    }
+
+
+def capture_frames_multi(camera_name: str) -> list:
+    """
+    Grabs one frame from `camera_name`, or TWO in rapid back-to-back
+    succession (one per configured resolution/output-mode profile) if
+    that camera's "dual capture" toggle is on (see set_camera_settings'
+    dual_capture/width_b/height_b/mono_b args, exposed on the Camera tab
+    as a second "Capture B" resolution/mode row) — e.g. one full-
+    resolution color/overlay shot and one grayscale/mono shot from the
+    SAME physical camera, every time a photo is requested from it, with
+    no manual re-triggering needed.
+
+    Returns a list of (suffix, frame) pairs: one pair (suffix "a") for a
+    normal single capture, two pairs ("a", "b") for dual capture —
+    callers save each under a different view_index so they never
+    collide on disk (see main.py's capture_movement_snapshot()/
+    run_manual_snapshot()).
+    """
+    configured = list_configured_cameras()
+    if camera_name not in configured:
+        raise ValueError(
+            f"Unknown camera '{camera_name}'. Configured cameras: "
+            f"{list(configured.keys())}. Add it to CAMERAS in "
+            f"vision/config.py, or assign it from the Camera tab."
+        )
+    index = configured[camera_name]
+    settings = get_camera_settings(camera_name)
+
+    frame_a = _capture_from_index(index, camera_name=camera_name)
+    if not settings["dual_capture"]:
+        return [("a", frame_a)]
+
+    settings_b = {"width": settings["width_b"], "height": settings["height_b"],
+                  "mono": settings["mono_b"]}
+    lock = _get_lock(index)
+    with lock:
+        cap = _get_handle(index, camera_name=camera_name)
+        _apply_camera_settings(cap, settings_b)
+        if _flush_stale_frames_enabled:
+            for _ in range(_STALE_FRAME_FLUSH_COUNT):
+                cap.grab()
+        ok_b, frame_b = cap.read()
+        _apply_camera_settings(cap, settings)  # restore the primary profile so
+                                                # anything else reading this
+                                                # camera next (live feed, the
+                                                # next capture) gets the
+                                                # normal/primary output again.
+    if not ok_b or frame_b is None:
+        print(f"[CAMERA] '{camera_name}' dual-capture secondary shot failed — "
+              f"only the primary was saved.")
+        return [("a", frame_a)]
+    return [("a", frame_a), ("b", frame_b)]
 
 
 def capture_frame(camera_name: str):
@@ -349,7 +578,7 @@ def capture_frame(camera_name: str):
             f"{list(configured.keys())}. Add it to CAMERAS in "
             f"vision/config.py, or assign it from the Camera tab."
         )
-    return _capture_from_index(configured[camera_name])
+    return _capture_from_index(configured[camera_name], camera_name=camera_name)
 
 
 def capture_station_frame():

@@ -33,6 +33,10 @@ from vision.camera.capture import (
     is_camera_available,
     list_camera_device_names,
     set_flush_stale_frames,
+    get_camera_settings,
+    set_camera_settings,
+    capture_frames_multi,
+    probe_camera_output_modes,
 )
 import requests
 from vision.config import (
@@ -517,9 +521,9 @@ def capture_movement_snapshot(sample_id: str, label: str) -> None:
         pairs = []
         for cam in list(list_configured_cameras().keys()):
             try:
-                frame = capture_frame(cam)
-                path = save_image(frame, sample_id, cam, 0)
-                pairs.append((cam, path))
+                for view_index, (suffix, frame) in enumerate(capture_frames_multi(cam)):
+                    path = save_image(frame, sample_id, cam, view_index)
+                    pairs.append((cam, path))
             except Exception as e:
                 print(f"[AUTO CAPTURE] '{cam}' unavailable for {sample_id}: {e}")
         if not pairs:
@@ -2259,9 +2263,16 @@ def run_automatic_capture_sequence(category: str, num_images: int,
         # Collections" page identically to a manual submission. 4DAI's
         # code is completely unmodified for this to work.
         values = {"predicted_label": category, "num_images": len(image_paths)}
+        # Pass our own already-structured, timestamp-sortable id through
+        # as a hint - the server honors it if given (see
+        # server-4dai/Server/main.py's submission()) instead of minting
+        # its own random one, so the folder it creates on upload matches
+        # this same sortable id rather than diverging from it.
+        local_sample_id = new_sample_id()
         submit_response = requests.post(
             f"{SERVER_URL}/collection/submission",
-            json={"category": category, "date": str(date.today()), "data": values},
+            json={"category": category, "date": str(date.today()), "data": values,
+                  "sample_id": local_sample_id},
             timeout=10,
         )
         submit_response.raise_for_status()
@@ -6490,13 +6501,15 @@ def run_manual_snapshot(sample_label: str, status_label_widget: tk.Label,
 
     def worker():
         sample_id = new_sample_id()
-        saved_paths = {}   # camera name -> image path
+        saved_pairs = []   # list of (camera_name, image_path) — a camera
+                            # contributes TWO entries here if its "dual
+                            # capture" toggle is on (see capture_frames_multi)
         cam_errors = {}    # camera name -> error message
 
         for cam in camera_names:
             try:
-                frame = capture_frame(cam)
-                saved_paths[cam] = save_image(frame, sample_id, cam, 0)
+                for view_index, (suffix, frame) in enumerate(capture_frames_multi(cam)):
+                    saved_pairs.append((cam, save_image(frame, sample_id, cam, view_index)))
             except Exception as e:
                 cam_errors[cam] = str(e)
 
@@ -6505,18 +6518,21 @@ def run_manual_snapshot(sample_label: str, status_label_widget: tk.Label,
         # logger_service) uses — so a manual GUI capture and an
         # automatic one are recorded identically: Mongo `objects`/
         # `images` docs, catalog match/link, CSV + JSON append, Excel
-        # refresh. See vision/storage/capture_pipeline.py.
+        # refresh. See vision/storage/capture_pipeline.py. Passed as a
+        # list of (source, path) pairs, not a dict, since dual-capture
+        # can mean the SAME camera name appears twice — see
+        # record_capture()'s docstring on why that needs the list form.
         arm_position = current_arm_position()  # snapshot NOW — right as the photos were taken,
                                                 # not wherever the arm ends up later. None (-> null)
                                                 # if the robot isn't connected/no feedback yet.
         mongo_ok = False
         object_id = sample_id  # kept as the local var name used below/upload code
         pipeline_warnings = []
-        if saved_paths:
+        if saved_pairs:
             try:
                 object_id, pipeline_warnings = record_capture(
                     name=sample_label,
-                    image_paths_by_source=saved_paths,
+                    image_paths_by_source=saved_pairs,
                     position=arm_position,
                 )
                 mongo_ok = True
@@ -6526,19 +6542,20 @@ def run_manual_snapshot(sample_label: str, status_label_widget: tk.Label,
                 print(f"[MONGO] Could not log capture locally: {e}")
 
         uploaded = 0
-        if SERVER_URL and saved_paths:
+        if SERVER_URL and saved_pairs:
             try:
                 submit_response = requests.post(
                     f"{SERVER_URL}/collection/submission",
                     json={"category": sample_label, "date": str(date.today()),
                           "data": {"label": sample_label,
                                    "predicted_label": sample_label,
-                                   "num_images": len(saved_paths)}},
+                                   "num_images": len(saved_pairs)},
+                          "sample_id": sample_id},
                     timeout=5,
                 )
                 submit_response.raise_for_status()
                 remote_sample_id = submit_response.json()["sample_id"]
-                for cam, path in saved_paths.items():
+                for cam, path in saved_pairs:
                     try:
                         with open(path, "rb") as image_file:
                             upload_response = requests.post(
@@ -6555,12 +6572,13 @@ def run_manual_snapshot(sample_label: str, status_label_widget: tk.Label,
                 print(f"[UPLOAD] Could not create submission on server ({SERVER_URL}): {e}")
 
         def report():
-            parts = [f"Saved {len(saved_paths)}/{len(camera_names)} camera(s) as '{sample_label}'"]
+            parts = [f"Saved {len(saved_pairs)} image(s) from "
+                     f"{len(camera_names) - len(cam_errors)}/{len(camera_names)} camera(s) as '{sample_label}'"]
             if cam_errors:
                 parts.append("Errors: " + ", ".join(
                     f"{c} ({m})" for c, m in cam_errors.items()))
             parts.append("MongoDB: OK" if mongo_ok else "MongoDB: failed")
-            parts.append(f"Upload: {uploaded}/{len(saved_paths)}" if saved_paths
+            parts.append(f"Upload: {uploaded}/{len(saved_pairs)}" if saved_pairs
                          else "Upload: skipped")
             color = "green" if (mongo_ok or uploaded) else "orange"
             status_label_widget.config(text=" | ".join(parts), fg=color)
@@ -6677,6 +6695,34 @@ def _build_camera_panels():
 
 
 _build_camera_panels()
+
+
+def _warm_camera_handles():
+    """
+    Pre-opens (and caches — see vision/camera/capture.py's _capture_handles)
+    every configured camera's cv2.VideoCapture handle right at startup,
+    in the background, instead of waiting for the first real capture to
+    open it "cold".
+
+    WHY THIS MATTERS: opening a camera (probing DSHOW/MSMF/CAP_ANY,
+    negotiating a format) commonly takes 1-3 seconds on Windows,
+    especially the first time. capture_frame() already caches the
+    handle across calls, so this cost is normally paid only once per
+    camera per app run - but if that "once" happens to land on the very
+    first auto-capture-on-move (see trigger_arm_move_autocapture), the
+    whole feature *looks* like it has a multi-second lag right when it
+    matters most (right after a move). Warming every handle here at
+    launch means that cost is paid during startup instead, once, before
+    anyone's watching a specific move for a fast response.
+    """
+    for cam_name in list_configured_cameras():
+        try:
+            capture_frame(cam_name)
+        except Exception as e:
+            print(f"[CAMERA WARMUP] '{cam_name}' not ready yet: {e}")
+
+
+threading.Thread(target=_warm_camera_handles, daemon=True).start()
 
 live_feed_button_row = tk.Frame(gallery_frame, bg="#f0f0f0")
 live_feed_button_row.pack(pady=4)
@@ -6813,15 +6859,93 @@ camera_assign_rows_frame = tk.Frame(camera_assign_frame)
 camera_assign_rows_frame.pack(fill=tk.X)
 
 _camera_assign_index_vars = {}  # camera name -> tk.StringVar holding the index entry text
+_camera_settings_vars = {}      # camera name -> {"res": tk.StringVar, "mono": tk.BooleanVar}
+
+_RESOLUTION_CHOICES = ["640x480", "1280x720", "1920x1080"]
+
+
+def _do_apply_camera_settings(cam_name):
+    res_str = _camera_settings_vars[cam_name]["res"].get().strip()
+    mono = _camera_settings_vars[cam_name]["mono"].get()
+    dual = _camera_settings_vars[cam_name]["dual"].get()
+    res_b_str = _camera_settings_vars[cam_name]["res_b"].get().strip()
+    mono_b = _camera_settings_vars[cam_name]["mono_b"].get()
+    try:
+        width_str, height_str = res_str.lower().split("x")
+        width, height = int(width_str), int(height_str)
+    except ValueError:
+        camera_assign_status.config(
+            text=f"'{res_str}' is not a valid resolution — use WIDTHxHEIGHT (e.g. 1280x720).",
+            fg="red")
+        return
+    width_b = height_b = None
+    if dual:
+        try:
+            width_b_str, height_b_str = res_b_str.lower().split("x")
+            width_b, height_b = int(width_b_str), int(height_b_str)
+        except ValueError:
+            camera_assign_status.config(
+                text=f"'{res_b_str}' is not a valid resolution B — use WIDTHxHEIGHT (e.g. 640x480).",
+                fg="red")
+            return
+    try:
+        set_camera_settings(cam_name, width=width, height=height, mono=mono,
+                             dual_capture=dual, width_b=width_b, height_b=height_b,
+                             mono_b=mono_b)
+        if dual:
+            msg = (f"'{cam_name}' set to dual-capture: A = {width}x{height} "
+                   f"{'mono' if mono else 'color/overlay'}, B = {width_b}x{height_b} "
+                   f"{'mono' if mono_b else 'color/overlay'}. Every photo request from "
+                   f"this camera now rapid-fires both shots.")
+        else:
+            msg = (f"'{cam_name}' set to {width}x{height}, "
+                   f"{'grayscale/mono' if mono else 'color/overlay'} mode.")
+        camera_assign_status.config(text=msg, fg="green")
+    except Exception as e:
+        camera_assign_status.config(text=f"Could not apply settings for '{cam_name}': {e}", fg="red")
+
+
+def _do_detect_output_modes(cam_name):
+    camera_assign_status.config(text=f"Probing '{cam_name}' output modes...", fg="gray")
+
+    def worker():
+        result = probe_camera_output_modes(cam_name)
+        def report():
+            if result["modes_differ"]:
+                msg = (f"'{cam_name}' confirmed: color/overlay and grayscale/mono "
+                       f"produce genuinely different output on this camera — the "
+                       f"toggle above will do something.")
+                color = "green"
+            elif result["color_supported"] and result["mono_supported"]:
+                msg = (f"'{cam_name}' accepted both modes but the images came back "
+                       f"the same — this camera may not actually support switching "
+                       f"output modes, or does so in a way OpenCV's standard "
+                       f"CAP_PROP_CONVERT_RGB switch doesn't control.")
+                color = "orange"
+            else:
+                msg = (f"Could not confirm either mode on '{cam_name}' — check it's "
+                       f"connected and not in use by another program.")
+                color = "orange"
+            camera_assign_status.config(text=msg, fg=color)
+        root.after(0, report)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _rebuild_camera_assign_rows():
     """(Re)draws one row per currently-configured camera name, each with
     an editable device-index box, a best-effort detected device-name
-    hint (see list_camera_device_names()), and an Assign button."""
+    hint (see list_camera_device_names()), an Assign button, a row of
+    primary resolution/mono-vs-color settings, a "Detect Output Modes"
+    button that actually tests whether THIS camera's hardware honors the
+    mono/color toggle (see probe_camera_output_modes()), and an optional
+    second "Capture B" resolution/mode row — turning that on makes every
+    photo request from this camera rapid-fire both profiles back to back
+    (see vision/camera/capture.py's capture_frames_multi())."""
     for child in camera_assign_rows_frame.winfo_children():
         child.destroy()
     _camera_assign_index_vars.clear()
+    _camera_settings_vars.clear()
 
     device_names = list_camera_device_names()
     current = list_configured_cameras()
@@ -6841,6 +6965,42 @@ def _rebuild_camera_assign_rows():
         if detected_name:
             tk.Label(row, text=f"(detected: {detected_name})", fg="gray",
                      font=("Arial", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+        current_settings = get_camera_settings(cam_name)
+
+        settings_row = tk.Frame(camera_assign_rows_frame)
+        settings_row.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
+        tk.Label(settings_row, text="A (primary) resolution:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 2))
+        res_var = tk.StringVar(value=f"{current_settings['width']}x{current_settings['height']}")
+        ttk.Combobox(settings_row, textvariable=res_var, width=10,
+                     values=_RESOLUTION_CHOICES).pack(side=tk.LEFT, padx=(0, 8))
+        mono_var = tk.BooleanVar(value=current_settings["mono"])
+        tk.Checkbutton(settings_row, text="Grayscale / mono (uncheck for color/overlay)",
+                        variable=mono_var, font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(settings_row, text="Detect Output Modes", bg="lightgray", font=("Arial", 8),
+                  command=lambda n=cam_name: _do_detect_output_modes(n)).pack(side=tk.LEFT, padx=(0, 8))
+
+        dual_row = tk.Frame(camera_assign_rows_frame)
+        dual_row.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
+        dual_var = tk.BooleanVar(value=current_settings["dual_capture"])
+        tk.Checkbutton(dual_row, text="Also rapid-capture a B shot on every photo request:",
+                        variable=dual_var, font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 4))
+        res_b_var = tk.StringVar(value=f"{current_settings['width_b']}x{current_settings['height_b']}")
+        ttk.Combobox(dual_row, textvariable=res_b_var, width=10,
+                     values=_RESOLUTION_CHOICES).pack(side=tk.LEFT, padx=(0, 8))
+        mono_b_var = tk.BooleanVar(value=current_settings["mono_b"])
+        tk.Checkbutton(dual_row, text="B is grayscale/mono (uncheck for color/overlay)",
+                        variable=mono_b_var, font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 8))
+
+        _camera_settings_vars[cam_name] = {
+            "res": res_var, "mono": mono_var,
+            "dual": dual_var, "res_b": res_b_var, "mono_b": mono_b_var,
+        }
+
+        apply_row = tk.Frame(camera_assign_rows_frame)
+        apply_row.pack(fill=tk.X, pady=(0, 8), padx=(12, 0))
+        tk.Button(apply_row, text="Apply Settings", bg="lightyellow",
+                  command=lambda n=cam_name: _do_apply_camera_settings(n)).pack(side=tk.LEFT)
 
 
 def _do_remove_camera_override(cam_name):

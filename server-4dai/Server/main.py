@@ -53,6 +53,19 @@ def safe_collection_name(name) -> str:
         raise HTTPException(status_code=400, detail="Category name is too long.")
     return cleaned
 
+def _structured_id(prefix: str = "sample") -> str:
+    """Structured, chronologically-sortable id: <prefix>_<YYYYMMDD>_<HHMMSS>_<4-char
+    suffix> instead of a bare UUID, so sample/image folders and Mongo
+    _ids sort by when they were created just from their name/string
+    value - same convention the desktop app's vision/camera/capture.py
+    new_sample_id() uses. The short suffix (from uuid4, truncated) only
+    exists to avoid collisions when more than one request lands in the
+    same second (e.g. several images from one fast rotation sweep)."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:4]
+    return f"{prefix}_{timestamp}_{suffix}"
+
+
 @app.post("/collection/submission")
 def submission(submission:dict):
     for required_key in ("category", "date", "data"):
@@ -61,8 +74,21 @@ def submission(submission:dict):
 
     category = safe_collection_name(submission["category"].lower())
     table = db[category]
-    sample_id = str(uuid.uuid4())
-    
+    # BUGFIX (folder names were "random"): this used to always mint a
+    # bare uuid.uuid4() here regardless of anything the caller sent,
+    # which became BOTH the Mongo _id AND the on-disk folder name
+    # (/collection/images/upload builds images/<category>/<sample_id>/
+    # straight from this) - so no matter how structured/date-based a
+    # client's own sample naming was, the actual folder on disk (here,
+    # on the server) still came out as opaque random hex. Now: honor a
+    # client-supplied "sample_id" if one's given (sanitized the same way
+    # a path-supplied name is elsewhere in this file), otherwise mint a
+    # structured, timestamp-sortable one instead of a raw UUID.
+    if submission.get("sample_id"):
+        sample_id = safe_filename(str(submission["sample_id"]))
+    else:
+        sample_id = _structured_id("sample")
+
     table.insert_one({
         "_id": sample_id,
         "date" : submission["date"],
@@ -77,7 +103,7 @@ def upload_image(sample_id: str = Form(...), category:str = Form(...), file:Uplo
     image_folder = f"images/{category}/{sample_id}"
     os.makedirs(image_folder,exist_ok=True)
 
-    image_id = str(uuid.uuid4())
+    image_id = _structured_id("img")
 
     image_file = f"{image_folder}/{image_id}.jpg"
     
@@ -297,7 +323,7 @@ def save_auto_captured_image(category: str = Form(...), file: UploadFile = File(
         # No sample_id from the caller (e.g. a manual test POST) — every
         # image gets its own sample so it's still findable, just not
         # grouped with anything.
-        sample_id = str(uuid.uuid4())
+        sample_id = _structured_id("sample")
         table.insert_one({
             "_id": sample_id,
             "date": str(datetime.now().date()),

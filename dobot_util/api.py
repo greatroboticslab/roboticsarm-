@@ -500,28 +500,81 @@ class Feedback(DobotSocketConnection):
     def __init__(self, ip: str):
         super().__init__(ip, REALTIME_FEEDBACK_PORT, consume_greeting=False)
         self.socket.settimeout(0.5)
+        self._partial = b""  # bytes of a packet assembled so far but not
+                              # yet complete — carried over between calls,
+                              # see _try_read_packet()/get_feedback() below
+
+    def _try_read_packet(self, timeout: float):
+        """
+        Attempts to complete exactly one PACKET_SIZE packet, resuming from
+        self._partial if a previous attempt (in either this call's own
+        drain loop or a prior get_feedback() call) left one in progress.
+        timeout=0.0 means non-blocking - "give me only bytes that have
+        already arrived, don't wait for more" - anything else blocks up
+        to that many seconds waiting for the first byte of a fresh
+        packet. Returns the raw packet bytes once one is fully
+        assembled, or None if not yet complete (any partial bytes read
+        so far stay in self._partial for the next call - never
+        discarded, so packet boundaries can never get corrupted by a
+        drain pass stopping mid-packet).
+        """
+        self.socket.settimeout(timeout)
+        try:
+            while len(self._partial) < self.PACKET_SIZE:
+                chunk = self.socket.recv(self.PACKET_SIZE - len(self._partial))
+                if not chunk:
+                    return None
+                self._partial += chunk
+        except (socket.timeout, BlockingIOError):
+            return None
+        packet = self._partial
+        self._partial = b""
+        return packet
 
     def get_feedback(self):
         """
-        Read exactly one 1440-byte packet and return it as a numpy structured
-        array, or None if no complete packet is available yet.
+        Returns the MOST CURRENT 1440-byte telemetry packet as a numpy
+        structured array, or None if no complete packet is available yet.
+
+        BUGFIX (robot position on the live tracking dot/telemetry taking
+        seconds to catch up to where the arm actually is): the
+        controller streams a fresh packet every ~8ms (125Hz) the instant
+        this connection opens, but main.py's feedback_loop() only calls
+        get_feedback() once every ~20ms (50Hz) - slower than packets
+        arrive. The OLD version of this method read exactly ONE packet
+        per call and nothing more, so it never drained anything beyond
+        that - the OS-level TCP receive buffer behind the socket steadily
+        filled with a growing backlog of un-consumed packets, and every
+        call kept returning whatever was at the FRONT of that backlog:
+        an increasingly stale snapshot of where the arm WAS a while ago,
+        not where it is right now. (Same failure mode as the camera
+        "one photo behind" bugfix in vision/camera/capture.py, just on
+        the telemetry socket instead of a video feed.)
+
+        Fix: after reading one full packet the normal way (blocking, up
+        to the connection's 0.5s timeout), keep pulling any FURTHER
+        packets that have ALREADY arrived off the socket without
+        blocking, keeping only the newest one. That guarantees this
+        never returns anything older than "whatever's most recent as of
+        right now", so a backlog can never accumulate between polls
+        regardless of how much faster the controller streams than we
+        poll.
         """
         try:
-            data = b""
-            while len(data) < self.PACKET_SIZE:
-                chunk = self.socket.recv(self.PACKET_SIZE - len(data))
-                if not chunk:
-                    return None
-                data += chunk
-            if len(data) == self.PACKET_SIZE:
-                return np.frombuffer(data, dtype=FeedbackType)
-        except socket.timeout:
-            return None
+            data = self._try_read_packet(timeout=0.5)
+            if data is None:
+                return None
+            while True:
+                newer = self._try_read_packet(timeout=0.0)
+                if newer is None:
+                    break
+                data = newer
+            return np.frombuffer(data, dtype=FeedbackType)
         except Exception as exc:
             log.warning("Feedback read error: %s", exc)
             return None
-
-        return None
+        finally:
+            self.socket.settimeout(0.5)
 
 
 
