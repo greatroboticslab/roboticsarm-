@@ -29,6 +29,7 @@ from datetime import datetime
 
 try:
     import cv2
+    import numpy as np
     _CV2_AVAILABLE = True
 except ImportError:
     _CV2_AVAILABLE = False
@@ -160,43 +161,62 @@ _load_camera_settings()
 def get_camera_settings(name: str) -> dict:
     """Returns the resolved settings dict for `name` — defaults
     (vision.config's CAMERA_FRAME_WIDTH/HEIGHT, color mode, dual-capture
-    off) filled in for anything not explicitly set yet:
+    off, "combined" view) filled in for anything not explicitly set yet:
       width/height/mono   - the camera's normal/primary output.
+      view                 - for a stereo/multi-eye camera whose raw
+                              frame is two (or more) views packed side
+                              by side (e.g. the e-con See3CAM_Stereo's
+                              native "<left><right>" combined output):
+                              "combined" (the raw frame, unmodified),
+                              "left"/"right" (crop to just that half),
+                              or "blend" (left | right | combined,
+                              stacked into one wide image — all
+                              perspectives in one photo at a glance).
+                              No-op for an ordinary single-eye camera.
       dual_capture         - if True, every capture_frames_multi() call
                               for this camera rapid-fires a SECOND shot
-                              at width_b/height_b/mono_b right after the
-                              primary one (see capture_frames_multi()).
-      width_b/height_b/mono_b - the second profile. mono_b defaults to
-                              the OPPOSITE of mono (e.g. primary=color,
-                              secondary=mono) since "the other output the
-                              camera offers" is the common case; width_b/
-                              height_b default to the same as primary if
-                              not set separately.
+                              at width_b/height_b/mono_b/view_b right
+                              after the primary one (see
+                              capture_frames_multi()).
+      width_b/height_b/mono_b/view_b - the second profile. mono_b
+                              defaults to the OPPOSITE of mono (e.g.
+                              primary=color, secondary=mono) since "the
+                              other output the camera offers" is the
+                              common case; width_b/height_b/view_b
+                              default to the same as primary if not set
+                              separately.
     """
     saved = _camera_settings.get(str(name).strip(), {})
     width = saved.get("width") or CAMERA_FRAME_WIDTH
     height = saved.get("height") or CAMERA_FRAME_HEIGHT
     mono = bool(saved.get("mono", False))
+    view = saved.get("view") or "combined"
     return {
         "width": width,
         "height": height,
         "mono": mono,
+        "view": view,
         "dual_capture": bool(saved.get("dual_capture", False)),
         "width_b": saved.get("width_b") or width,
         "height_b": saved.get("height_b") or height,
         "mono_b": bool(saved.get("mono_b", not mono)),
+        "view_b": saved.get("view_b") or view,
     }
 
 
 def set_camera_settings(name: str, width: int = None, height: int = None,
-                         mono: bool = None, dual_capture: bool = None,
+                         mono: bool = None, view: str = None,
+                         dual_capture: bool = None,
                          width_b: int = None, height_b: int = None,
-                         mono_b: bool = None) -> None:
-    """Persists resolution/mono-vs-color (and optional second dual-capture
-    profile) settings for camera `name` and applies the PRIMARY profile
-    immediately to its handle if one's already open/cached (cap.set() on
-    a live handle - no reopen needed), so a change takes effect on the
-    very next frame rather than needing a reconnect."""
+                         mono_b: bool = None, view_b: str = None) -> None:
+    """Persists resolution/mono-vs-color/stereo-view (and optional second
+    dual-capture profile) settings for camera `name` and applies the
+    PRIMARY profile's resolution/mono immediately to its handle if one's
+    already open/cached (cap.set() on a live handle - no reopen needed),
+    so a change takes effect on the very next frame rather than needing
+    a reconnect. `view`/`view_b` are purely a post-processing crop
+    applied after the frame is read (see _apply_stereo_view) - nothing
+    to push to the camera hardware for those."""
     name = str(name).strip()
     if not name:
         raise ValueError("Camera name cannot be empty.")
@@ -207,6 +227,8 @@ def set_camera_settings(name: str, width: int = None, height: int = None,
         entry["height"] = int(height)
     if mono is not None:
         entry["mono"] = bool(mono)
+    if view is not None:
+        entry["view"] = str(view)
     if dual_capture is not None:
         entry["dual_capture"] = bool(dual_capture)
     if width_b is not None:
@@ -215,6 +237,8 @@ def set_camera_settings(name: str, width: int = None, height: int = None,
         entry["height_b"] = int(height_b)
     if mono_b is not None:
         entry["mono_b"] = bool(mono_b)
+    if view_b is not None:
+        entry["view_b"] = str(view_b)
     _save_camera_settings()
 
     index = list_configured_cameras().get(name)
@@ -234,6 +258,60 @@ def _apply_camera_settings(cap, settings: dict) -> None:
         cap.set(cv2.CAP_PROP_CONVERT_RGB, 0 if settings["mono"] else 1)
     except Exception:
         pass
+
+
+def _normalize_frame_for_save(frame):
+    """
+    Converts a raw frame from cap.read() into something safe to save/
+    display as a normal 8-bit image, whatever raw pixel format the
+    camera/backend handed back.
+
+    BUGFIX (dual-capture returning solid-white photos): some cameras —
+    notably a mono/stereo Y16 sensor like the e-con See3CAM_Stereo, when
+    CAP_PROP_CONVERT_RGB is off — hand back 16-bit-per-pixel raw data.
+    Treating that as if it were an ordinary 8-bit BGR frame (which is
+    what happens if it's saved/displayed with no conversion) blows the
+    high byte of every 16-bit value out toward white, or otherwise
+    scrambles the image — exactly the "white photos" symptom reported.
+    This min/max-normalizes any non-8-bit frame down to the full 0-255
+    uint8 range before returning it, regardless of the sensor's actual
+    bit depth, so it always saves as a real, viewable image.
+    """
+    if frame is None or frame.dtype == np.uint8:
+        return frame
+    return cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+def _apply_stereo_view(frame, view: str):
+    """
+    For a stereo/multi-eye camera whose raw frame is two views packed
+    side by side (left eye | right eye, in one wide frame — the
+    e-con See3CAM_Stereo's native output, and common to UVC stereo
+    cameras generally): crops to just the left or right half, or builds
+    a "blend" composite of left | right | combined stacked into one wide
+    image so all three perspectives are visible in a single photo.
+    No-op (returns `frame` unchanged) for view == "combined"/None, or
+    for a frame that isn't at least twice as wide as it is tall (not
+    plausibly a side-by-side pair — an ordinary single-eye camera should
+    just leave `view` on "combined" and never hit the crop logic at
+    all).
+    """
+    if not view or view == "combined" or frame is None:
+        return frame
+    h, w = frame.shape[:2]
+    if w < h * 2:
+        return frame  # doesn't look like a side-by-side stereo pair — leave it alone
+    half_w = w // 2
+    left = frame[:, :half_w]
+    right = frame[:, half_w:half_w * 2]
+    if view == "left":
+        return left
+    if view == "right":
+        return right
+    if view == "blend":
+        return np.hstack([left, right, frame[:, :half_w * 2]])
+    return frame
+
 
 # Lazily-opened, cached VideoCapture handles - opened once, reused across
 # calls rather than reopening the device every capture (slow + some UVC
@@ -460,67 +538,124 @@ def _capture_from_index(index: int, _retry: bool = True, camera_name: str = None
             f"reconnecting. Check the USB connection and that no other "
             f"program has it open."
         )
+    frame = _normalize_frame_for_save(frame)
+    if camera_name:
+        frame = _apply_stereo_view(frame, get_camera_settings(camera_name)["view"])
     return frame
 
 
-def probe_camera_output_modes(camera_name: str) -> dict:
+def probe_camera_modes(camera_name: str) -> list:
     """
-    Best-effort: actually tries both CAP_PROP_CONVERT_RGB=1 (color/
-    overlay) and =0 (raw/mono) on the live camera and reports whether
-    the two reads came back genuinely different — so the Camera tab can
-    tell you whether THIS camera's mono/overlay toggle actually does
-    anything on the actual connected hardware, "based on the option the
-    camera provides", instead of just always showing the checkbox
-    regardless of whether it's honored. Restores whatever settings were
-    configured before probing once done.
+    Actually tests each candidate (width, height) against the live
+    camera hardware — closes whatever handle is cached first (many
+    industrial/stereo UVC cameras, the e-con See3CAM_Stereo included,
+    need a full stream restart to change resolution/format; a property
+    set on an already-streaming handle can silently no-op or, per the
+    "white photos" report, hand back garbage — see capture_frames_multi()
+    for the same fix applied to actual captures), opens a fresh handle
+    per candidate, sets it, discards a few warm-up frames to let the
+    sensor settle, reads one frame, and reports whether that frame looks
+    like real image data (not blank/constant) plus its actual returned
+    shape/dtype. Restores a normal handle at this camera's configured
+    settings once done.
 
-    Returns {"color_supported": bool, "mono_supported": bool,
-    "modes_differ": bool} — all best-effort; False here means "couldn't
-    confirm", not necessarily "definitely unsupported" (some backends
-    report success on a property set but silently no-op it).
+    Candidates include the See3CAM_Stereo's documented native combined
+    (left+right side by side) resolutions — WVGA/VGA/QVGA, per e-con's
+    own datasheet — alongside generic common ones, each tried in both
+    color and mono, so this can tell you exactly which combinations your
+    specific unit actually accepts instead of guessing.
+
+    Returns a list of dicts, one per WORKING combo — only combos that
+    produced a plausible non-blank frame are included, so this is the
+    definitive "what does this camera actually support" answer:
+      {"width", "height", "mono", "label", "actual_shape", "actual_dtype"}
     """
     configured = list_configured_cameras()
     if camera_name not in configured:
-        return {"color_supported": False, "mono_supported": False, "modes_differ": False}
+        return []
     index = configured[camera_name]
+
+    candidates = [
+        (1504, 480, "1504x480 (WVGA combined L+R — See3CAM_Stereo native)"),
+        (1280, 480, "1280x480 (VGA combined L+R — See3CAM_Stereo native)"),
+        (640, 240, "640x240 (QVGA combined L+R — See3CAM_Stereo native)"),
+        (1920, 1080, "1920x1080"),
+        (1280, 720, "1280x720"),
+        (640, 480, "640x480"),
+    ]
+
     lock = _get_lock(index)
+    working = []
     with lock:
+        cached = _capture_handles.pop(index, None)
+        if cached is not None:
+            cached.release()
+
+        for width, height, label in candidates:
+            for mono in (False, True):
+                cap = _open_camera(index)
+                if cap is None:
+                    continue
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                cap.set(cv2.CAP_PROP_CONVERT_RGB, 0 if mono else 1)
+                # Let the sensor settle after a resolution/format change
+                # before trusting what comes back - the first frame or
+                # two after a UVC stream (re)negotiation is commonly
+                # garbage/blank while auto-exposure/the sensor catches up.
+                for _ in range(5):
+                    cap.grab()
+                ok, frame = cap.read()
+                cap.release()
+                if not ok or frame is None:
+                    continue
+                # A "blank" frame (solid white/black/constant color) is
+                # exactly the reported symptom — this combo opened but
+                # isn't actually streaming real data.
+                if float(np.std(frame)) < 1.0:
+                    continue
+                working.append({
+                    "width": width, "height": height, "mono": mono,
+                    "label": f"{label} — {'mono' if mono else 'color/overlay'} "
+                             f"(actual {frame.shape}, {frame.dtype})",
+                    "actual_shape": tuple(frame.shape), "actual_dtype": str(frame.dtype),
+                })
+
+        # Restore a live handle at this camera's configured settings so
+        # nothing else (live feed, the next ordinary capture) is left
+        # without a working handle after probing.
         try:
-            cap = _get_handle(index, camera_name=camera_name)
+            _get_handle(index, camera_name=camera_name)
         except Exception:
-            return {"color_supported": False, "mono_supported": False, "modes_differ": False}
-        original = get_camera_settings(camera_name)
+            pass
 
-        cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-        ok_color, frame_color = cap.read()
-
-        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-        ok_mono, frame_mono = cap.read()
-
-        _apply_camera_settings(cap, original)  # restore whatever was configured before probing
-
-    modes_differ = False
-    if ok_color and ok_mono and frame_color is not None and frame_mono is not None:
-        modes_differ = (frame_color.shape != frame_mono.shape) or \
-                        (abs(float(frame_color.mean()) - float(frame_mono.mean())) > 1.0)
-
-    return {
-        "color_supported": bool(ok_color and frame_color is not None),
-        "mono_supported": bool(ok_mono and frame_mono is not None),
-        "modes_differ": modes_differ,
-    }
+    return working
 
 
 def capture_frames_multi(camera_name: str) -> list:
     """
-    Grabs one frame from `camera_name`, or TWO in rapid back-to-back
-    succession (one per configured resolution/output-mode profile) if
-    that camera's "dual capture" toggle is on (see set_camera_settings'
-    dual_capture/width_b/height_b/mono_b args, exposed on the Camera tab
-    as a second "Capture B" resolution/mode row) — e.g. one full-
-    resolution color/overlay shot and one grayscale/mono shot from the
-    SAME physical camera, every time a photo is requested from it, with
-    no manual re-triggering needed.
+    Grabs one frame from `camera_name`, or TWO in rapid succession (one
+    per configured resolution/output-mode profile) if that camera's
+    "dual capture" toggle is on (see set_camera_settings' dual_capture/
+    width_b/height_b/mono_b/view_b args, exposed on the Camera tab as a
+    second "Capture B" resolution/mode row) — e.g. one full-resolution
+    shot and one lower-res/mono shot from the SAME physical camera,
+    every time a photo is requested from it.
+
+    BUGFIX (dual capture returning solid-white photos and crashing): the
+    first version of this switched profiles with a bare cap.set() on the
+    SAME still-open handle, then read immediately. Several UVC cameras —
+    stereo/industrial ones especially, the e-con See3CAM_Stereo
+    included — don't actually renegotiate their stream that fast (or at
+    all without a full restart); reading right after a live property
+    change caught the sensor mid-reconfiguration, producing blank/white
+    frames and in some cases wedging the driver badly enough to crash.
+    Fixed by fully CLOSING the handle, reopening fresh at the B profile,
+    discarding a few warm-up frames to let the new stream settle, THEN
+    reading — the same "give the hardware a moment" approach
+    probe_camera_modes() uses — before closing that and reopening once
+    more back at the A/primary profile for whatever uses this camera
+    next (live feed, the next capture).
 
     Returns a list of (suffix, frame) pairs: one pair (suffix "a") for a
     normal single capture, two pairs ("a", "b") for dual capture —
@@ -545,19 +680,31 @@ def capture_frames_multi(camera_name: str) -> list:
     settings_b = {"width": settings["width_b"], "height": settings["height_b"],
                   "mono": settings["mono_b"]}
     lock = _get_lock(index)
+    frame_b = None
     with lock:
-        cap = _get_handle(index, camera_name=camera_name)
-        _apply_camera_settings(cap, settings_b)
-        if _flush_stale_frames_enabled:
-            for _ in range(_STALE_FRAME_FLUSH_COUNT):
-                cap.grab()
-        ok_b, frame_b = cap.read()
-        _apply_camera_settings(cap, settings)  # restore the primary profile so
-                                                # anything else reading this
-                                                # camera next (live feed, the
-                                                # next capture) gets the
-                                                # normal/primary output again.
-    if not ok_b or frame_b is None:
+        cached = _capture_handles.pop(index, None)
+        if cached is not None:
+            cached.release()
+        cap_b = _open_camera(index)
+        if cap_b is not None:
+            _apply_camera_settings(cap_b, settings_b)
+            for _ in range(5):  # let the reconfigured stream settle — see BUGFIX above
+                cap_b.grab()
+            ok_b, raw_b = cap_b.read()
+            cap_b.release()
+            if ok_b and raw_b is not None:
+                frame_b = _apply_stereo_view(_normalize_frame_for_save(raw_b), settings["view_b"])
+
+        # Reopen fresh at the primary/A profile, same "settle first"
+        # treatment, for whatever uses this camera next.
+        cap_a = _open_camera(index)
+        if cap_a is not None:
+            _apply_camera_settings(cap_a, settings)
+            for _ in range(5):
+                cap_a.grab()
+            _capture_handles[index] = cap_a
+
+    if frame_b is None:
         print(f"[CAMERA] '{camera_name}' dual-capture secondary shot failed — "
               f"only the primary was saved.")
         return [("a", frame_a)]

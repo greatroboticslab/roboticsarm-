@@ -223,7 +223,7 @@ def import_package(package_dir: str) -> Tuple[int, int, List[str]]:
                 skipped += 1
                 continue
 
-            new_object_id = str(uuid.uuid4())
+            new_object_id = f"object_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
             dest_dir = os.path.join(storage_location.imported_images_root(), new_object_id)
             os.makedirs(dest_dir, exist_ok=True)
 

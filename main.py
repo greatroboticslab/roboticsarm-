@@ -36,7 +36,7 @@ from vision.camera.capture import (
     get_camera_settings,
     set_camera_settings,
     capture_frames_multi,
-    probe_camera_output_modes,
+    probe_camera_modes,
 )
 import requests
 from vision.config import (
@@ -6864,12 +6864,18 @@ _camera_settings_vars = {}      # camera name -> {"res": tk.StringVar, "mono": t
 _RESOLUTION_CHOICES = ["640x480", "1280x720", "1920x1080"]
 
 
+_VIEW_CHOICES = ["combined", "left", "right", "blend"]
+_detected_modes_by_camera = {}  # camera name -> list of mode dicts from the last Detect Output Modes run
+
+
 def _do_apply_camera_settings(cam_name):
     res_str = _camera_settings_vars[cam_name]["res"].get().strip()
     mono = _camera_settings_vars[cam_name]["mono"].get()
+    view = _camera_settings_vars[cam_name]["view"].get().strip() or "combined"
     dual = _camera_settings_vars[cam_name]["dual"].get()
     res_b_str = _camera_settings_vars[cam_name]["res_b"].get().strip()
     mono_b = _camera_settings_vars[cam_name]["mono_b"].get()
+    view_b = _camera_settings_vars[cam_name]["view_b"].get().strip() or "combined"
     try:
         width_str, height_str = res_str.lower().split("x")
         width, height = int(width_str), int(height_str)
@@ -6889,59 +6895,93 @@ def _do_apply_camera_settings(cam_name):
                 fg="red")
             return
     try:
-        set_camera_settings(cam_name, width=width, height=height, mono=mono,
+        set_camera_settings(cam_name, width=width, height=height, mono=mono, view=view,
                              dual_capture=dual, width_b=width_b, height_b=height_b,
-                             mono_b=mono_b)
+                             mono_b=mono_b, view_b=view_b)
         if dual:
             msg = (f"'{cam_name}' set to dual-capture: A = {width}x{height} "
-                   f"{'mono' if mono else 'color/overlay'}, B = {width_b}x{height_b} "
-                   f"{'mono' if mono_b else 'color/overlay'}. Every photo request from "
-                   f"this camera now rapid-fires both shots.")
+                   f"{'mono' if mono else 'color/overlay'}/{view}, B = {width_b}x{height_b} "
+                   f"{'mono' if mono_b else 'color/overlay'}/{view_b}. Every photo request "
+                   f"from this camera now rapid-fires both shots (full reconnect between "
+                   f"them so the sensor has time to settle — see the note on white/blank "
+                   f"frames below).")
         else:
             msg = (f"'{cam_name}' set to {width}x{height}, "
-                   f"{'grayscale/mono' if mono else 'color/overlay'} mode.")
+                   f"{'grayscale/mono' if mono else 'color/overlay'}, view={view}.")
         camera_assign_status.config(text=msg, fg="green")
     except Exception as e:
         camera_assign_status.config(text=f"Could not apply settings for '{cam_name}': {e}", fg="red")
 
 
-def _do_detect_output_modes(cam_name):
-    camera_assign_status.config(text=f"Probing '{cam_name}' output modes...", fg="gray")
+def _do_detect_output_modes(cam_name, listbox_widget):
+    camera_assign_status.config(
+        text=f"Probing '{cam_name}' — this fully reconnects the camera several times "
+             f"and takes a few seconds, live feed for it will pause...", fg="gray")
+    listbox_widget.delete(0, tk.END)
+    listbox_widget.insert(tk.END, "Detecting...")
 
     def worker():
-        result = probe_camera_output_modes(cam_name)
+        modes = probe_camera_modes(cam_name)
+        _detected_modes_by_camera[cam_name] = modes
         def report():
-            if result["modes_differ"]:
-                msg = (f"'{cam_name}' confirmed: color/overlay and grayscale/mono "
-                       f"produce genuinely different output on this camera — the "
-                       f"toggle above will do something.")
-                color = "green"
-            elif result["color_supported"] and result["mono_supported"]:
-                msg = (f"'{cam_name}' accepted both modes but the images came back "
-                       f"the same — this camera may not actually support switching "
-                       f"output modes, or does so in a way OpenCV's standard "
-                       f"CAP_PROP_CONVERT_RGB switch doesn't control.")
-                color = "orange"
+            listbox_widget.delete(0, tk.END)
+            if modes:
+                for m in modes:
+                    listbox_widget.insert(tk.END, m["label"])
+                camera_assign_status.config(
+                    text=f"'{cam_name}': found {len(modes)} working mode(s) — click one in "
+                         f"the list to load it into the A (primary) settings above, then "
+                         f"Apply Settings.",
+                    fg="green")
             else:
-                msg = (f"Could not confirm either mode on '{cam_name}' — check it's "
-                       f"connected and not in use by another program.")
-                color = "orange"
-            camera_assign_status.config(text=msg, fg=color)
+                listbox_widget.insert(tk.END, "(none found — see status message)")
+                camera_assign_status.config(
+                    text=f"'{cam_name}': none of the candidate resolutions/modes produced "
+                         f"a real (non-blank) frame. If this is a stereo/industrial camera "
+                         f"(e.g. See3CAM_Stereo), it may need its vendor SDK/driver rather "
+                         f"than plain OpenCV to stream at all — check it's plugged into a "
+                         f"USB 3.0 port (these often need the bandwidth) and not already "
+                         f"open in another program.",
+                    fg="orange")
         root.after(0, report)
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def _do_pick_detected_mode(cam_name, listbox_widget, target):
+    """target is 'a' or 'b' — loads the clicked detected mode into that
+    profile's resolution/mono controls (Apply Settings still needed to
+    actually save/use it)."""
+    selection = listbox_widget.curselection()
+    modes = _detected_modes_by_camera.get(cam_name) or []
+    if not selection or not modes or selection[0] >= len(modes):
+        return
+    mode = modes[selection[0]]
+    vars_ = _camera_settings_vars[cam_name]
+    if target == "a":
+        vars_["res"].set(f"{mode['width']}x{mode['height']}")
+        vars_["mono"].set(mode["mono"])
+    else:
+        vars_["res_b"].set(f"{mode['width']}x{mode['height']}")
+        vars_["mono_b"].set(mode["mono"])
+    camera_assign_status.config(
+        text=f"Loaded '{mode['label']}' into profile {target.upper()} — click Apply "
+             f"Settings to save/use it.",
+        fg="blue")
 
 
 def _rebuild_camera_assign_rows():
     """(Re)draws one row per currently-configured camera name, each with
     an editable device-index box, a best-effort detected device-name
     hint (see list_camera_device_names()), an Assign button, a row of
-    primary resolution/mono-vs-color settings, a "Detect Output Modes"
-    button that actually tests whether THIS camera's hardware honors the
-    mono/color toggle (see probe_camera_output_modes()), and an optional
-    second "Capture B" resolution/mode row — turning that on makes every
-    photo request from this camera rapid-fire both profiles back to back
-    (see vision/camera/capture.py's capture_frames_multi())."""
+    primary resolution/mono/view settings, a "Detect Output Modes"
+    button + results list that actually tests what THIS camera's
+    hardware really supports (see probe_camera_modes()) so a mode can be
+    picked from real detected options instead of guessed, and an
+    optional second "Capture B" resolution/mode/view row — turning that
+    on makes every photo request from this camera rapid-fire both
+    profiles back to back (see vision/camera/capture.py's
+    capture_frames_multi())."""
     for child in camera_assign_rows_frame.winfo_children():
         child.destroy()
     _camera_assign_index_vars.clear()
@@ -6977,8 +7017,33 @@ def _rebuild_camera_assign_rows():
         mono_var = tk.BooleanVar(value=current_settings["mono"])
         tk.Checkbutton(settings_row, text="Grayscale / mono (uncheck for color/overlay)",
                         variable=mono_var, font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Button(settings_row, text="Detect Output Modes", bg="lightgray", font=("Arial", 8),
-                  command=lambda n=cam_name: _do_detect_output_modes(n)).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(settings_row, text="view:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(4, 2))
+        view_var = tk.StringVar(value=current_settings["view"])
+        ttk.Combobox(settings_row, textvariable=view_var, width=9, state="readonly",
+                     values=_VIEW_CHOICES).pack(side=tk.LEFT)
+
+        modes_frame = tk.Frame(camera_assign_rows_frame)
+        modes_frame.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
+        modes_listbox = tk.Listbox(modes_frame, height=4, width=70, font=("Arial", 8))
+        modes_listbox.pack(side=tk.LEFT)
+        modes_btns = tk.Frame(modes_frame)
+        modes_btns.pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(modes_btns, text="Use as A", font=("Arial", 8),
+                  command=lambda n=cam_name, lb=modes_listbox: _do_pick_detected_mode(n, lb, "a")
+                  ).pack(fill=tk.X)
+        tk.Button(modes_btns, text="Use as B", font=("Arial", 8),
+                  command=lambda n=cam_name, lb=modes_listbox: _do_pick_detected_mode(n, lb, "b")
+                  ).pack(fill=tk.X, pady=(2, 0))
+
+        detect_row = tk.Frame(camera_assign_rows_frame)
+        detect_row.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
+        tk.Button(detect_row, text="Detect Output Modes", bg="lightgray", font=("Arial", 8),
+                  command=lambda n=cam_name, lb=modes_listbox: _do_detect_output_modes(n, lb)
+                  ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(detect_row, text="(actually tests real resolutions/modes on the hardware — "
+                 "for a stereo camera like the See3CAM_Stereo this includes its native "
+                 "combined left+right sizes)", fg="gray", font=("Arial", 8),
+                 wraplength=520, justify=tk.LEFT).pack(side=tk.LEFT)
 
         dual_row = tk.Frame(camera_assign_rows_frame)
         dual_row.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
@@ -6989,12 +7054,16 @@ def _rebuild_camera_assign_rows():
         ttk.Combobox(dual_row, textvariable=res_b_var, width=10,
                      values=_RESOLUTION_CHOICES).pack(side=tk.LEFT, padx=(0, 8))
         mono_b_var = tk.BooleanVar(value=current_settings["mono_b"])
-        tk.Checkbutton(dual_row, text="B is grayscale/mono (uncheck for color/overlay)",
-                        variable=mono_b_var, font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Checkbutton(dual_row, text="B is grayscale/mono", variable=mono_b_var,
+                        font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(dual_row, text="view:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(4, 2))
+        view_b_var = tk.StringVar(value=current_settings["view_b"])
+        ttk.Combobox(dual_row, textvariable=view_b_var, width=9, state="readonly",
+                     values=_VIEW_CHOICES).pack(side=tk.LEFT)
 
         _camera_settings_vars[cam_name] = {
-            "res": res_var, "mono": mono_var,
-            "dual": dual_var, "res_b": res_b_var, "mono_b": mono_b_var,
+            "res": res_var, "mono": mono_var, "view": view_var,
+            "dual": dual_var, "res_b": res_b_var, "mono_b": mono_b_var, "view_b": view_b_var,
         }
 
         apply_row = tk.Frame(camera_assign_rows_frame)
