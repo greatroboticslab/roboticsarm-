@@ -53,17 +53,19 @@ def safe_collection_name(name) -> str:
         raise HTTPException(status_code=400, detail="Category name is too long.")
     return cleaned
 
-def _structured_id(prefix: str = "sample") -> str:
-    """Structured, chronologically-sortable id: <prefix>_<YYYYMMDD>_<HHMMSS>_<4-char
-    suffix> instead of a bare UUID, so sample/image folders and Mongo
-    _ids sort by when they were created just from their name/string
-    value - same convention the desktop app's vision/camera/capture.py
-    new_sample_id() uses. The short suffix (from uuid4, truncated) only
-    exists to avoid collisions when more than one request lands in the
-    same second (e.g. several images from one fast rotation sweep)."""
+def _structured_id() -> str:
+    """Structured, chronologically-sortable id: <YYYYMMDD>_<HHMMSS>_<4-char
+    suffix> instead of a bare UUID or a "sample_"/"img_" word prefix — a
+    folder can hold more than one sample/object, so a semantic prefix
+    like that is misleading; plain date+time is what actually sorts and
+    means something. Same convention the desktop app's
+    vision/camera/capture.py new_sample_id() uses. The short suffix
+    (from uuid4, truncated) only exists to avoid collisions when more
+    than one request lands in the same second (e.g. several images from
+    one fast rotation sweep)."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = uuid.uuid4().hex[:4]
-    return f"{prefix}_{timestamp}_{suffix}"
+    return f"{timestamp}_{suffix}"
 
 
 @app.post("/collection/submission")
@@ -87,7 +89,7 @@ def submission(submission:dict):
     if submission.get("sample_id"):
         sample_id = safe_filename(str(submission["sample_id"]))
     else:
-        sample_id = _structured_id("sample")
+        sample_id = _structured_id()
 
     table.insert_one({
         "_id": sample_id,
@@ -103,7 +105,7 @@ def upload_image(sample_id: str = Form(...), category:str = Form(...), file:Uplo
     image_folder = f"images/{category}/{sample_id}"
     os.makedirs(image_folder,exist_ok=True)
 
-    image_id = _structured_id("img")
+    image_id = _structured_id()
 
     image_file = f"{image_folder}/{image_id}.jpg"
     
@@ -323,7 +325,7 @@ def save_auto_captured_image(category: str = Form(...), file: UploadFile = File(
         # No sample_id from the caller (e.g. a manual test POST) — every
         # image gets its own sample so it's still findable, just not
         # grouped with anything.
-        sample_id = _structured_id("sample")
+        sample_id = _structured_id()
         table.insert_one({
             "_id": sample_id,
             "date": str(datetime.now().date()),

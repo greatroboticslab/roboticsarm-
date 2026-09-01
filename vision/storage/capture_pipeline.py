@@ -104,15 +104,14 @@ def record_capture(name: str, image_paths_by_source, category: str = None,
         step succeeded.
     """
     warnings: List[str] = []
-    # BUGFIX (folder names still random): package_export.py builds its
-    # per-object export folder straight from this object_id
-    # (images/<object_id>/...), and this used to be a bare uuid.uuid4()
-    # - completely unrelated to sample_id's already-fixed structured
-    # naming (see vision/camera/capture.py's new_sample_id()), so an
-    # exported package's folders stayed unsortable jibberish even after
-    # that fix. Same structured, timestamp-sortable format here too.
+    # BUGFIX (folder names still random/misleading): package_export.py
+    # builds its per-object export folder straight from this object_id
+    # (images/<object_id>/...). Plain date+time, no "object_"/"sample_"
+    # word prefix — a folder can hold more than one object/sample, so a
+    # semantic prefix like that is misleading; the timestamp is what
+    # actually sorts and means something.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    object_id = f"object_{timestamp}_{uuid.uuid4().hex[:4]}"
+    object_id = f"{timestamp}_{uuid.uuid4().hex[:4]}"
     captured_at = datetime.now()
 
     session_id = session_manager.get_or_create_today_session()
