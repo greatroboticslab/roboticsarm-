@@ -37,7 +37,6 @@ from vision.camera.capture import (
     set_camera_settings,
     capture_frames_multi,
     probe_camera_modes,
-    probe_camera_formats,
 )
 import requests
 from vision.config import (
@@ -6860,64 +6859,21 @@ camera_assign_rows_frame = tk.Frame(camera_assign_frame)
 camera_assign_rows_frame.pack(fill=tk.X)
 
 _camera_assign_index_vars = {}  # camera name -> tk.StringVar holding the index entry text
-_camera_settings_vars = {}      # camera name -> {"res": tk.StringVar, "mode": tk.StringVar, ...}
+_camera_settings_vars = {}      # camera name -> {"a_label": tk.StringVar, "extract": tk.BooleanVar, ...}
 
-_RESOLUTION_CHOICES = ["640x480", "1280x720", "1920x1080"]
-_MODE_CHOICES = ["combined", "mono"]
-_detected_modes_by_camera = {}  # camera name -> list of mode dicts from the last Detect Output Modes run
-_detected_formats_by_camera = {}  # camera name -> list of format dicts from the last Detect Raw Formats run
+_detected_modes_by_camera = {}  # camera name -> list of format dicts from the last Detect Formats run
 
 
 def _do_apply_camera_settings(cam_name):
-    res_str = _camera_settings_vars[cam_name]["res"].get().strip()
-    mode = _camera_settings_vars[cam_name]["mode"].get().strip() or "combined"
-    split_str = _camera_settings_vars[cam_name]["split"].get().strip() or "1"
+    extract = _camera_settings_vars[cam_name]["extract"].get()
     dual = _camera_settings_vars[cam_name]["dual"].get()
-    res_b_str = _camera_settings_vars[cam_name]["res_b"].get().strip()
-    mode_b = _camera_settings_vars[cam_name]["mode_b"].get().strip() or "combined"
-    split_b_str = _camera_settings_vars[cam_name]["split_b"].get().strip() or "1"
+    extract_b = _camera_settings_vars[cam_name]["extract_b"].get()
     try:
-        width_str, height_str = res_str.lower().split("x")
-        width, height = int(width_str), int(height_str)
-    except ValueError:
-        camera_assign_status.config(
-            text=f"'{res_str}' is not a valid resolution — use WIDTHxHEIGHT (e.g. 1280x720).",
-            fg="red")
-        return
-    try:
-        split_layers = max(1, int(split_str))
-    except ValueError:
-        camera_assign_status.config(text=f"'{split_str}' is not a valid layer count — use a whole number.", fg="red")
-        return
-    width_b = height_b = None
-    split_layers_b = 1
-    if dual:
-        try:
-            width_b_str, height_b_str = res_b_str.lower().split("x")
-            width_b, height_b = int(width_b_str), int(height_b_str)
-        except ValueError:
-            camera_assign_status.config(
-                text=f"'{res_b_str}' is not a valid resolution B — use WIDTHxHEIGHT (e.g. 640x480).",
-                fg="red")
-            return
-        try:
-            split_layers_b = max(1, int(split_b_str))
-        except ValueError:
-            camera_assign_status.config(text=f"'{split_b_str}' is not a valid layer count B — use a whole number.", fg="red")
-            return
-    try:
-        set_camera_settings(cam_name, width=width, height=height, mode=mode, split_layers=split_layers,
-                             dual_capture=dual, width_b=width_b, height_b=height_b,
-                             mode_b=mode_b, split_layers_b=split_layers_b)
-        split_note = f", split into {split_layers} photos" if split_layers > 1 else ""
-        if dual:
-            split_b_note = f", split into {split_layers_b} photos" if split_layers_b > 1 else ""
-            msg = (f"'{cam_name}' set to dual-capture: A = {width}x{height} {mode}{split_note}, "
-                   f"B = {width_b}x{height_b} {mode_b}{split_b_note}. Every photo request "
-                   f"from this camera now rapid-fires both shots (full reconnect between "
-                   f"them so the sensor has time to settle).")
-        else:
-            msg = f"'{cam_name}' set to {width}x{height}, {mode}{split_note}."
+        set_camera_settings(cam_name, extract_lenses=extract, dual_capture=dual, extract_lenses_b=extract_b)
+        note = " — pick A/B formats from the Detected Formats list above (Use as A / Use as B applies immediately)."
+        msg = (f"'{cam_name}': extract lenses = {extract}"
+               + (f", dual-capture B = on (extract lenses B = {extract_b})" if dual else "")
+               + note)
         camera_assign_status.config(text=msg, fg="green")
     except Exception as e:
         camera_assign_status.config(text=f"Could not apply settings for '{cam_name}': {e}", fg="red")
@@ -6925,8 +6881,8 @@ def _do_apply_camera_settings(cam_name):
 
 def _do_detect_output_modes(cam_name, listbox_widget):
     camera_assign_status.config(
-        text=f"Probing '{cam_name}' resolutions — this fully reconnects the camera "
-             f"several times and takes a few seconds, live feed for it will pause...", fg="gray")
+        text=f"Probing '{cam_name}' — this fully reconnects the camera several times "
+             f"and takes a few seconds, live feed for it will pause...", fg="gray")
     listbox_widget.delete(0, tk.END)
     listbox_widget.insert(tk.END, "Detecting...")
 
@@ -6939,52 +6895,17 @@ def _do_detect_output_modes(cam_name, listbox_widget):
                 for m in modes:
                     listbox_widget.insert(tk.END, m["label"])
                 camera_assign_status.config(
-                    text=f"'{cam_name}': found {len(modes)} working raw resolution/mode "
-                         f"combo(s), shown with their actual pixel format (FOURCC) — click "
-                         f"one in the list to load it into A or B below, then Apply Settings.",
+                    text=f"'{cam_name}': found {len(modes)} working format(s) — shown the "
+                         f"same way e-con's own tool lists a camera's supported formats. "
+                         f"Click one, then 'Use as A' or 'Use as B'.",
                     fg="green")
             else:
                 listbox_widget.insert(tk.END, "(none found — see status message)")
                 camera_assign_status.config(
-                    text=f"'{cam_name}': none of the candidate resolutions/modes produced "
+                    text=f"'{cam_name}': none of the candidate resolutions/framerates produced "
                          f"a real (non-blank) frame. Check it's plugged into a USB 3.0 port "
                          f"(some cameras need the bandwidth) and not already open in another "
-                         f"program. If it's an industrial/stereo camera it may need its "
-                         f"vendor SDK/driver rather than plain OpenCV to stream at all.",
-                    fg="orange")
-        root.after(0, report)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def _do_detect_raw_formats(cam_name, listbox_widget):
-    camera_assign_status.config(
-        text=f"Probing '{cam_name}' raw pixel formats (MJPG/YUYV/GREY/Y16/etc — same generic "
-             f"list tried on any camera) — takes a few seconds, live feed for it will pause...",
-        fg="gray")
-    listbox_widget.delete(0, tk.END)
-    listbox_widget.insert(tk.END, "Detecting...")
-
-    def worker():
-        formats = probe_camera_formats(cam_name)
-        _detected_formats_by_camera[cam_name] = formats
-        def report():
-            listbox_widget.delete(0, tk.END)
-            if formats:
-                for f in formats:
-                    listbox_widget.insert(tk.END, f["label"])
-                camera_assign_status.config(
-                    text=f"'{cam_name}': found {len(formats)} distinct pixel format(s) this "
-                         f"camera's driver actually honors, at its current resolution — this "
-                         f"is what the hardware itself reports, not an assumption about which "
-                         f"camera model it is.",
-                    fg="green")
-            else:
-                listbox_widget.insert(tk.END, "(none found — see status message)")
-                camera_assign_status.config(
-                    text=f"'{cam_name}': none of the candidate pixel formats produced a real "
-                         f"(non-blank) frame at its current resolution — try a different "
-                         f"resolution in A above first, then detect formats again.",
+                         f"program.",
                     fg="orange")
         root.after(0, report)
 
@@ -6992,39 +6913,43 @@ def _do_detect_raw_formats(cam_name, listbox_widget):
 
 
 def _do_pick_detected_mode(cam_name, listbox_widget, target):
-    """target is 'a' or 'b' — loads the clicked detected mode into that
-    profile's resolution/mode controls (Apply Settings still needed to
-    actually save/use it)."""
+    """target is 'a' or 'b' — applies the clicked detected format
+    IMMEDIATELY (resolution + fps only; Extract Lenses stays whatever
+    the checkbox already says, toggled separately) and updates the
+    on-screen A:/B: label."""
     selection = listbox_widget.curselection()
     modes = _detected_modes_by_camera.get(cam_name) or []
     if not selection or not modes or selection[0] >= len(modes):
         return
     mode = modes[selection[0]]
     vars_ = _camera_settings_vars[cam_name]
-    if target == "a":
-        vars_["res"].set(f"{mode['width']}x{mode['height']}")
-        vars_["mode"].set(mode["mode"])
-    else:
-        vars_["res_b"].set(f"{mode['width']}x{mode['height']}")
-        vars_["mode_b"].set(mode["mode"])
-    camera_assign_status.config(
-        text=f"Loaded '{mode['label']}' into profile {target.upper()} — click Apply "
-             f"Settings to save/use it.",
-        fg="blue")
+    try:
+        if target == "a":
+            set_camera_settings(cam_name, width=mode["width"], height=mode["height"], fps=mode["fps"])
+            vars_["a_label"].set(f"A: {mode['width']}x{mode['height']} @ {mode['fps']}fps ({mode['fourcc']})")
+        else:
+            set_camera_settings(cam_name, width_b=mode["width"], height_b=mode["height"], fps_b=mode["fps"])
+            vars_["b_label"].set(f"B: {mode['width']}x{mode['height']} @ {mode['fps']}fps ({mode['fourcc']})")
+        camera_assign_status.config(
+            text=f"'{cam_name}' profile {target.upper()} set to {mode['label']}.", fg="blue")
+    except Exception as e:
+        camera_assign_status.config(text=f"Could not set profile {target.upper()} for '{cam_name}': {e}", fg="red")
 
 
 def _rebuild_camera_assign_rows():
     """(Re)draws one row per currently-configured camera name, each with
     an editable device-index box, a best-effort detected device-name
-    hint (see list_camera_device_names()), an Assign button, a row of
-    primary resolution/mode/split-layers settings, a "Detect Output
-    Modes" button + results list that actually tests what THIS camera's
-    hardware really supports — real resolutions and pixel formats, not
-    guessed — (see probe_camera_modes()) so a mode can be picked from
-    real detected options, and an optional second "Capture B" row —
-    turning that on makes every photo request from this camera
-    rapid-fire both profiles back to back (see
-    vision/camera/capture.py's capture_frames_multi())."""
+    hint (see list_camera_device_names()), an Assign button, a "Detect
+    Formats" button + results list that actually tests what THIS
+    camera's hardware really supports — shown the same way e-con's own
+    OpenCVCam.exe reference tool lists a camera's formats ("FormatType:
+    Y16 Width: 752 Height: 480 Fps: 60") — click one to use it as
+    profile A or B, an "Extract Lenses" checkbox (splits a multi-channel
+    frame into one photo per channel — see
+    vision/camera/capture.py's _extract_lenses()), and an optional
+    second "Capture B" toggle — turning that on makes every photo
+    request from this camera rapid-fire both profiles back to back (see
+    capture_frames_multi())."""
     for child in camera_assign_rows_frame.winfo_children():
         child.destroy()
     _camera_assign_index_vars.clear()
@@ -7051,23 +6976,19 @@ def _rebuild_camera_assign_rows():
 
         current_settings = get_camera_settings(cam_name)
 
-        settings_row = tk.Frame(camera_assign_rows_frame)
-        settings_row.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
-        tk.Label(settings_row, text="A resolution:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 2))
-        res_var = tk.StringVar(value=f"{current_settings['width']}x{current_settings['height']}")
-        ttk.Combobox(settings_row, textvariable=res_var, width=10,
-                     values=_RESOLUTION_CHOICES).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(settings_row, text="mode:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 2))
-        mode_var = tk.StringVar(value=current_settings["mode"])
-        ttk.Combobox(settings_row, textvariable=mode_var, width=9, state="readonly",
-                     values=_MODE_CHOICES).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(settings_row, text="split into N photos:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(4, 2))
-        split_var = tk.StringVar(value=str(current_settings["split_layers"]))
-        tk.Entry(settings_row, textvariable=split_var, width=3).pack(side=tk.LEFT)
+        selected_row = tk.Frame(camera_assign_rows_frame)
+        selected_row.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
+        a_label_var = tk.StringVar(
+            value=f"A: {current_settings['width']}x{current_settings['height']} "
+                  f"@ {current_settings['fps'] or 'default'}fps")
+        tk.Label(selected_row, textvariable=a_label_var, font=("Arial", 8), fg="blue").pack(side=tk.LEFT, padx=(0, 12))
+        extract_var = tk.BooleanVar(value=current_settings["extract_lenses"])
+        tk.Checkbutton(selected_row, text="Extract Lenses (split channels into separate photos)",
+                        variable=extract_var, font=("Arial", 8)).pack(side=tk.LEFT)
 
         modes_frame = tk.Frame(camera_assign_rows_frame)
         modes_frame.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
-        modes_listbox = tk.Listbox(modes_frame, height=4, width=80, font=("Arial", 8))
+        modes_listbox = tk.Listbox(modes_frame, height=5, width=70, font=("Consolas", 8))
         modes_listbox.pack(side=tk.LEFT)
         modes_btns = tk.Frame(modes_frame)
         modes_btns.pack(side=tk.LEFT, padx=(6, 0))
@@ -7079,48 +7000,30 @@ def _rebuild_camera_assign_rows():
                   ).pack(fill=tk.X, pady=(2, 0))
 
         detect_row = tk.Frame(camera_assign_rows_frame)
-        detect_row.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
-        tk.Button(detect_row, text="Detect Output Modes", bg="lightgray", font=("Arial", 8),
+        detect_row.pack(fill=tk.X, pady=(0, 4), padx=(12, 0))
+        tk.Button(detect_row, text="Detect Formats", bg="lightgray", font=("Arial", 8),
                   command=lambda n=cam_name, lb=modes_listbox: _do_detect_output_modes(n, lb)
                   ).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(detect_row, text="(tests real resolutions on the hardware and shows the "
-                 "actual pixel format/FOURCC returned for each)", fg="gray", font=("Arial", 8),
-                 wraplength=520, justify=tk.LEFT).pack(side=tk.LEFT)
-
-        formats_frame = tk.Frame(camera_assign_rows_frame)
-        formats_frame.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
-        formats_listbox = tk.Listbox(formats_frame, height=4, width=80, font=("Arial", 8))
-        formats_listbox.pack(side=tk.LEFT)
-
-        detect_formats_row = tk.Frame(camera_assign_rows_frame)
-        detect_formats_row.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
-        tk.Button(detect_formats_row, text="Detect Raw Formats", bg="lightgray", font=("Arial", 8),
-                  command=lambda n=cam_name, lb=formats_listbox: _do_detect_raw_formats(n, lb)
-                  ).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(detect_formats_row, text="(tries common raw pixel formats — MJPG, YUYV, GREY, "
-                 "Y16, etc — the same generic list for any camera, and reports which ones this "
-                 "camera's driver actually honors at its current resolution)", fg="gray",
+        tk.Label(detect_row, text="(tests the camera's actual supported resolutions/framerates/"
+                 "pixel formats — shown the same way e-con's own tool lists them)", fg="gray",
                  font=("Arial", 8), wraplength=520, justify=tk.LEFT).pack(side=tk.LEFT)
 
         dual_row = tk.Frame(camera_assign_rows_frame)
         dual_row.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
         dual_var = tk.BooleanVar(value=current_settings["dual_capture"])
-        tk.Checkbutton(dual_row, text="Also rapid-capture a B shot on every photo request:",
-                        variable=dual_var, font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 4))
-        res_b_var = tk.StringVar(value=f"{current_settings['width_b']}x{current_settings['height_b']}")
-        ttk.Combobox(dual_row, textvariable=res_b_var, width=10,
-                     values=_RESOLUTION_CHOICES).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(dual_row, text="mode:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 2))
-        mode_b_var = tk.StringVar(value=current_settings["mode_b"])
-        ttk.Combobox(dual_row, textvariable=mode_b_var, width=9, state="readonly",
-                     values=_MODE_CHOICES).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(dual_row, text="split into N photos:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(4, 2))
-        split_b_var = tk.StringVar(value=str(current_settings["split_layers_b"]))
-        tk.Entry(dual_row, textvariable=split_b_var, width=3).pack(side=tk.LEFT)
+        tk.Checkbutton(dual_row, text="Also capture a second (B) format on every photo request",
+                        variable=dual_var, font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 12))
+        b_label_var = tk.StringVar(
+            value=f"B: {current_settings['width_b']}x{current_settings['height_b']} "
+                  f"@ {current_settings['fps_b'] or 'default'}fps")
+        tk.Label(dual_row, textvariable=b_label_var, font=("Arial", 8), fg="blue").pack(side=tk.LEFT, padx=(0, 12))
+        extract_b_var = tk.BooleanVar(value=current_settings["extract_lenses_b"])
+        tk.Checkbutton(dual_row, text="Extract Lenses (B)", variable=extract_b_var,
+                        font=("Arial", 8)).pack(side=tk.LEFT)
 
         _camera_settings_vars[cam_name] = {
-            "res": res_var, "mode": mode_var, "split": split_var,
-            "dual": dual_var, "res_b": res_b_var, "mode_b": mode_b_var, "split_b": split_b_var,
+            "a_label": a_label_var, "extract": extract_var,
+            "dual": dual_var, "b_label": b_label_var, "extract_b": extract_b_var,
         }
 
         apply_row = tk.Frame(camera_assign_rows_frame)
