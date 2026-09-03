@@ -163,12 +163,20 @@ def get_camera_settings(name: str) -> dict:
     (vision.config's CAMERA_FRAME_WIDTH/HEIGHT, no FPS override, lenses
     not extracted, dual-capture off) filled in for anything not
     explicitly set yet:
-      width/height/fps    - the camera's primary output format. These
-                              are meant to be picked from a real detected
-                              format (see probe_camera_modes()) — the
-                              same width/height/fps combos the camera
-                              itself reports supporting — not typed in
-                              freely. fps=None means "don't request a
+      width/height/fps/raw  - the camera's primary output format. These
+                              are meant to be picked as a set from a real
+                              detected format (see probe_camera_modes())
+                              — the exact width/height/fps/pixel-format
+                              combos the camera itself reports supporting
+                              — not typed in freely; picking one detected
+                              entry sets all four together (see
+                              main.py's _do_pick_detected_mode()). `raw`
+                              is what actually distinguishes two formats
+                              that share the same resolution/fps (this
+                              camera's Y16 vs RGB24 both exist at e.g.
+                              752x480@60 — the CAP_PROP_CONVERT_RGB=0
+                              request is what tells the driver which one
+                              you mean). fps=None means "don't request a
                               specific framerate, take whatever's
                               default".
       extract_lenses        - if True, every capture_frames_multi() call
@@ -184,42 +192,72 @@ def get_camera_settings(name: str) -> dict:
                               frame that looks like RGB noise. No-op
                               (nothing to extract) for an already single-
                               channel format like Y16/GREY.
+      keep_original          - only meaningful when extract_lenses is
+                              on. If True, ALSO saves the original,
+                              un-split combined frame as an extra photo
+                              alongside the extracted per-channel ones
+                              (labeled "orig") — off by default, since
+                              the whole point of extraction is usually
+                              to get past a combined frame that just
+                              looks like noise, but it's there as an
+                              option if you want both.
+      alternate_lenses        - only meaningful when extract_lenses is
+                              on. If True, each successive photo request
+                              saves only ONE extracted lens instead of
+                              all of them — cycling to the NEXT one each
+                              time (view 0 this capture, view 1 the
+                              next, back to view 0 after that, and so
+                              on) rather than saving every view on every
+                              single photo. Useful when you want each
+                              capture event to be one lightweight image
+                              instead of N, while still eventually
+                              covering every view across a sequence of
+                              captures. See _next_lens_index below for
+                              the per-camera cycling state this uses.
       dual_capture          - if True, every capture_frames_multi() call
                               for this camera rapid-fires a SECOND shot
-                              at width_b/height_b/fps_b/extract_lenses_b
-                              right after the primary one.
-      width_b/height_b/fps_b/extract_lenses_b - the second profile,
-                              same meaning as above. Default to the same
-                              as primary if not set separately.
+                              at width_b/height_b/fps_b/raw_b/
+                              extract_lenses_b right after the primary
+                              one.
+      width_b/height_b/fps_b/raw_b/extract_lenses_b - the second
+                              profile, same meaning as above. Default to
+                              the same as primary if not set separately.
     """
     saved = _camera_settings.get(str(name).strip(), {})
     width = saved.get("width") or CAMERA_FRAME_WIDTH
     height = saved.get("height") or CAMERA_FRAME_HEIGHT
     fps = saved.get("fps")
+    raw = bool(saved.get("raw", False))
     extract_lenses = bool(saved.get("extract_lenses", False))
     return {
         "width": width,
         "height": height,
         "fps": fps,
+        "raw": raw,
         "extract_lenses": extract_lenses,
+        "keep_original": bool(saved.get("keep_original", False)),
+        "alternate_lenses": bool(saved.get("alternate_lenses", False)),
         "dual_capture": bool(saved.get("dual_capture", False)),
         "width_b": saved.get("width_b") or width,
         "height_b": saved.get("height_b") or height,
         "fps_b": saved.get("fps_b", fps),
+        "raw_b": bool(saved.get("raw_b", raw)),
         "extract_lenses_b": bool(saved.get("extract_lenses_b", extract_lenses)),
     }
 
 
 def set_camera_settings(name: str, width: int = None, height: int = None,
-                         fps: int = None, extract_lenses: bool = None,
+                         fps: int = None, raw: bool = None, extract_lenses: bool = None,
+                         keep_original: bool = None, alternate_lenses: bool = None,
                          dual_capture: bool = None,
                          width_b: int = None, height_b: int = None,
-                         fps_b: int = None, extract_lenses_b: bool = None) -> None:
-    """Persists resolution/fps/lens-extraction (and optional second dual-
-    capture profile) settings for camera `name` and applies the PRIMARY
-    profile immediately to its handle if one's already open/cached
-    (cap.set() on a live handle - no reopen needed), so a change takes
-    effect on the very next frame rather than needing a reconnect."""
+                         fps_b: int = None, raw_b: bool = None, extract_lenses_b: bool = None) -> None:
+    """Persists resolution/fps/pixel-format/lens-extraction (and
+    optional second dual-capture profile) settings for camera `name` and
+    applies the PRIMARY profile immediately to its handle if one's
+    already open/cached (cap.set() on a live handle - no reopen needed),
+    so a change takes effect on the very next frame rather than needing
+    a reconnect."""
     name = str(name).strip()
     if not name:
         raise ValueError("Camera name cannot be empty.")
@@ -230,8 +268,14 @@ def set_camera_settings(name: str, width: int = None, height: int = None,
         entry["height"] = int(height)
     if fps is not None:
         entry["fps"] = int(fps)
+    if raw is not None:
+        entry["raw"] = bool(raw)
     if extract_lenses is not None:
         entry["extract_lenses"] = bool(extract_lenses)
+    if keep_original is not None:
+        entry["keep_original"] = bool(keep_original)
+    if alternate_lenses is not None:
+        entry["alternate_lenses"] = bool(alternate_lenses)
     if dual_capture is not None:
         entry["dual_capture"] = bool(dual_capture)
     if width_b is not None:
@@ -240,6 +284,8 @@ def set_camera_settings(name: str, width: int = None, height: int = None,
         entry["height_b"] = int(height_b)
     if fps_b is not None:
         entry["fps_b"] = int(fps_b)
+    if raw_b is not None:
+        entry["raw_b"] = bool(raw_b)
     if extract_lenses_b is not None:
         entry["extract_lenses_b"] = bool(extract_lenses_b)
     _save_camera_settings()
@@ -251,21 +297,23 @@ def set_camera_settings(name: str, width: int = None, height: int = None,
 
 def _apply_camera_settings(cap, settings: dict) -> None:
     """Applies a resolved settings dict (see get_camera_settings) to an
-    already-open cv2.VideoCapture handle — resolution, and FPS if one's
-    been set. Deliberately does NOT touch CAP_PROP_CONVERT_RGB or
-    CAP_PROP_FOURCC here at all: an earlier version unconditionally
-    forced CAP_PROP_CONVERT_RGB on every camera (even just re-setting it
-    to its own default for the "normal" case), which turned out to
-    change what some ordinary UVC webcams actually streamed back on some
-    backends. Now: resolution/FPS are the only things pushed onto an
-    already-cached handle. Best-effort — cv2 silently ignores what a
-    given backend can't do, same as elsewhere in this file (see e.g.
-    CAP_PROP_BUFFERSIZE above)."""
+    already-open cv2.VideoCapture handle — resolution, FPS if one's been
+    set, and CAP_PROP_CONVERT_RGB if `raw` is on (requesting the
+    driver's raw/uncoverted format — e.g. this camera's Y16 — instead of
+    its normal one, e.g. RGB24). CAP_PROP_CONVERT_RGB is only ever
+    touched when `raw` is explicitly True; an earlier version
+    unconditionally forced it on every camera, even re-setting it to its
+    own default for the normal case, which changed what some ordinary
+    UVC webcams streamed back on some backends. Best-effort — cv2
+    silently ignores what a given backend can't do, same as elsewhere in
+    this file (see e.g. CAP_PROP_BUFFERSIZE above)."""
     try:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings["width"])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings["height"])
         if settings.get("fps"):
             cap.set(cv2.CAP_PROP_FPS, settings["fps"])
+        if settings.get("raw"):
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
     except Exception:
         pass
 
@@ -317,6 +365,14 @@ def _extract_lenses(frame) -> list:
     if frame.ndim < 3 or frame.shape[2] < 2:
         return [frame]  # already single-channel — nothing to extract
     return [frame[:, :, i] for i in range(frame.shape[2])]
+
+
+# Per-camera "which lens comes next" cycling position for "alternate_lenses"
+# (see get_camera_settings/capture_frames_multi) — in-memory only, not
+# persisted to disk, since it's just a rotating pointer rather than a
+# real saved preference. Resets to 0 (start from the first lens again)
+# on app restart.
+_next_lens_index: dict = {}
 
 
 # Lazily-opened, cached VideoCapture handles - opened once, reused across
@@ -555,6 +611,42 @@ def _fourcc_from_str(code: str):
     return cv2.VideoWriter_fourcc(*code.ljust(4)[:4])
 
 
+def _describe_pixel_format(frame, fourcc_str: str) -> str:
+    """
+    Best-effort human-readable pixel format name for a captured frame.
+
+    BUGFIX ("FormatType" showing gibberish like "}ë6ä" instead of a real
+    name like "Y16"/"RGB24"): CAP_PROP_FOURCC isn't reliably populated by
+    every backend — DirectShow on Windows especially will sometimes
+    return some other internal numeric identifier instead of a real
+    packed-ASCII FOURCC, which then decodes to non-printable garbage
+    bytes when unpacked as 4 characters. That garbage was being shown
+    directly as the format name.
+
+    Fix: only trust the decoded FOURCC if it's actually 4 printable
+    ASCII characters — a real FOURCC always is. Otherwise, fall back to
+    inferring the format directly from the frame's actual shape/dtype,
+    which is always correct regardless of what the backend reports for
+    FOURCC: single-channel 16-bit -> "Y16", single-channel 8-bit ->
+    "GREY", 3-channel 8-bit -> "RGB24", 4-channel 8-bit -> "RGBA32",
+    anything else described generically as "<channels>ch-<dtype>".
+    """
+    if fourcc_str and fourcc_str != "?" and fourcc_str.isprintable() and all(ord(c) < 128 for c in fourcc_str):
+        return fourcc_str
+    if frame is None:
+        return "?"
+    channels = frame.shape[2] if frame.ndim == 3 else 1
+    if channels == 1 and frame.dtype == np.uint16:
+        return "Y16"
+    if channels == 1 and frame.dtype == np.uint8:
+        return "GREY"
+    if channels == 3 and frame.dtype == np.uint8:
+        return "RGB24"
+    if channels == 4 and frame.dtype == np.uint8:
+        return "RGBA32"
+    return f"{channels}ch-{frame.dtype}"
+
+
 # Common raw/compressed UVC pixel formats, tried by explicitly requesting
 # each one via CAP_PROP_FOURCC. This list is GENERIC — the same
 # candidates are tried on every camera, no model-specific assumptions —
@@ -637,17 +729,26 @@ def probe_camera_formats(camera_name: str) -> list:
 
 def probe_camera_modes(camera_name: str) -> list:
     """
-    Actually tests each candidate (width, height, fps) against the live
-    camera hardware — closes whatever handle is cached first (some
-    industrial/stereo UVC cameras need a full stream restart to change
-    resolution/format; a property set on an already-streaming handle can
-    silently no-op or hand back garbage — see capture_frames_multi() for
-    the same fix applied to actual captures), opens a fresh handle per
-    candidate, sets it, discards a few warm-up frames to let the sensor
-    settle, reads one frame, and reports whether that frame looks like
-    real image data (not blank/constant) plus its ACTUAL returned
-    resolution, framerate, and pixel format (FOURCC — e.g. "MJPG",
-    "YUY2", "Y16", "RGB3").
+    Actually tests each candidate (width, height, fps, raw-vs-normal
+    pixel format) against the live camera hardware — closes whatever
+    handle is cached first (some industrial/stereo UVC cameras need a
+    full stream restart to change resolution/format; a property set on
+    an already-streaming handle can silently no-op or hand back garbage
+    — see capture_frames_multi() for the same fix applied to actual
+    captures), opens a fresh handle per candidate, sets it, discards a
+    few warm-up frames to let the sensor settle, reads one frame, and
+    reports whether that frame looks like real image data (not blank/
+    constant) plus its ACTUAL returned resolution, framerate, and pixel
+    format name (see _describe_pixel_format() — a real FOURCC like
+    "MJPG"/"YUY2" when the backend reports one properly, otherwise
+    inferred from the frame's actual shape/dtype, e.g. "Y16"/"RGB24").
+
+    BOTH the driver's normal format and its raw/CAP_PROP_CONVERT_RGB=0
+    format are tried at every resolution/fps — some cameras (this one
+    included) offer two genuinely different pixel formats at the SAME
+    resolution/framerate (e.g. Y16 and RGB24 both at 752x480@60), which
+    only shows up if both are actually requested; testing just one
+    would silently miss half of what the camera supports.
 
     Labeled the same way e-con's own OpenCVCam.exe reference tool lists
     a camera's supported formats ("FormatType: Y16 Width: 752 Height:
@@ -660,10 +761,19 @@ def probe_camera_modes(camera_name: str) -> list:
     assuming any particular camera model's known native sizes. Restores
     a normal handle at this camera's configured settings once done.
 
+    This is deliberately EXHAUSTIVE (13 resolutions x 4 framerates x 2
+    pixel-format modes = up to 104 attempts, each a full close+reopen+
+    settle+read+close cycle) rather than a quick handful of common
+    sizes, since a quick probe can miss real modes a camera supports —
+    this is meant to be the closest plain OpenCV can get to a vendor
+    tool's exhaustive format enumeration. That thoroughness costs real
+    time (can take a minute or more) — the Camera tab's status message
+    reflects that.
+
     Returns a list of dicts, one per WORKING combo — only combos that
     produced a plausible non-blank frame are included, so this is the
     definitive "what does this camera actually support" answer:
-      {"width", "height", "fps", "fourcc", "label", "actual_shape", "actual_dtype"}
+      {"width", "height", "fps", "raw", "fourcc", "label", "actual_shape", "actual_dtype"}
     """
     configured = list_configured_cameras()
     if camera_name not in configured:
@@ -671,10 +781,11 @@ def probe_camera_modes(camera_name: str) -> list:
     index = configured[camera_name]
 
     resolutions = [
-        (320, 240), (640, 480), (752, 480), (800, 600),
-        (1280, 720), (1280, 960), (1920, 1080),
+        (160, 120), (176, 144), (320, 240), (352, 288), (640, 480),
+        (752, 480), (800, 600), (1024, 768), (1280, 720), (1280, 960),
+        (1280, 1024), (1600, 1200), (1920, 1080),
     ]
-    framerates = [60, 30]
+    framerates = [15, 24, 30, 60]
 
     lock = _get_lock(index)
     working = []
@@ -686,42 +797,48 @@ def probe_camera_modes(camera_name: str) -> list:
 
         for width, height in resolutions:
             for fps in framerates:
-                cap = _open_camera(index)
-                if cap is None:
-                    continue
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                cap.set(cv2.CAP_PROP_FPS, fps)
-                # Let the sensor settle after a resolution/format change
-                # before trusting what comes back - the first frame or
-                # two after a UVC stream (re)negotiation is commonly
-                # garbage/blank while auto-exposure/the sensor catches up.
-                for _ in range(5):
-                    cap.grab()
-                ok, frame = cap.read()
-                fourcc = _fourcc_to_str(int(cap.get(cv2.CAP_PROP_FOURCC)))
-                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                actual_fps = cap.get(cv2.CAP_PROP_FPS)
-                cap.release()
-                if not ok or frame is None:
-                    continue
-                # A "blank" frame (solid white/black/constant color) is
-                # exactly the reported symptom — this combo opened but
-                # isn't actually streaming real data.
-                if float(np.std(frame)) < 1.0:
-                    continue
-                key = (actual_w, actual_h, round(actual_fps), fourcc)
-                if key in seen:
-                    continue  # several requested combos landing on the same actual negotiated one
-                seen.add(key)
-                working.append({
-                    "width": actual_w, "height": actual_h, "fps": round(actual_fps) or fps,
-                    "fourcc": fourcc,
-                    "label": f"FormatType: {fourcc} Width: {actual_w} Height: {actual_h} "
-                             f"Fps: {round(actual_fps) or fps}",
-                    "actual_shape": tuple(frame.shape), "actual_dtype": str(frame.dtype),
-                })
+                for raw in (False, True):
+                    cap = _open_camera(index)
+                    if cap is None:
+                        continue
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                    cap.set(cv2.CAP_PROP_FPS, fps)
+                    if raw:
+                        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                    # Let the sensor settle after a resolution/format
+                    # change before trusting what comes back - the first
+                    # frame or two after a UVC stream (re)negotiation is
+                    # commonly garbage/blank while auto-exposure/the
+                    # sensor catches up. 8 (up from 5) for more reliable/
+                    # accurate detection across this wider candidate set.
+                    for _ in range(8):
+                        cap.grab()
+                    ok, frame = cap.read()
+                    fourcc_raw = _fourcc_to_str(int(cap.get(cv2.CAP_PROP_FOURCC)))
+                    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+                    cap.release()
+                    if not ok or frame is None:
+                        continue
+                    # A "blank" frame (solid white/black/constant color)
+                    # is exactly the reported symptom — this combo
+                    # opened but isn't actually streaming real data.
+                    if float(np.std(frame)) < 1.0:
+                        continue
+                    fourcc = _describe_pixel_format(frame, fourcc_raw)
+                    key = (actual_w, actual_h, round(actual_fps), fourcc)
+                    if key in seen:
+                        continue  # several requested combos landing on the same actual negotiated one
+                    seen.add(key)
+                    working.append({
+                        "width": actual_w, "height": actual_h, "fps": round(actual_fps) or fps,
+                        "raw": raw, "fourcc": fourcc,
+                        "label": f"FormatType: {fourcc} Width: {actual_w} Height: {actual_h} "
+                                 f"Fps: {round(actual_fps) or fps}",
+                        "actual_shape": tuple(frame.shape), "actual_dtype": str(frame.dtype),
+                    })
 
         # Restore a live handle at this camera's configured settings so
         # nothing else (live feed, the next ordinary capture) is left
@@ -734,13 +851,42 @@ def probe_camera_modes(camera_name: str) -> list:
     return working
 
 
+def _apply_extraction(camera_name: str, suffix_prefix: str, frame, extract_on: bool,
+                       keep_original: bool, alternate: bool) -> list:
+    """
+    Shared "what do we actually save for this frame" logic for both the
+    A and B profiles in capture_frames_multi() below. If extraction is
+    off, just the one frame. If it's on:
+      - alternate=False (default): every extracted lens, every capture.
+      - alternate=True: only ONE lens this capture, cycling to the next
+        one next time (see _next_lens_index) — "the next photo is just
+        the other secondary view" instead of every view every time.
+      - keep_original=True additionally includes the un-split original
+        combined frame as one more entry, labeled "<prefix>_orig".
+    """
+    if not extract_on:
+        return [(suffix_prefix, frame)]
+    lenses = _extract_lenses(frame)
+    if len(lenses) <= 1:
+        results = [(suffix_prefix, lenses[0])]
+    elif alternate:
+        idx = _next_lens_index.get(camera_name, 0) % len(lenses)
+        _next_lens_index[camera_name] = idx + 1
+        results = [(f"{suffix_prefix}_lens{idx}", lenses[idx])]
+    else:
+        results = [(f"{suffix_prefix}_lens{i}", f) for i, f in enumerate(lenses)]
+    if keep_original and len(lenses) > 1:
+        results.append((f"{suffix_prefix}_orig", frame))
+    return results
+
+
 def capture_frames_multi(camera_name: str) -> list:
     """
     Grabs frame(s) from `camera_name` for one photo request, extracting
-    lenses (see _extract_lenses) if that toggle is on, and — if the
-    camera's "dual capture" toggle is on — rapid-firing a SECOND shot at
-    a different resolution/fps right after the primary one (see
-    set_camera_settings' dual_capture/width_b/height_b/fps_b/
+    lenses (see _extract_lenses/_apply_extraction) if that toggle is on,
+    and — if the camera's "dual capture" toggle is on — rapid-firing a
+    SECOND shot at a different resolution/fps right after the primary
+    one (see set_camera_settings' dual_capture/width_b/height_b/fps_b/
     extract_lenses_b args, exposed on the Camera tab as a "Capture B"
     row).
 
@@ -760,13 +906,13 @@ def capture_frames_multi(camera_name: str) -> list:
 
     Returns a list of (suffix, frame) pairs. Normal case: one pair,
     suffix "a". If A's extract_lenses is on and the frame has multiple
-    channels, that becomes one pair per channel ("a_lens0", "a_lens1",
-    ...) — each an actual separate view (e.g. left/right/computed),
-    correctly saved as its own grayscale photo instead of one frame that
-    displays as RGB noise. Dual capture adds the equivalent "b"/
-    "b_lens0".."b_lensN" pairs for the second profile. Callers save each
-    pair under a different view_index so they never collide on disk (see
-    main.py's capture_movement_snapshot()/run_manual_snapshot()).
+    channels: one pair per channel ("a_lens0", "a_lens1", ...) normally,
+    or just ONE pair for whichever lens is next in rotation if
+    alternate_lenses is on, plus an "a_orig" pair too if keep_original is
+    on. Dual capture adds the equivalent "b"/"b_lens0".."b_lensN"/
+    "b_orig" pairs for the second profile. Callers save each pair under
+    a different view_index so they never collide on disk (see main.py's
+    capture_movement_snapshot()/run_manual_snapshot()).
     """
     configured = list_configured_cameras()
     if camera_name not in configured:
@@ -779,15 +925,14 @@ def capture_frames_multi(camera_name: str) -> list:
     settings = get_camera_settings(camera_name)
 
     frame_a = _capture_from_index(index, camera_name=camera_name)
-    lenses_a = _extract_lenses(frame_a) if settings["extract_lenses"] else [frame_a]
-    results = ([(f"a_lens{i}", f) for i, f in enumerate(lenses_a)] if len(lenses_a) > 1
-               else [("a", lenses_a[0])])
+    results = _apply_extraction(camera_name, "a", frame_a, settings["extract_lenses"],
+                                 settings["keep_original"], settings["alternate_lenses"])
 
     if not settings["dual_capture"]:
         return results
 
     settings_b = {"width": settings["width_b"], "height": settings["height_b"],
-                  "fps": settings["fps_b"]}
+                  "fps": settings["fps_b"], "raw": settings["raw_b"]}
     lock = _get_lock(index)
     frame_b = None
     with lock:
@@ -799,10 +944,10 @@ def capture_frames_multi(camera_name: str) -> list:
             _apply_camera_settings(cap_b, settings_b)
             for _ in range(5):  # let the reconfigured stream settle — see BUGFIX above
                 cap_b.grab()
-            ok_b, raw_b = cap_b.read()
+            ok_b, frame_b_raw = cap_b.read()
             cap_b.release()
-            if ok_b and raw_b is not None:
-                frame_b = _normalize_frame_for_save(raw_b)
+            if ok_b and frame_b_raw is not None:
+                frame_b = _normalize_frame_for_save(frame_b_raw)
 
         # Reopen fresh at the primary/A profile, same "settle first"
         # treatment, for whatever uses this camera next.
@@ -818,9 +963,8 @@ def capture_frames_multi(camera_name: str) -> list:
               f"only the primary was saved.")
         return results
 
-    lenses_b = _extract_lenses(frame_b) if settings["extract_lenses_b"] else [frame_b]
-    results += ([(f"b_lens{i}", f) for i, f in enumerate(lenses_b)] if len(lenses_b) > 1
-                else [("b", lenses_b[0])])
+    results += _apply_extraction(camera_name, "b", frame_b, settings["extract_lenses_b"],
+                                  settings["keep_original"], settings["alternate_lenses"])
     return results
 
 

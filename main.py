@@ -6866,12 +6866,17 @@ _detected_modes_by_camera = {}  # camera name -> list of format dicts from the l
 
 def _do_apply_camera_settings(cam_name):
     extract = _camera_settings_vars[cam_name]["extract"].get()
+    keep_orig = _camera_settings_vars[cam_name]["keep_orig"].get()
+    alternate = _camera_settings_vars[cam_name]["alternate"].get()
     dual = _camera_settings_vars[cam_name]["dual"].get()
     extract_b = _camera_settings_vars[cam_name]["extract_b"].get()
     try:
-        set_camera_settings(cam_name, extract_lenses=extract, dual_capture=dual, extract_lenses_b=extract_b)
+        set_camera_settings(cam_name, extract_lenses=extract, keep_original=keep_orig,
+                             alternate_lenses=alternate, dual_capture=dual, extract_lenses_b=extract_b)
         note = " — pick A/B formats from the Detected Formats list above (Use as A / Use as B applies immediately)."
         msg = (f"'{cam_name}': extract lenses = {extract}"
+               + (f", keep original = {keep_orig}" if extract else "")
+               + (f", alternate views (one per photo) = {alternate}" if extract else "")
                + (f", dual-capture B = on (extract lenses B = {extract_b})" if dual else "")
                + note)
         camera_assign_status.config(text=msg, fg="green")
@@ -6881,10 +6886,12 @@ def _do_apply_camera_settings(cam_name):
 
 def _do_detect_output_modes(cam_name, listbox_widget):
     camera_assign_status.config(
-        text=f"Probing '{cam_name}' — this fully reconnects the camera several times "
-             f"and takes a few seconds, live feed for it will pause...", fg="gray")
+        text=f"Probing '{cam_name}' — this is an exhaustive test (13 resolutions x 4 "
+             f"framerates x raw/normal pixel format) so it can take a minute or more, and "
+             f"fully reconnects the camera repeatedly, so live feed for it will pause...",
+        fg="gray")
     listbox_widget.delete(0, tk.END)
-    listbox_widget.insert(tk.END, "Detecting...")
+    listbox_widget.insert(tk.END, "Detecting... (this can take a minute or more)")
 
     def worker():
         modes = probe_camera_modes(cam_name)
@@ -6914,9 +6921,10 @@ def _do_detect_output_modes(cam_name, listbox_widget):
 
 def _do_pick_detected_mode(cam_name, listbox_widget, target):
     """target is 'a' or 'b' — applies the clicked detected format
-    IMMEDIATELY (resolution + fps only; Extract Lenses stays whatever
-    the checkbox already says, toggled separately) and updates the
-    on-screen A:/B: label."""
+    IMMEDIATELY (resolution + fps + raw/normal pixel format — the exact
+    combo that was actually confirmed working during Detect Formats;
+    Extract Lenses stays whatever the checkbox already says, toggled
+    separately) and updates the on-screen A:/B: label."""
     selection = listbox_widget.curselection()
     modes = _detected_modes_by_camera.get(cam_name) or []
     if not selection or not modes or selection[0] >= len(modes):
@@ -6925,10 +6933,12 @@ def _do_pick_detected_mode(cam_name, listbox_widget, target):
     vars_ = _camera_settings_vars[cam_name]
     try:
         if target == "a":
-            set_camera_settings(cam_name, width=mode["width"], height=mode["height"], fps=mode["fps"])
+            set_camera_settings(cam_name, width=mode["width"], height=mode["height"],
+                                 fps=mode["fps"], raw=mode["raw"])
             vars_["a_label"].set(f"A: {mode['width']}x{mode['height']} @ {mode['fps']}fps ({mode['fourcc']})")
         else:
-            set_camera_settings(cam_name, width_b=mode["width"], height_b=mode["height"], fps_b=mode["fps"])
+            set_camera_settings(cam_name, width_b=mode["width"], height_b=mode["height"],
+                                 fps_b=mode["fps"], raw_b=mode["raw"])
             vars_["b_label"].set(f"B: {mode['width']}x{mode['height']} @ {mode['fps']}fps ({mode['fourcc']})")
         camera_assign_status.config(
             text=f"'{cam_name}' profile {target.upper()} set to {mode['label']}.", fg="blue")
@@ -6986,6 +6996,17 @@ def _rebuild_camera_assign_rows():
         tk.Checkbutton(selected_row, text="Extract Lenses (split channels into separate photos)",
                         variable=extract_var, font=("Arial", 8)).pack(side=tk.LEFT)
 
+        extract_options_row = tk.Frame(camera_assign_rows_frame)
+        extract_options_row.pack(fill=tk.X, pady=(0, 2), padx=(28, 0))
+        keep_orig_var = tk.BooleanVar(value=current_settings["keep_original"])
+        tk.Checkbutton(extract_options_row, text="Also keep the original (un-split) photo",
+                        variable=keep_orig_var, font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 12))
+        alternate_var = tk.BooleanVar(value=current_settings["alternate_lenses"])
+        tk.Checkbutton(extract_options_row,
+                        text="Alternate views (each photo saves just one view, cycling to "
+                             "the next one next time — instead of all views every photo)",
+                        variable=alternate_var, font=("Arial", 8)).pack(side=tk.LEFT)
+
         modes_frame = tk.Frame(camera_assign_rows_frame)
         modes_frame.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
         modes_listbox = tk.Listbox(modes_frame, height=5, width=70, font=("Consolas", 8))
@@ -7023,6 +7044,7 @@ def _rebuild_camera_assign_rows():
 
         _camera_settings_vars[cam_name] = {
             "a_label": a_label_var, "extract": extract_var,
+            "keep_orig": keep_orig_var, "alternate": alternate_var,
             "dual": dual_var, "b_label": b_label_var, "extract_b": extract_b_var,
         }
 
