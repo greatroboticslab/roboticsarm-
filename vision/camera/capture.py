@@ -163,22 +163,49 @@ def get_camera_settings(name: str) -> dict:
     (vision.config's CAMERA_FRAME_WIDTH/HEIGHT, no FPS override, lenses
     not extracted, dual-capture off) filled in for anything not
     explicitly set yet:
-      width/height/fps/raw  - the camera's primary output format. These
-                              are meant to be picked as a set from a real
-                              detected format (see probe_camera_modes())
-                              — the exact width/height/fps/pixel-format
-                              combos the camera itself reports supporting
-                              — not typed in freely; picking one detected
-                              entry sets all four together (see
-                              main.py's _do_pick_detected_mode()). `raw`
-                              is what actually distinguishes two formats
-                              that share the same resolution/fps (this
-                              camera's Y16 vs RGB24 both exist at e.g.
-                              752x480@60 — the CAP_PROP_CONVERT_RGB=0
-                              request is what tells the driver which one
-                              you mean). fps=None means "don't request a
-                              specific framerate, take whatever's
-                              default".
+      width/height/fps/format_request - the camera's primary output
+                              format. These are meant to be picked as a
+                              set from a real detected format (see
+                              probe_camera_modes()) — the exact
+                              width/height/fps/pixel-format combos the
+                              camera itself reports supporting — not
+                              typed in freely; picking one detected entry
+                              sets all four together (see main.py's
+                              _do_pick_detected_mode()).
+
+                              format_request is what actually
+                              distinguishes two formats that share the
+                              same resolution/fps (this camera's Y16 vs
+                              RGB24 both exist at e.g. 752x480@60).
+
+                              BUGFIX (Y16 was coming out identical to
+                              RGB24 — "B just overridden by A"): the
+                              previous version only ever toggled
+                              CAP_PROP_CONVERT_RGB (raw=True/False) to
+                              try to select between formats. That
+                              property controls whether a backend does
+                              color conversion AFTER capturing — it does
+                              NOT select between genuinely different USB
+                              Video Class format descriptors the way
+                              this camera's Y16-vs-RGB24 actually work,
+                              which are negotiated at the USB/driver
+                              level. So toggling it did nothing on this
+                              camera: A and B ended up requesting the
+                              exact same real format regardless of the
+                              setting, producing pixel-identical frames
+                              under different filenames — which looked
+                              like "B is just A again", because it
+                              genuinely was. format_request now instead
+                              stores either None (driver default), the
+                              string "mono" (still tries
+                              CAP_PROP_CONVERT_RGB=0 — this DOES work on
+                              some ordinary webcams), or an explicit
+                              4-character FOURCC string like "Y16 " —
+                              set via CAP_PROP_FOURCC, which is the
+                              property that actually selects between
+                              distinct UVC format descriptors. fps=None
+                              means "don't request a specific framerate,
+                              take whatever's default".
       extract_lenses        - if True, every capture_frames_multi() call
                               for this camera splits the frame into ONE
                               PHOTO PER COLOR CHANNEL instead of saving
@@ -195,12 +222,12 @@ def get_camera_settings(name: str) -> dict:
       keep_original          - only meaningful when extract_lenses is
                               on. If True, ALSO saves the original,
                               un-split combined frame as an extra photo
-                              alongside the extracted per-channel ones
-                              (labeled "orig") — off by default, since
-                              the whole point of extraction is usually
-                              to get past a combined frame that just
-                              looks like noise, but it's there as an
-                              option if you want both.
+                              alongside the extracted per-channel ones —
+                              off by default, since the whole point of
+                              extraction is usually to get past a
+                              combined frame that just looks like noise,
+                              but it's there as an option if you want
+                              both.
       alternate_lenses        - only meaningful when extract_lenses is
                               on. If True, each successive photo request
                               saves only ONE extracted lens instead of
@@ -216,24 +243,25 @@ def get_camera_settings(name: str) -> dict:
                               the per-camera cycling state this uses.
       dual_capture          - if True, every capture_frames_multi() call
                               for this camera rapid-fires a SECOND shot
-                              at width_b/height_b/fps_b/raw_b/
+                              at width_b/height_b/fps_b/format_request_b/
                               extract_lenses_b right after the primary
                               one.
-      width_b/height_b/fps_b/raw_b/extract_lenses_b - the second
-                              profile, same meaning as above. Default to
-                              the same as primary if not set separately.
+      width_b/height_b/fps_b/format_request_b/extract_lenses_b - the
+                              second profile, same meaning as above.
+                              Default to the same as primary if not set
+                              separately.
     """
     saved = _camera_settings.get(str(name).strip(), {})
     width = saved.get("width") or CAMERA_FRAME_WIDTH
     height = saved.get("height") or CAMERA_FRAME_HEIGHT
     fps = saved.get("fps")
-    raw = bool(saved.get("raw", False))
+    format_request = saved.get("format_request")
     extract_lenses = bool(saved.get("extract_lenses", False))
     return {
         "width": width,
         "height": height,
         "fps": fps,
-        "raw": raw,
+        "format_request": format_request,
         "extract_lenses": extract_lenses,
         "keep_original": bool(saved.get("keep_original", False)),
         "alternate_lenses": bool(saved.get("alternate_lenses", False)),
@@ -241,23 +269,26 @@ def get_camera_settings(name: str) -> dict:
         "width_b": saved.get("width_b") or width,
         "height_b": saved.get("height_b") or height,
         "fps_b": saved.get("fps_b", fps),
-        "raw_b": bool(saved.get("raw_b", raw)),
+        "format_request_b": saved.get("format_request_b", format_request),
         "extract_lenses_b": bool(saved.get("extract_lenses_b", extract_lenses)),
     }
 
 
 def set_camera_settings(name: str, width: int = None, height: int = None,
-                         fps: int = None, raw: bool = None, extract_lenses: bool = None,
+                         fps: int = None, format_request: str = None, extract_lenses: bool = None,
                          keep_original: bool = None, alternate_lenses: bool = None,
                          dual_capture: bool = None,
                          width_b: int = None, height_b: int = None,
-                         fps_b: int = None, raw_b: bool = None, extract_lenses_b: bool = None) -> None:
+                         fps_b: int = None, format_request_b: str = None,
+                         extract_lenses_b: bool = None) -> None:
     """Persists resolution/fps/pixel-format/lens-extraction (and
     optional second dual-capture profile) settings for camera `name` and
     applies the PRIMARY profile immediately to its handle if one's
     already open/cached (cap.set() on a live handle - no reopen needed),
     so a change takes effect on the very next frame rather than needing
-    a reconnect."""
+    a reconnect. Pass format_request="" (empty string, not None — None
+    means "leave whatever's already saved alone") to explicitly clear
+    back to driver-default."""
     name = str(name).strip()
     if not name:
         raise ValueError("Camera name cannot be empty.")
@@ -268,8 +299,8 @@ def set_camera_settings(name: str, width: int = None, height: int = None,
         entry["height"] = int(height)
     if fps is not None:
         entry["fps"] = int(fps)
-    if raw is not None:
-        entry["raw"] = bool(raw)
+    if format_request is not None:
+        entry["format_request"] = format_request or None
     if extract_lenses is not None:
         entry["extract_lenses"] = bool(extract_lenses)
     if keep_original is not None:
@@ -284,8 +315,8 @@ def set_camera_settings(name: str, width: int = None, height: int = None,
         entry["height_b"] = int(height_b)
     if fps_b is not None:
         entry["fps_b"] = int(fps_b)
-    if raw_b is not None:
-        entry["raw_b"] = bool(raw_b)
+    if format_request_b is not None:
+        entry["format_request_b"] = format_request_b or None
     if extract_lenses_b is not None:
         entry["extract_lenses_b"] = bool(extract_lenses_b)
     _save_camera_settings()
@@ -298,22 +329,29 @@ def set_camera_settings(name: str, width: int = None, height: int = None,
 def _apply_camera_settings(cap, settings: dict) -> None:
     """Applies a resolved settings dict (see get_camera_settings) to an
     already-open cv2.VideoCapture handle — resolution, FPS if one's been
-    set, and CAP_PROP_CONVERT_RGB if `raw` is on (requesting the
-    driver's raw/uncoverted format — e.g. this camera's Y16 — instead of
-    its normal one, e.g. RGB24). CAP_PROP_CONVERT_RGB is only ever
-    touched when `raw` is explicitly True; an earlier version
-    unconditionally forced it on every camera, even re-setting it to its
-    own default for the normal case, which changed what some ordinary
-    UVC webcams streamed back on some backends. Best-effort — cv2
-    silently ignores what a given backend can't do, same as elsewhere in
-    this file (see e.g. CAP_PROP_BUFFERSIZE above)."""
+    set, and the pixel format if `format_request` is set: either the
+    string "mono" (CAP_PROP_CONVERT_RGB=0 — works on some ordinary
+    webcams, but NOT what actually distinguishes this camera's Y16 vs
+    RGB24 — see get_camera_settings' BUGFIX note), or an explicit
+    FOURCC string like "Y16 " (CAP_PROP_FOURCC — the property that
+    actually selects between distinct UVC format descriptors, which IS
+    what this camera needs). Only ever touched when format_request is
+    set to something; an earlier version unconditionally forced
+    CAP_PROP_CONVERT_RGB on every camera, even re-setting it to its own
+    default for the normal case, which changed what some ordinary UVC
+    webcams streamed back on some backends. Best-effort — cv2 silently
+    ignores what a given backend can't do, same as elsewhere in this
+    file (see e.g. CAP_PROP_BUFFERSIZE above)."""
     try:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings["width"])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings["height"])
         if settings.get("fps"):
             cap.set(cv2.CAP_PROP_FPS, settings["fps"])
-        if settings.get("raw"):
+        fmt = settings.get("format_request")
+        if fmt == "mono":
             cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+        elif fmt:
+            cap.set(cv2.CAP_PROP_FOURCC, _fourcc_from_str(fmt))
     except Exception:
         pass
 
@@ -727,65 +765,85 @@ def probe_camera_formats(camera_name: str) -> list:
     return working
 
 
-def probe_camera_modes(camera_name: str) -> list:
+def probe_camera_modes(camera_name: str, resolution_filter: tuple = None,
+                        fps_filter: int = None) -> list:
     """
-    Actually tests each candidate (width, height, fps, raw-vs-normal
-    pixel format) against the live camera hardware — closes whatever
-    handle is cached first (some industrial/stereo UVC cameras need a
-    full stream restart to change resolution/format; a property set on
-    an already-streaming handle can silently no-op or hand back garbage
-    — see capture_frames_multi() for the same fix applied to actual
-    captures), opens a fresh handle per candidate, sets it, discards a
-    few warm-up frames to let the sensor settle, reads one frame, and
-    reports whether that frame looks like real image data (not blank/
-    constant) plus its ACTUAL returned resolution, framerate, and pixel
-    format name (see _describe_pixel_format() — a real FOURCC like
-    "MJPG"/"YUY2" when the backend reports one properly, otherwise
-    inferred from the frame's actual shape/dtype, e.g. "Y16"/"RGB24").
+    Actually tests candidate (width, height, fps, pixel format) combos
+    against the live camera hardware — closes whatever handle is cached
+    first (some industrial/stereo UVC cameras need a full stream restart
+    to change resolution/format; a property set on an already-streaming
+    handle can silently no-op or hand back garbage — see
+    capture_frames_multi() for the same fix applied to actual captures),
+    opens a fresh handle per candidate, sets it, discards a few warm-up
+    frames to let the sensor settle, reads one frame, and reports
+    whether that frame looks like real image data (not blank/constant)
+    plus its ACTUAL returned resolution, framerate, and pixel format
+    name (see _describe_pixel_format() — a real FOURCC like "MJPG"/
+    "YUY2" when the backend reports one properly, otherwise inferred
+    from the frame's actual shape/dtype, e.g. "Y16"/"RGB24").
 
-    BOTH the driver's normal format and its raw/CAP_PROP_CONVERT_RGB=0
-    format are tried at every resolution/fps — some cameras (this one
-    included) offer two genuinely different pixel formats at the SAME
-    resolution/framerate (e.g. Y16 and RGB24 both at 752x480@60), which
-    only shows up if both are actually requested; testing just one
-    would silently miss half of what the camera supports.
+    resolution_filter=(width, height) and/or fps_filter=<int> narrow the
+    search to just that resolution and/or framerate instead of the full
+    candidate sweep — exposed on the Camera tab as "Detect Formats"
+    filter fields. Narrowing the search also unlocks a MUCH deeper pixel
+    format search (see below) since the total combo count stays bounded
+    either way.
+
+    BUGFIX (Y16 was coming out identical to RGB24): the previous version
+    only ever toggled CAP_PROP_CONVERT_RGB to try to distinguish formats
+    at the same resolution/fps. That property controls post-capture
+    color conversion — it does NOT select between genuinely different
+    USB Video Class format descriptors, which is what this camera's
+    Y16-vs-RGB24 actually are. Toggling it did nothing on this camera:
+    every attempt silently landed on the same real format, so entries
+    that were supposed to be different formats came back pixel-
+    identical. Fixed: format selection is now tried via explicit
+    CAP_PROP_FOURCC requests (the property that actually does select
+    between UVC format descriptors) in addition to the CONVERT_RGB=0
+    "mono" attempt (kept — it DOES work on some ordinary webcams).
+    When the search is unfiltered (testing every resolution/fps), only
+    [driver default, "mono"] are tried per resolution/fps pair to keep
+    the total sweep bounded (13 resolutions x 4 framerates x 2 = up to
+    104 attempts). When resolution and/or fps has been narrowed down via
+    the filters, the FULL set of candidate FOURCC codes is also tried at
+    each remaining resolution/fps pair, since the search space shrinks
+    enough to afford it — this is how you actually confirm/find e.g.
+    "Y16 " vs "RGB24" as genuinely distinct results rather than
+    duplicates.
 
     Labeled the same way e-con's own OpenCVCam.exe reference tool lists
     a camera's supported formats ("FormatType: Y16 Width: 752 Height:
     480 Fps: 60") so the list here reads the same way if you've compared
     against that tool.
 
-    Generic candidate list only (common resolutions/framerates) — this
-    makes no assumption about what kind of camera is plugged in; it
-    reports whatever the hardware actually says it supports rather than
-    assuming any particular camera model's known native sizes. Restores
+    Generic candidate list only (common resolutions/framerates/pixel
+    formats) — this makes no assumption about what kind of camera is
+    plugged in; it reports whatever the hardware actually says it
+    supports rather than assuming any particular camera model. Restores
     a normal handle at this camera's configured settings once done.
-
-    This is deliberately EXHAUSTIVE (13 resolutions x 4 framerates x 2
-    pixel-format modes = up to 104 attempts, each a full close+reopen+
-    settle+read+close cycle) rather than a quick handful of common
-    sizes, since a quick probe can miss real modes a camera supports —
-    this is meant to be the closest plain OpenCV can get to a vendor
-    tool's exhaustive format enumeration. That thoroughness costs real
-    time (can take a minute or more) — the Camera tab's status message
-    reflects that.
 
     Returns a list of dicts, one per WORKING combo — only combos that
     produced a plausible non-blank frame are included, so this is the
     definitive "what does this camera actually support" answer:
-      {"width", "height", "fps", "raw", "fourcc", "label", "actual_shape", "actual_dtype"}
+      {"width", "height", "fps", "format_request", "fourcc", "label", "actual_shape", "actual_dtype"}
     """
     configured = list_configured_cameras()
     if camera_name not in configured:
         return []
     index = configured[camera_name]
 
-    resolutions = [
-        (160, 120), (176, 144), (320, 240), (352, 288), (640, 480),
-        (752, 480), (800, 600), (1024, 768), (1280, 720), (1280, 960),
-        (1280, 1024), (1600, 1200), (1920, 1080),
-    ]
-    framerates = [15, 24, 30, 60]
+    if resolution_filter:
+        resolutions = [tuple(resolution_filter)]
+    else:
+        resolutions = [
+            (160, 120), (176, 144), (320, 240), (352, 288), (640, 480),
+            (752, 480), (800, 600), (1024, 768), (1280, 720), (1280, 960),
+            (1280, 1024), (1600, 1200), (1920, 1080),
+        ]
+    framerates = [fps_filter] if fps_filter else [15, 24, 30, 60]
+
+    narrowed = bool(resolution_filter or fps_filter)
+    format_requests = [None, "mono"] + (list(_CANDIDATE_FOURCCS) if narrowed else [])
 
     lock = _get_lock(index)
     working = []
@@ -797,15 +855,17 @@ def probe_camera_modes(camera_name: str) -> list:
 
         for width, height in resolutions:
             for fps in framerates:
-                for raw in (False, True):
+                for format_request in format_requests:
                     cap = _open_camera(index)
                     if cap is None:
                         continue
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
                     cap.set(cv2.CAP_PROP_FPS, fps)
-                    if raw:
+                    if format_request == "mono":
                         cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                    elif format_request:
+                        cap.set(cv2.CAP_PROP_FOURCC, _fourcc_from_str(format_request))
                     # Let the sensor settle after a resolution/format
                     # change before trusting what comes back - the first
                     # frame or two after a UVC stream (re)negotiation is
@@ -834,7 +894,7 @@ def probe_camera_modes(camera_name: str) -> list:
                     seen.add(key)
                     working.append({
                         "width": actual_w, "height": actual_h, "fps": round(actual_fps) or fps,
-                        "raw": raw, "fourcc": fourcc,
+                        "format_request": format_request, "fourcc": fourcc,
                         "label": f"FormatType: {fourcc} Width: {actual_w} Height: {actual_h} "
                                  f"Fps: {round(actual_fps) or fps}",
                         "actual_shape": tuple(frame.shape), "actual_dtype": str(frame.dtype),
@@ -851,32 +911,39 @@ def probe_camera_modes(camera_name: str) -> list:
     return working
 
 
-def _apply_extraction(camera_name: str, suffix_prefix: str, frame, extract_on: bool,
+def _apply_extraction(camera_name: str, profile_label: str, frame, extract_on: bool,
                        keep_original: bool, alternate: bool) -> list:
     """
     Shared "what do we actually save for this frame" logic for both the
-    A and B profiles in capture_frames_multi() below. If extraction is
-    off, just the one frame. If it's on:
-      - alternate=False (default): every extracted lens, every capture.
-      - alternate=True: only ONE lens this capture, cycling to the next
-        one next time (see _next_lens_index) — "the next photo is just
-        the other secondary view" instead of every view every time.
+    primary and alternate profiles in capture_frames_multi() below.
+    `profile_label` is "primary" for the A profile or "alternate" for
+    the B/dual-capture profile — used directly in the saved suffix so
+    filenames say what they actually are instead of a bare letter. If
+    extraction is off, just the one frame under `profile_label`. If it's
+    on:
+      - alternate=False (default): every extracted lens, every capture,
+        suffixed "<profile_label>_splitA", "..._splitB", "..._splitC"
+        etc. (a letter per channel — descriptive, not a numeric index).
+      - alternate=True: only ONE lens this capture, suffixed with
+        whichever letter is next in rotation (see _next_lens_index),
+        cycling to the next one next time — "the next photo is just the
+        other secondary view" instead of every view every time.
       - keep_original=True additionally includes the un-split original
-        combined frame as one more entry, labeled "<prefix>_orig".
+        combined frame as one more entry, suffixed "<profile_label>_original".
     """
     if not extract_on:
-        return [(suffix_prefix, frame)]
+        return [(profile_label, frame)]
     lenses = _extract_lenses(frame)
     if len(lenses) <= 1:
-        results = [(suffix_prefix, lenses[0])]
+        results = [(profile_label, lenses[0])]
     elif alternate:
         idx = _next_lens_index.get(camera_name, 0) % len(lenses)
         _next_lens_index[camera_name] = idx + 1
-        results = [(f"{suffix_prefix}_lens{idx}", lenses[idx])]
+        results = [(f"{profile_label}_split{chr(65 + idx)}", lenses[idx])]
     else:
-        results = [(f"{suffix_prefix}_lens{i}", f) for i, f in enumerate(lenses)]
+        results = [(f"{profile_label}_split{chr(65 + i)}", f) for i, f in enumerate(lenses)]
     if keep_original and len(lenses) > 1:
-        results.append((f"{suffix_prefix}_orig", frame))
+        results.append((f"{profile_label}_original", frame))
     return results
 
 
@@ -888,7 +955,8 @@ def capture_frames_multi(camera_name: str) -> list:
     SECOND shot at a different resolution/fps right after the primary
     one (see set_camera_settings' dual_capture/width_b/height_b/fps_b/
     extract_lenses_b args, exposed on the Camera tab as a "Capture B"
-    row).
+    row) — the ACTUAL SECOND/OTHER camera output, hence "alternate"
+    below.
 
     BUGFIX (dual capture returning solid-white photos and crashing): the
     first version of this switched profiles with a bare cap.set() on the
@@ -905,14 +973,16 @@ def capture_frames_multi(camera_name: str) -> list:
     this camera next (live feed, the next capture).
 
     Returns a list of (suffix, frame) pairs. Normal case: one pair,
-    suffix "a". If A's extract_lenses is on and the frame has multiple
-    channels: one pair per channel ("a_lens0", "a_lens1", ...) normally,
-    or just ONE pair for whichever lens is next in rotation if
-    alternate_lenses is on, plus an "a_orig" pair too if keep_original is
-    on. Dual capture adds the equivalent "b"/"b_lens0".."b_lensN"/
-    "b_orig" pairs for the second profile. Callers save each pair under
-    a different view_index so they never collide on disk (see main.py's
-    capture_movement_snapshot()/run_manual_snapshot()).
+    suffix "primary". If the primary profile's extract_lenses is on and
+    the frame has multiple channels: one pair per channel ("primary_
+    splitA", "primary_splitB", ...) normally, or just ONE pair for
+    whichever lens is next in rotation if alternate_lenses is on, plus a
+    "primary_original" pair too if keep_original is on. Dual capture
+    adds the equivalent "alternate"/"alternate_splitA".."alternate_
+    original" pairs for the second (actually-different-camera-output)
+    profile. Callers save each pair under a different view_index so they
+    never collide on disk (see main.py's capture_movement_snapshot()/
+    run_manual_snapshot()).
     """
     configured = list_configured_cameras()
     if camera_name not in configured:
@@ -925,14 +995,14 @@ def capture_frames_multi(camera_name: str) -> list:
     settings = get_camera_settings(camera_name)
 
     frame_a = _capture_from_index(index, camera_name=camera_name)
-    results = _apply_extraction(camera_name, "a", frame_a, settings["extract_lenses"],
+    results = _apply_extraction(camera_name, "primary", frame_a, settings["extract_lenses"],
                                  settings["keep_original"], settings["alternate_lenses"])
 
     if not settings["dual_capture"]:
         return results
 
     settings_b = {"width": settings["width_b"], "height": settings["height_b"],
-                  "fps": settings["fps_b"], "raw": settings["raw_b"]}
+                  "fps": settings["fps_b"], "format_request": settings["format_request_b"]}
     lock = _get_lock(index)
     frame_b = None
     with lock:
@@ -963,7 +1033,7 @@ def capture_frames_multi(camera_name: str) -> list:
               f"only the primary was saved.")
         return results
 
-    results += _apply_extraction(camera_name, "b", frame_b, settings["extract_lenses_b"],
+    results += _apply_extraction(camera_name, "alternate", frame_b, settings["extract_lenses_b"],
                                   settings["keep_original"], settings["alternate_lenses"])
     return results
 

@@ -6862,6 +6862,9 @@ _camera_assign_index_vars = {}  # camera name -> tk.StringVar holding the index 
 _camera_settings_vars = {}      # camera name -> {"a_label": tk.StringVar, "extract": tk.BooleanVar, ...}
 
 _detected_modes_by_camera = {}  # camera name -> list of format dicts from the last Detect Formats run
+_RESOLUTION_FILTER_CHOICES = ["160x120", "176x144", "320x240", "352x288", "640x480",
+                              "752x480", "800x600", "1024x768", "1280x720", "1280x960",
+                              "1280x1024", "1600x1200", "1920x1080"]
 
 
 def _do_apply_camera_settings(cam_name):
@@ -6884,17 +6887,44 @@ def _do_apply_camera_settings(cam_name):
         camera_assign_status.config(text=f"Could not apply settings for '{cam_name}': {e}", fg="red")
 
 
-def _do_detect_output_modes(cam_name, listbox_widget):
+def _do_detect_output_modes(cam_name, listbox_widget, res_filter_var, fps_filter_var):
+    res_filter_str = res_filter_var.get().strip()
+    fps_filter_str = fps_filter_var.get().strip()
+    resolution_filter = None
+    fps_filter = None
+    if res_filter_str and res_filter_str.lower() != "any":
+        try:
+            w_str, h_str = res_filter_str.lower().split("x")
+            resolution_filter = (int(w_str), int(h_str))
+        except ValueError:
+            camera_assign_status.config(
+                text=f"'{res_filter_str}' is not a valid resolution filter — use WIDTHxHEIGHT "
+                     f"(e.g. 752x480) or leave blank/'Any'.", fg="red")
+            return
+    if fps_filter_str and fps_filter_str.lower() != "any":
+        try:
+            fps_filter = int(fps_filter_str)
+        except ValueError:
+            camera_assign_status.config(
+                text=f"'{fps_filter_str}' is not a valid fps filter — use a whole number "
+                     f"(e.g. 60) or leave blank/'Any'.", fg="red")
+            return
+
+    narrowed = bool(resolution_filter or fps_filter)
     camera_assign_status.config(
-        text=f"Probing '{cam_name}' — this is an exhaustive test (13 resolutions x 4 "
-             f"framerates x raw/normal pixel format) so it can take a minute or more, and "
-             f"fully reconnects the camera repeatedly, so live feed for it will pause...",
+        text=f"Probing '{cam_name}'"
+             + (f" (filtered to {resolution_filter or 'any resolution'} @ "
+                f"{fps_filter or 'any'}fps — also testing every candidate pixel format "
+                f"since the search is narrowed)" if narrowed else
+                " — exhaustive test (13 resolutions x 4 framerates x driver-default/mono), "
+                "can take a minute or more")
+             + ", fully reconnects the camera repeatedly, so live feed for it will pause...",
         fg="gray")
     listbox_widget.delete(0, tk.END)
-    listbox_widget.insert(tk.END, "Detecting... (this can take a minute or more)")
+    listbox_widget.insert(tk.END, "Detecting...")
 
     def worker():
-        modes = probe_camera_modes(cam_name)
+        modes = probe_camera_modes(cam_name, resolution_filter=resolution_filter, fps_filter=fps_filter)
         _detected_modes_by_camera[cam_name] = modes
         def report():
             listbox_widget.delete(0, tk.END)
@@ -6909,10 +6939,10 @@ def _do_detect_output_modes(cam_name, listbox_widget):
             else:
                 listbox_widget.insert(tk.END, "(none found — see status message)")
                 camera_assign_status.config(
-                    text=f"'{cam_name}': none of the candidate resolutions/framerates produced "
-                         f"a real (non-blank) frame. Check it's plugged into a USB 3.0 port "
-                         f"(some cameras need the bandwidth) and not already open in another "
-                         f"program.",
+                    text=f"'{cam_name}': none of the candidate resolutions/framerates/formats "
+                         f"produced a real (non-blank) frame. Check it's plugged into a USB "
+                         f"3.0 port (some cameras need the bandwidth) and not already open in "
+                         f"another program.",
                     fg="orange")
         root.after(0, report)
 
@@ -6921,10 +6951,10 @@ def _do_detect_output_modes(cam_name, listbox_widget):
 
 def _do_pick_detected_mode(cam_name, listbox_widget, target):
     """target is 'a' or 'b' — applies the clicked detected format
-    IMMEDIATELY (resolution + fps + raw/normal pixel format — the exact
-    combo that was actually confirmed working during Detect Formats;
-    Extract Lenses stays whatever the checkbox already says, toggled
-    separately) and updates the on-screen A:/B: label."""
+    IMMEDIATELY (resolution + fps + the exact pixel-format request that
+    was actually confirmed working during Detect Formats; Extract
+    Lenses stays whatever the checkbox already says, toggled separately)
+    and updates the on-screen A:/B: label."""
     selection = listbox_widget.curselection()
     modes = _detected_modes_by_camera.get(cam_name) or []
     if not selection or not modes or selection[0] >= len(modes):
@@ -6934,11 +6964,11 @@ def _do_pick_detected_mode(cam_name, listbox_widget, target):
     try:
         if target == "a":
             set_camera_settings(cam_name, width=mode["width"], height=mode["height"],
-                                 fps=mode["fps"], raw=mode["raw"])
+                                 fps=mode["fps"], format_request=mode["format_request"] or "")
             vars_["a_label"].set(f"A: {mode['width']}x{mode['height']} @ {mode['fps']}fps ({mode['fourcc']})")
         else:
             set_camera_settings(cam_name, width_b=mode["width"], height_b=mode["height"],
-                                 fps_b=mode["fps"], raw_b=mode["raw"])
+                                 fps_b=mode["fps"], format_request_b=mode["format_request"] or "")
             vars_["b_label"].set(f"B: {mode['width']}x{mode['height']} @ {mode['fps']}fps ({mode['fourcc']})")
         camera_assign_status.config(
             text=f"'{cam_name}' profile {target.upper()} set to {mode['label']}.", fg="blue")
@@ -7022,11 +7052,22 @@ def _rebuild_camera_assign_rows():
 
         detect_row = tk.Frame(camera_assign_rows_frame)
         detect_row.pack(fill=tk.X, pady=(0, 4), padx=(12, 0))
+        tk.Label(detect_row, text="filter — resolution:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 2))
+        res_filter_var = tk.StringVar(value="Any")
+        ttk.Combobox(detect_row, textvariable=res_filter_var, width=10,
+                     values=["Any"] + _RESOLUTION_FILTER_CHOICES).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(detect_row, text="fps:", font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 2))
+        fps_filter_var = tk.StringVar(value="Any")
+        ttk.Combobox(detect_row, textvariable=fps_filter_var, width=6,
+                     values=["Any", "15", "24", "30", "60"]).pack(side=tk.LEFT, padx=(0, 8))
         tk.Button(detect_row, text="Detect Formats", bg="lightgray", font=("Arial", 8),
-                  command=lambda n=cam_name, lb=modes_listbox: _do_detect_output_modes(n, lb)
+                  command=lambda n=cam_name, lb=modes_listbox, rv=res_filter_var, fv=fps_filter_var:
+                      _do_detect_output_modes(n, lb, rv, fv)
                   ).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(detect_row, text="(tests the camera's actual supported resolutions/framerates/"
-                 "pixel formats — shown the same way e-con's own tool lists them)", fg="gray",
+        tk.Label(detect_row, text="(leave filters on 'Any' for the full exhaustive sweep — "
+                 "narrowing to a specific resolution/fps also tests every candidate pixel "
+                 "format there, which finds distinct formats like Y16 vs RGB24 the full "
+                 "sweep doesn't have time to check everywhere)", fg="gray",
                  font=("Arial", 8), wraplength=520, justify=tk.LEFT).pack(side=tk.LEFT)
 
         dual_row = tk.Frame(camera_assign_rows_frame)
