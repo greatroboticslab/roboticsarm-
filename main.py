@@ -37,7 +37,9 @@ from vision.camera.capture import (
     set_camera_settings,
     capture_frames_multi,
     probe_camera_modes,
+    capture_lens_pair,
 )
+from vision.camera import stereo_depth
 import requests
 from vision.config import (
     TOPIC_CAPTURE_COMMAND,
@@ -6867,19 +6869,72 @@ _RESOLUTION_FILTER_CHOICES = ["160x120", "176x144", "320x240", "352x288", "640x4
                               "1280x1024", "1600x1200", "1920x1080"]
 
 
-def _do_apply_camera_settings(cam_name):
+def _do_start_calibration(cam_name):
+    stereo_depth.start_calibration_session(cam_name)
+    camera_assign_status.config(
+        text=f"'{cam_name}': calibration session started (any previous in-progress images "
+             f"cleared). Show a printed checkerboard (9x6 internal corners) to the camera "
+             f"and click 'Add Calibration Image' for each of 10+ different angles/positions.",
+        fg="blue")
+
+
+def _do_add_calibration_image(cam_name, calib_status_var):
+    camera_assign_status.config(text=f"Capturing a calibration image from '{cam_name}'...", fg="gray")
+
+    def worker():
+        try:
+            left, right = capture_lens_pair(cam_name)
+            result = stereo_depth.add_calibration_image(cam_name, left, right)
+        except Exception as e:
+            result = {"found": False, "count": stereo_depth.calibration_progress(cam_name),
+                      "message": f"Could not capture/process: {e}"}
+        def report():
+            camera_assign_status.config(
+                text=f"'{cam_name}': {result['message']}",
+                fg="green" if result["found"] else "orange")
+        root.after(0, report)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _do_finish_calibration(cam_name, calib_status_var):
+    camera_assign_status.config(text=f"Running calibration for '{cam_name}'...", fg="gray")
+
+    def worker():
+        result = stereo_depth.run_calibration(cam_name)
+        def report():
+            camera_assign_status.config(text=result["message"], fg="green" if result["ok"] else "orange")
+            if result["ok"]:
+                calib_status_var.set("calibrated")
+        root.after(0, report)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _do_clear_calibration(cam_name, calib_status_var):
+    stereo_depth.clear_calibration(cam_name)
+    calib_status_var.set("not calibrated (less accurate)")
+    camera_assign_status.config(text=f"'{cam_name}': calibration cleared — depth maps will "
+                                      f"use the uncalibrated fallback until recalibrated.",
+                                 fg="blue")
+
+
+
     extract = _camera_settings_vars[cam_name]["extract"].get()
     keep_orig = _camera_settings_vars[cam_name]["keep_orig"].get()
     alternate = _camera_settings_vars[cam_name]["alternate"].get()
+    depth_map = _camera_settings_vars[cam_name]["depth_map"].get()
     dual = _camera_settings_vars[cam_name]["dual"].get()
     extract_b = _camera_settings_vars[cam_name]["extract_b"].get()
     try:
         set_camera_settings(cam_name, extract_lenses=extract, keep_original=keep_orig,
-                             alternate_lenses=alternate, dual_capture=dual, extract_lenses_b=extract_b)
+                             alternate_lenses=alternate, depth_map=depth_map,
+                             dual_capture=dual, extract_lenses_b=extract_b)
         note = " — pick A/B formats from the Detected Formats list above (Use as A / Use as B applies immediately)."
         msg = (f"'{cam_name}': extract lenses = {extract}"
                + (f", keep original = {keep_orig}" if extract else "")
                + (f", alternate views (one per photo) = {alternate}" if extract else "")
+               + (f", depth map = {depth_map}" if extract else "")
                + (f", dual-capture B = on (extract lenses B = {extract_b})" if dual else "")
                + note)
         camera_assign_status.config(text=msg, fg="green")
@@ -7037,6 +7092,36 @@ def _rebuild_camera_assign_rows():
                              "the next one next time — instead of all views every photo)",
                         variable=alternate_var, font=("Arial", 8)).pack(side=tk.LEFT)
 
+        depth_row = tk.Frame(camera_assign_rows_frame)
+        depth_row.pack(fill=tk.X, pady=(0, 2), padx=(28, 0))
+        depth_var = tk.BooleanVar(value=current_settings["depth_map"])
+        tk.Checkbutton(depth_row,
+                        text="Generate a depth map (from split A + B, treated as left/right) "
+                             "using open-source stereo matching",
+                        variable=depth_var, font=("Arial", 8)).pack(side=tk.LEFT, padx=(0, 8))
+        calib_status_var = tk.StringVar(
+            value="calibrated" if stereo_depth.has_calibration(cam_name) else "not calibrated (less accurate)")
+        tk.Label(depth_row, textvariable=calib_status_var, font=("Arial", 8), fg="gray").pack(side=tk.LEFT)
+
+        calib_row = tk.Frame(camera_assign_rows_frame)
+        calib_row.pack(fill=tk.X, pady=(0, 2), padx=(28, 0))
+        tk.Button(calib_row, text="Start Calibration", font=("Arial", 8),
+                  command=lambda n=cam_name: _do_start_calibration(n)).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(calib_row, text="Add Calibration Image", font=("Arial", 8),
+                  command=lambda n=cam_name, cv=calib_status_var: _do_add_calibration_image(n, cv)
+                  ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(calib_row, text="Finish Calibration", font=("Arial", 8),
+                  command=lambda n=cam_name, cv=calib_status_var: _do_finish_calibration(n, cv)
+                  ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(calib_row, text="Clear Calibration", fg="darkred", font=("Arial", 8),
+                  command=lambda n=cam_name, cv=calib_status_var: _do_clear_calibration(n, cv)
+                  ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(calib_row, text="(show a printed checkerboard — default 9x6 internal corners "
+                 "— to the camera from 10+ different angles, clicking 'Add Calibration Image' "
+                 "each time, then 'Finish Calibration'. Optional — depth maps work without it, "
+                 "just less accurately.)", fg="gray", font=("Arial", 8), wraplength=560,
+                 justify=tk.LEFT).pack(side=tk.LEFT)
+
         modes_frame = tk.Frame(camera_assign_rows_frame)
         modes_frame.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
         modes_listbox = tk.Listbox(modes_frame, height=5, width=70, font=("Consolas", 8))
@@ -7085,7 +7170,7 @@ def _rebuild_camera_assign_rows():
 
         _camera_settings_vars[cam_name] = {
             "a_label": a_label_var, "extract": extract_var,
-            "keep_orig": keep_orig_var, "alternate": alternate_var,
+            "keep_orig": keep_orig_var, "alternate": alternate_var, "depth_map": depth_var,
             "dual": dual_var, "b_label": b_label_var, "extract_b": extract_b_var,
         }
 

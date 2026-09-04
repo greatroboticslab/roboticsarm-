@@ -56,6 +56,8 @@ from vision.storage import storage_location
 import json
 import subprocess
 
+from vision.camera import stereo_depth
+
 _ASSIGNMENTS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "camera_assignments.json")
 
@@ -265,6 +267,7 @@ def get_camera_settings(name: str) -> dict:
         "extract_lenses": extract_lenses,
         "keep_original": bool(saved.get("keep_original", False)),
         "alternate_lenses": bool(saved.get("alternate_lenses", False)),
+        "depth_map": bool(saved.get("depth_map", False)),
         "dual_capture": bool(saved.get("dual_capture", False)),
         "width_b": saved.get("width_b") or width,
         "height_b": saved.get("height_b") or height,
@@ -277,6 +280,7 @@ def get_camera_settings(name: str) -> dict:
 def set_camera_settings(name: str, width: int = None, height: int = None,
                          fps: int = None, format_request: str = None, extract_lenses: bool = None,
                          keep_original: bool = None, alternate_lenses: bool = None,
+                         depth_map: bool = None,
                          dual_capture: bool = None,
                          width_b: int = None, height_b: int = None,
                          fps_b: int = None, format_request_b: str = None,
@@ -307,6 +311,8 @@ def set_camera_settings(name: str, width: int = None, height: int = None,
         entry["keep_original"] = bool(keep_original)
     if alternate_lenses is not None:
         entry["alternate_lenses"] = bool(alternate_lenses)
+    if depth_map is not None:
+        entry["depth_map"] = bool(depth_map)
     if dual_capture is not None:
         entry["dual_capture"] = bool(dual_capture)
     if width_b is not None:
@@ -912,7 +918,7 @@ def probe_camera_modes(camera_name: str, resolution_filter: tuple = None,
 
 
 def _apply_extraction(camera_name: str, profile_label: str, frame, extract_on: bool,
-                       keep_original: bool, alternate: bool) -> list:
+                       keep_original: bool, alternate: bool, depth_map: bool) -> list:
     """
     Shared "what do we actually save for this frame" logic for both the
     primary and alternate profiles in capture_frames_multi() below.
@@ -930,6 +936,15 @@ def _apply_extraction(camera_name: str, profile_label: str, frame, extract_on: b
         other secondary view" instead of every view every time.
       - keep_original=True additionally includes the un-split original
         combined frame as one more entry, suffixed "<profile_label>_original".
+      - depth_map=True additionally computes and saves a depth/disparity
+        image (see vision.camera.stereo_depth) from the FIRST TWO
+        extracted lenses (splitA/splitB — assumed left/right, since a
+        stereo camera's combined output conventionally packs left then
+        right), suffixed "<profile_label>_depth". Requires at least 2
+        lenses to have actually been extracted; no-ops (with a console
+        note) if there weren't at least 2, or if depth computation
+        itself fails for any reason (bad/misaligned pair, etc) — a
+        failed depth map should never block saving the actual photos.
     """
     if not extract_on:
         return [(profile_label, frame)]
@@ -944,6 +959,17 @@ def _apply_extraction(camera_name: str, profile_label: str, frame, extract_on: b
         results = [(f"{profile_label}_split{chr(65 + i)}", f) for i, f in enumerate(lenses)]
     if keep_original and len(lenses) > 1:
         results.append((f"{profile_label}_original", frame))
+    if depth_map:
+        if len(lenses) >= 2:
+            try:
+                depth = stereo_depth.compute_depth_map(camera_name, lenses[0], lenses[1])
+                if depth is not None:
+                    results.append((f"{profile_label}_depth", depth))
+            except Exception as e:
+                print(f"[STEREO DEPTH] Could not compute depth map for '{camera_name}': {e}")
+        else:
+            print(f"[STEREO DEPTH] '{camera_name}': depth map needs at least 2 extracted "
+                  f"lenses (left+right) — this frame only produced {len(lenses)}.")
     return results
 
 
@@ -996,7 +1022,8 @@ def capture_frames_multi(camera_name: str) -> list:
 
     frame_a = _capture_from_index(index, camera_name=camera_name)
     results = _apply_extraction(camera_name, "primary", frame_a, settings["extract_lenses"],
-                                 settings["keep_original"], settings["alternate_lenses"])
+                                 settings["keep_original"], settings["alternate_lenses"],
+                                 settings["depth_map"])
 
     if not settings["dual_capture"]:
         return results
@@ -1034,8 +1061,36 @@ def capture_frames_multi(camera_name: str) -> list:
         return results
 
     results += _apply_extraction(camera_name, "alternate", frame_b, settings["extract_lenses_b"],
-                                  settings["keep_original"], settings["alternate_lenses"])
+                                  settings["keep_original"], settings["alternate_lenses"],
+                                  settings["depth_map"])
     return results
+
+
+def capture_lens_pair(camera_name: str):
+    """
+    Grabs one frame from `camera_name` and extracts it into individual
+    lenses (see _extract_lenses), returning the first two as
+    (left, right) — regardless of that camera's saved extract_lenses/
+    depth_map settings. Used by the stereo calibration wizard (see
+    vision.camera.stereo_depth) to pull a fresh Left/Right pair on
+    demand for "Add Calibration Image", without needing extraction
+    turned on as a persistent capture setting. Raises ValueError if the
+    frame doesn't actually split into at least 2 lenses (e.g. this isn't
+    a multi-channel/stereo-style camera).
+    """
+    configured = list_configured_cameras()
+    if camera_name not in configured:
+        raise ValueError(f"Unknown camera '{camera_name}'.")
+    frame = _capture_from_index(configured[camera_name], camera_name=camera_name)
+    lenses = _extract_lenses(frame)
+    if len(lenses) < 2:
+        raise ValueError(
+            f"'{camera_name}' only produced {len(lenses)} channel(s) — needs at least 2 "
+            f"(left+right) for stereo calibration/depth. This only works for a camera whose "
+            f"frame is a multi-channel combined stereo pair, like the See3CAM_Stereo's RGB24 "
+            f"output."
+        )
+    return lenses[0], lenses[1]
 
 
 def capture_frame(camera_name: str):
