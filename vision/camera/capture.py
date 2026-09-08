@@ -523,8 +523,21 @@ def list_camera_device_names() -> dict:
     indices - it has no idea what Device Manager calls a camera - which
     makes it hard to tell cameras apart by index alone once more than one
     or two are plugged in. This shells out to PowerShell to pull the same
-    "Cameras / Imaging devices" list Device Manager shows, so the Camera
-    tab can display e.g. "index 2 - Logitech BRIO" instead of just "2".
+    "Cameras" list Device Manager shows, so the Camera tab can display e.g.
+    "index 2 - Logitech BRIO" instead of just "2".
+
+    BUGFIX (printers showing up instead of cameras): the previous version
+    filtered WMI's PNPClass on 'Camera' OR 'Image'. 'Image' is Windows'
+    legacy WIA (Windows Image Acquisition) device class, which covers
+    SCANNERS and multi-function PRINTERS with a scan feature too — not
+    just cameras — so on a system with a networked/USB MFP printer, its
+    name showed up in this list right alongside (or instead of) actual
+    cameras. Fixed: uses Get-PnpDevice -Class Camera first — the modern,
+    camera-SPECIFIC device class Device Manager's "Cameras" node uses,
+    which doesn't include scanners/printers at all — and only falls back
+    to the older 'Image' class (still filtering out anything whose name
+    looks like a printer/scanner) for older cameras that only ever
+    registered under that legacy class.
 
     IMPORTANT CAVEAT: Windows' PnP device enumeration order and OpenCV's
     backend enumeration order are NOT contractually guaranteed to match -
@@ -543,9 +556,14 @@ def list_camera_device_names() -> dict:
         return {}
     try:
         ps_cmd = (
-            "Get-CimInstance Win32_PnPEntity | "
-            "Where-Object { $_.PNPClass -eq 'Camera' -or $_.PNPClass -eq 'Image' } | "
-            "Select-Object -ExpandProperty Name"
+            "$cams = Get-PnpDevice -Class Camera -PresentOnly | "
+            "Select-Object -ExpandProperty FriendlyName; "
+            "if (-not $cams) { "
+            "$cams = Get-PnpDevice -Class Image -PresentOnly | "
+            "Where-Object { $_.FriendlyName -notmatch "
+            "'printer|scan|mfp|fax|copier|multifunction' } | "
+            "Select-Object -ExpandProperty FriendlyName "
+            "}; $cams"
         )
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_cmd],

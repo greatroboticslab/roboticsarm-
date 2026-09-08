@@ -131,11 +131,15 @@ def add_calibration_image(camera_name: str, left_frame, right_frame,
     Right pair (see vision.camera.capture's lens extraction — this is
     meant to be called with two of the extracted lens images) and, if
     found in BOTH, accumulates them toward the running calibration.
-    Print a checkerboard pattern (checkerboard_size default is 9x6
-    INTERNAL corners — a 10x7-square board) and show it to the camera
-    from several different angles/distances/positions, calling this
-    once per position; run_calibration() once enough images (10+) are
-    collected.
+
+    The camera itself stays completely still/mounted for the whole
+    process — this is standard practice for stereo calibration and is
+    what this workflow assumes throughout. Print a checkerboard pattern
+    (checkerboard_size default is 9x6 INTERNAL corners — a 10x7-square
+    board) and move ONLY THE BOARD to several different positions,
+    angles, and distances in front of the stationary camera, calling
+    this once per position; run_calibration() once enough images (10+)
+    are collected.
 
     Returns {"found": bool, "count": int, "message": str}.
     """

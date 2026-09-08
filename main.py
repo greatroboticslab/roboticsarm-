@@ -6919,7 +6919,7 @@ def _do_clear_calibration(cam_name, calib_status_var):
                                  fg="blue")
 
 
-
+def _do_apply_camera_settings(cam_name):
     extract = _camera_settings_vars[cam_name]["extract"].get()
     keep_orig = _camera_settings_vars[cam_name]["keep_orig"].get()
     alternate = _camera_settings_vars[cam_name]["alternate"].get()
@@ -7116,11 +7116,12 @@ def _rebuild_camera_assign_rows():
         tk.Button(calib_row, text="Clear Calibration", fg="darkred", font=("Arial", 8),
                   command=lambda n=cam_name, cv=calib_status_var: _do_clear_calibration(n, cv)
                   ).pack(side=tk.LEFT, padx=(0, 8))
-        tk.Label(calib_row, text="(show a printed checkerboard — default 9x6 internal corners "
-                 "— to the camera from 10+ different angles, clicking 'Add Calibration Image' "
-                 "each time, then 'Finish Calibration'. Optional — depth maps work without it, "
-                 "just less accurately.)", fg="gray", font=("Arial", 8), wraplength=560,
-                 justify=tk.LEFT).pack(side=tk.LEFT)
+        tk.Label(calib_row, text="(keep the camera fixed in place — mount it, don't touch it — "
+                 "and only move a printed checkerboard (default 9x6 internal corners) in front "
+                 "of it: 10+ different positions/angles/distances, clicking 'Add Calibration "
+                 "Image' each time, then 'Finish Calibration'. Optional — depth maps work "
+                 "without it, just less accurately.)", fg="gray", font=("Arial", 8),
+                 wraplength=560, justify=tk.LEFT).pack(side=tk.LEFT)
 
         modes_frame = tk.Frame(camera_assign_rows_frame)
         modes_frame.pack(fill=tk.X, pady=(0, 2), padx=(12, 0))
@@ -7572,7 +7573,8 @@ def _laser_connect():
                     laser_connect_btn.config(state=tk.NORMAL)
             root.after(0, finish)
         except Exception as e:
-            root.after(0, lambda: (_laser_set_status(f"Connection error: {e}", fg="red"),
+            error_msg = str(e)
+            root.after(0, lambda: (_laser_set_status(f"Connection error: {error_msg}", fg="red"),
                                     laser_connect_btn.config(state=tk.NORMAL)))
 
     threading.Thread(target=worker, daemon=True).start()
